@@ -76,8 +76,8 @@ class Settings:
     # check only. NOT free: Tesla bills every response with status < 500.
     poll_driving: int = field(default_factory=lambda: int(_clean(os.getenv("POLL_DRIVING")) or 120))
     poll_charging: int = field(default_factory=lambda: int(_clean(os.getenv("POLL_CHARGING")) or 300))
-    poll_idle: int = field(default_factory=lambda: int(_clean(os.getenv("POLL_IDLE")) or 900))
-    poll_asleep: int = field(default_factory=lambda: int(_clean(os.getenv("POLL_ASLEEP")) or 300))
+    poll_idle: int = field(default_factory=lambda: int(_clean(os.getenv("POLL_IDLE")) or 1800))
+    poll_asleep: int = field(default_factory=lambda: int(_clean(os.getenv("POLL_ASLEEP")) or 1800))
 
     # Optional: price per kWh, purely for the cost/credit readout. Blank disables it.
     import_rate: float | None = field(
