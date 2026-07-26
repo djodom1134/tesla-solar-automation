@@ -243,8 +243,13 @@ async function loadSolar() {
   const card = $("solar-card");
   card.hidden = false;
 
-  $("solar-state").textContent = s.state;
-  $("solar-state").className = "pill state-" + s.state;
+  // A disabled controller that has never run also reports state:"idle" --
+  // identical to an enabled-but-quiet one. Showing "off" here is the only
+  // thing that tells the two apart (spec 7.4: honesty over a working-looking
+  // default).
+  const label = s.enabled ? s.state : "off";
+  $("solar-state").textContent = label;
+  $("solar-state").className = "pill state-" + label;
   $("solar-surplus").textContent =
     s.surplus_w === null ? "—" : (s.surplus_w / 1000).toFixed(2) + " kW surplus";
   $("solar-amps").textContent = s.amps === null ? "" : s.amps + " A";

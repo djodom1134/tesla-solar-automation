@@ -124,6 +124,24 @@ def test_status_reports_idle_before_anything_runs(client, monkeypatch):
     assert body["grace_import_wh_total"] == 0
 
 
+def test_status_pins_enabled_false_on_the_shipped_default(client, monkeypatch):
+    """I12: the branch ships with solar_config.enabled = 0 and no tick has
+    ever run. A disabled controller must render distinguishably from an
+    enabled-but-quiet one (both report state:"idle") -- `enabled` is the
+    only field that tells them apart. Pins that the real, unconfigured
+    payload carries `enabled: false` today."""
+    monkeypatch.setattr(solar_routes, "DEMO", False)
+    body = client.get("/api/car/solar/status").json()
+    assert body["enabled"] is False
+
+
+def test_status_enabled_reflects_config(client, monkeypatch):
+    monkeypatch.setattr(solar_routes, "DEMO", False)
+    client.put("/api/car/solar/config", json={"enabled": 1})
+    body = client.get("/api/car/solar/status").json()
+    assert body["enabled"] is True
+
+
 def test_demo_status_reports_a_live_session(client):
     """DEMO=1 must render every field the card shows, without a car.
 
@@ -137,6 +155,17 @@ def test_demo_status_reports_a_live_session(client):
     for key in ("surplus_w", "amps", "soc", "grace_import_wh_today",
                 "capped", "dirty", "raised_to", "original_limit"):
         assert key in body, key
+
+
+def test_demo_and_real_status_have_the_same_key_set(client, monkeypatch):
+    """I12: demo.solar_status() and the real, store-backed payload must carry
+    the same fields, `enabled` included -- a demo fixture missing a key the
+    card reads is a bug the DEMO=1 dogfood loop exists to catch before a real
+    car does."""
+    demo_body = client.get("/api/car/solar/status").json()
+    monkeypatch.setattr(solar_routes, "DEMO", False)
+    real_body = client.get("/api/car/solar/status").json()
+    assert set(demo_body) == set(real_body)
 
 
 def test_demo_status_returns_the_fixture_not_real_data(client):

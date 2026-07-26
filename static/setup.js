@@ -131,10 +131,44 @@ $("save-deadline").addEventListener("click", async () => {
 
 (async function init() {
   initTheme();
+  // Each load is caught independently, so a failure in one does not mask
+  // whether the other succeeded -- disabling only the Save buttons whose
+  // form is actually showing stale HTML defaults. Without this, a failed
+  // load leaves the page looking normal and clicking Save writes those
+  // defaults over the owner's real settings.
+  let homeOk = true;
+  let solarOk = true;
   try {
     await loadHome();
+  } catch (err) {
+    console.error(err);
+    homeOk = false;
+  }
+  try {
     await loadSolar();
   } catch (err) {
     console.error(err);
+    solarOk = false;
+  }
+
+  if (!homeOk || !solarOk) {
+    const parts = [];
+    if (!homeOk) parts.push("home");
+    if (!solarOk) parts.push("solar charging");
+    const banner = $("setup-error");
+    if (banner) {
+      banner.textContent =
+        `Could not load your current ${parts.join(" and ")} settings from the ` +
+        "server. Saving is disabled so the form's placeholder values cannot " +
+        "overwrite yours -- reload this page once the server is reachable.";
+      banner.hidden = false;
+    }
+    if (!homeOk) $("save-home").disabled = true;
+    if (!solarOk) {
+      // The deadline fields are populated by loadSolar() too, so a failed
+      // load leaves them at HTML placeholders as well.
+      $("save-solar").disabled = true;
+      $("save-deadline").disabled = true;
+    }
   }
 })();

@@ -358,6 +358,7 @@ def solar_status() -> dict:
     """A mid-session solar charge, so the card can be built without a car."""
     return {
         "state": "charging",
+        "enabled": True,
         "surplus_w": 6240.0,
         "amps": 26,
         "soc": 72,

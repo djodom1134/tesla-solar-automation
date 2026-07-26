@@ -154,6 +154,7 @@ async def get_solar_status() -> dict[str, Any]:
         " WHERE vin = ? ORDER BY ts DESC LIMIT 1", (vin,)).fetchone() if vin else None
     return {
         "state": state["state"],
+        "enabled": bool(solar.load_config(db)["enabled"]),
         "surplus_w": last["surplus_w"] if last else None,
         "amps": (last["amps_written"] or last["amps_before"]) if last else None,
         "soc": view.get("soc"),

@@ -58,7 +58,7 @@ async def poll_once(client: TeslaClient, store: Store, vin: str, cfg):
     """One cycle: cheap state check, then a paid read only if it can succeed."""
     try:
         car_state = (await client.vehicle(vin)).get("state") or "offline"
-    except TeslaAPIError as exc:
+    except (TeslaAPIError, httpx.HTTPError, OSError) as exc:
         _log(f"state check failed: {exc}")
         return "offline", None
 
@@ -70,7 +70,7 @@ async def poll_once(client: TeslaClient, store: Store, vin: str, cfg):
     except VehicleAsleep:
         # Documented: vehicle_data can 408 even when /vehicles says online.
         return "asleep", None
-    except TeslaAPIError as exc:
+    except (TeslaAPIError, httpx.HTTPError, OSError) as exc:
         _log(f"vehicle_data failed: {exc}")
         return car_state, None
 
@@ -104,19 +104,33 @@ async def _command(client: TeslaClient, vin: str, name: str, **params) -> bool:
     return True
 
 
-async def _restore(client: TeslaClient, db, vin: str, st: dict) -> tuple[bool, bool]:
+async def _restore(client: TeslaClient, db, vin: str, st: dict,
+                   view: dict | None) -> tuple[bool, bool]:
     """Put the owner's own settings back. Returns (succeeded, commanded).
 
     Clears dirty ONLY on success. A refused or failed write must leave the
     originals on disk to retry: the car still holds the solar values, and this
     record is the only way back to the owner's.
+
+    The charge LIMIT is restored only when the controller actually raised it
+    (`raised_to` is set) AND the car still holds that raised value (`view`'s
+    current limit == `raised_to`). Rewriting it unconditionally would spend a
+    billed command to re-assert a value nothing changed, and would silently
+    revert an owner who raised or lowered the limit themselves in the Tesla
+    app mid-session. `view` is the caller's most recent vehicle_data view;
+    pass None only when no view is available at all, which skips the limit
+    restore rather than guessing.
     """
     ok, commanded = True, False
     if st["original_amps"] is not None:
         commanded = True
         ok &= await _command(client, vin, "set_charging_amps",
                              charging_amps=st["original_amps"])
-    if st["original_limit"] is not None:
+    if view is None:
+        if st["original_limit"] is not None:
+            _log("no view available; skipping charge-limit restore")
+    elif (st["original_limit"] is not None and st["raised_to"] is not None
+          and view.get("limit") == st["raised_to"]):
         commanded = True
         ok &= await _command(client, vin, "set_charge_limit",
                              percent=st["original_limit"])
@@ -129,11 +143,18 @@ async def _restore(client: TeslaClient, db, vin: str, st: dict) -> tuple[bool, b
 
 
 async def recover(client: TeslaClient, db, vin: str, st: dict, location: str,
-                  cfg) -> bool:
+                  cfg, view: dict | None = None) -> bool:
     """Crash recovery. Returns True when the state is clean enough to engage.
 
     Gated on all of: dirty, at home, online, proxy reachable. A failed gate
     leaves dirty SET and returns False -- never cleared by giving up.
+
+    Called ONCE per process, at startup -- see run(). Recovery is a
+    startup-only action (spec 3.6): `dirty` is the normal, healthy condition
+    for the entire duration of an engagement (set on charge_start, cleared
+    only on restore), so calling this every tick would see dirty=1 on the
+    tick right after an ordinary engagement and restore the owner's settings
+    mid-charge -- see C5.
     """
     if not st["dirty"]:
         return True
@@ -143,7 +164,7 @@ async def recover(client: TeslaClient, db, vin: str, st: dict, location: str,
     if not solar.may_restore(st["dirty"], location, True, proxy_ok):
         _log(f"dirty, cannot restore yet (location={location}, proxy={proxy_ok})")
         return False
-    ok, _ = await _restore(client, db, vin, st)
+    ok, _ = await _restore(client, db, vin, st, view)
     if ok:
         # Reset the machine, not just the flags. _restore() nulls the
         # originals, so a machine left in "charging" resumes on the next tick
@@ -173,10 +194,11 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
 
     today = datetime.now(ZoneInfo(cfg.timezone)).strftime("%Y-%m-%d")
 
-    # --- crash recovery, before anything else can engage -------------------
-    if not await recover(client, db, vin, st, location, cfg):
-        return st["state"], False
-    st = solar.load_state(db, vin)
+    # Crash recovery runs ONCE at process startup (see run()), never here.
+    # `dirty` is the normal, healthy condition for the whole duration of an
+    # engagement -- calling recover() on every tick sees it set on the tick
+    # right after an ordinary charge_start and restores the owner's settings
+    # mid-charge, forcing the machine back to idle every other tick. See C5.
 
     if not conf["enabled"] and st["state"] == "idle":
         return "idle", False
@@ -188,7 +210,7 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
         # No location gate here would command a car whose location we cannot
         # even confirm; "unknown" must freeze exactly as it does in advance().
         if st["state"] != "idle" and location == "home":
-            await _restore(client, db, vin, st)
+            await _restore(client, db, vin, st, view)
         # Persist idle explicitly -- returning "idle" without writing it left
         # the DB holding a stale "charging" that resumed after midnight
         # rollover with nothing left to restore.
@@ -240,7 +262,7 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
     restored = False
     for action in actions:
         if action == "restore":
-            _, commanded = await _restore(client, db, vin, st)
+            _, commanded = await _restore(client, db, vin, st, view)
             restored = restored or commanded
         elif action == "wake":
             # wake_up is a dedicated REST endpoint, NOT a signed command --
@@ -248,9 +270,17 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
             try:
                 await client.wake_up(vin)
                 await asyncio.sleep(5)
-            except (TeslaAPIError, TeslaAuthError) as exc:
+            except (TeslaAPIError, TeslaAuthError, httpx.HTTPError, OSError) as exc:
                 _log(f"wake failed: {exc}")
-                return st["state"], False
+                # Persist a RESET hold, not just an early return. Returning
+                # st["state"] unchanged leaves hold_s already at
+                # restart_hold_s on disk, so advance() re-emits ["wake", ...]
+                # on the very next tick -- at $0.02/wake and a 120s period
+                # that is ~$0.60/hour until the daily cap intervenes. Forcing
+                # "stopped" with hold_s=0 makes the dwell re-accumulate.
+                solar.save_state(db, vin, **solar.machine_fields(
+                    solar.Machine(state="stopped", hold_s=0)))
+                return "stopped", False
         elif action == "charge_start":
             if st["original_amps"] is None:      # remember BEFORE we change it
                 solar.save_state(db, vin, dirty=1,
@@ -263,6 +293,16 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
             await _command(client, vin, "charge_stop")
         elif action == "set_amps":
             target = tun.min_a if machine.state == "grace" else decision.target_a
+            # Spec 3.2: never re-send a value the car already holds
+            # acknowledged (charge_current_request). Without this, a target
+            # pinned at a clamp while the error stays outside the deadband
+            # re-commands the same value every tick forever -- most likely
+            # triggered by charge completion, where amps_actual drops to 0,
+            # surplus_w becomes the full export, and the machine stays
+            # charging. Grace entry is the one exception: it must always
+            # write, because it is the one permitted ramp violation.
+            if target == view.get("charge_amps") and machine.state != "grace":
+                continue
             if await _command(client, vin, "set_charging_amps",
                               charging_amps=target):
                 written = target
@@ -290,7 +330,7 @@ async def refresh_view(client: TeslaClient, store_: Store, vin: str):
         view = vehicle.derive(await client.vehicle_data(vin))
     except VehicleAsleep:
         return None
-    except TeslaAPIError as exc:
+    except (TeslaAPIError, httpx.HTTPError, OSError) as exc:
         _log(f"vehicle_data failed: {exc}")
         return None
     store_.record(view, at_home=home.classify(view, home.load(store_._db)))
@@ -310,33 +350,36 @@ def should_refresh_view(ticks_since_view: int, refresh_every: int,
 async def run(once: bool = False) -> int:
     client = TeslaClient(settings)
     store = Store(settings.db_file)
-    try:
-        vin = await client.resolve_vin()
-    except (TeslaAPIError, TeslaAuthError) as exc:
-        _log(f"cannot resolve VIN: {exc}")
-        await client.aclose()
-        store.close()
-        return 1
-
-    _log(f"collecting for {vin}")
-
-    # Resolved once, not once per tick: the site doesn't change mid-process,
-    # and re-deriving it every tick was an unbudgeted /api/1/products call
-    # every time its 300s cache expired -- ~72 extra requests/day at a 120s
-    # period, comparable to the whole saving the call-pattern rule buys.
-    site_id = None
-    try:
-        sites = await client.energy_sites()
-        if sites:
-            site_id = sites[0]["energy_site_id"]
-        else:
-            _log("no energy site on this account; solar control cannot run")
-    except (TeslaAPIError, TeslaAuthError) as exc:
-        _log(f"cannot resolve energy site: {exc}")
-
     engaged, ticks_since_view, wrote_last_tick = 0, 0, False
     car_state, view = "offline", None
+    # Crash recovery (spec 3.6) runs ONCE per process, here, not per tick --
+    # see C5. A clean start (not dirty) clears this on the very first engaged
+    # tick at no cost, because recover() itself returns True immediately when
+    # nothing is dirty.
+    recovery_done = False
     try:
+        try:
+            vin = await client.resolve_vin()
+        except (TeslaAPIError, TeslaAuthError, httpx.HTTPError, OSError) as exc:
+            _log(f"cannot resolve VIN: {exc}")
+            return 1
+
+        _log(f"collecting for {vin}")
+
+        # Resolved once, not once per tick: the site doesn't change mid-process,
+        # and re-deriving it every tick was an unbudgeted /api/1/products call
+        # every time its 300s cache expired -- ~72 extra requests/day at a 120s
+        # period, comparable to the whole saving the call-pattern rule buys.
+        site_id = None
+        try:
+            sites = await client.energy_sites()
+            if sites:
+                site_id = sites[0]["energy_site_id"]
+            else:
+                _log("no energy site on this account; solar control cannot run")
+        except (TeslaAPIError, TeslaAuthError, httpx.HTTPError, OSError) as exc:
+            _log(f"cannot resolve energy site: {exc}")
+
         while True:
             conf = solar.load_config(store._db)
             st = solar.load_state(store._db, vin)
@@ -366,6 +409,24 @@ async def run(once: bool = False) -> int:
 
             wrote_last_tick = False
             if view is not None and solar_wanted:
+                if not recovery_done:
+                    db = store._db
+                    recovery_done = await recover(
+                        client, db, vin, solar.load_state(db, vin),
+                        home.classify(view, home.load(db)), settings, view)
+                    if not recovery_done:
+                        # Best-effort, not synchronous (spec 3.6): leave dirty
+                        # set and retry next tick rather than engaging with a
+                        # machine the recovery gate refused to clear.
+                        engaged = 0
+                        soc = (view or {}).get("soc")
+                        _log(f"{car_state}" + (f" soc={soc}%" if soc is not None else "")
+                             + " [recovery pending]")
+                        if once:
+                            return 0
+                        await asyncio.sleep(
+                            next_interval(car_state, view, settings, 0))
+                        continue
                 state, wrote_last_tick = await solar_tick(
                     client, store, vin, view, settings, site_id)
                 engaged = conf["period_s"] if state in ENGAGED_STATES else 0

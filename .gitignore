@@ -22,4 +22,4 @@ __pycache__/
 .venv/
 venv/
 .gstack/
-.tokens.lock
+*.lock

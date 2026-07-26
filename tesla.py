@@ -92,7 +92,6 @@ def _acquire_lock(token_path: Path) -> int:
     Locks a sidecar `.lock` file, never the token file itself: TokenStore.save()
     uses os.replace(), which swaps the inode, and an flock follows the inode —
     so a lock taken on the token file would be silently released mid-write.
-    Blocking, so callers on an event loop must acquire via asyncio.to_thread.
 
     Test-only entry point (blocking). Production async code uses
     `_acquire_lock_async`, which never lets an fd survive an `await` while
