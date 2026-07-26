@@ -30,6 +30,20 @@ def test_config_partial_update_leaves_other_fields_alone():
     assert cfg["period_s"] == 120, "untouched field must keep its default"
 
 
+def test_config_updates_survive_each_other():
+    """The load-bearing guarantee: a second save touching a DIFFERENT field
+    must not revert the first save's field to its default. A writer that
+    rebuilt from CONFIG_DEFAULTS every call would pass every other test in
+    this file."""
+    conn = db()
+    solar.save_config(conn, enabled=1)
+    solar.save_config(conn, soc_ceiling=100)
+    cfg = solar.load_config(conn)
+    assert cfg["enabled"] == 1, "second save reverted the first"
+    assert cfg["soc_ceiling"] == 100
+    assert cfg["period_s"] == 120, "untouched field should still be default"
+
+
 def test_tunables_prefer_the_cars_reported_ceiling_and_voltage():
     cfg = solar.load_config(db())
     t = solar.tunables_from(cfg, amps_max=32, volts=241)
@@ -54,6 +68,15 @@ def test_state_round_trips_and_defaults_clean():
     solar.save_state(conn, "V1", dirty=1, original_amps=32, original_limit=80)
     st = solar.load_state(conn, "V1")
     assert (st["dirty"], st["original_amps"], st["original_limit"]) == (1, 32, 80)
+
+
+def test_state_updates_survive_each_other():
+    conn = db()
+    solar.save_state(conn, "V1", dirty=1)
+    solar.save_state(conn, "V1", state="charging")
+    st = solar.load_state(conn, "V1")
+    assert st["dirty"] == 1, "second save reverted the first"
+    assert st["state"] == "charging"
 
 
 def test_request_cap_counts_and_trips():

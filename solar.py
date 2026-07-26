@@ -1,8 +1,14 @@
 """Closed-loop solar charge control.
 
-Everything here is pure: it takes numbers and returns numbers. collector.py
-owns all I/O. That split is what makes a control system testable without a car,
-a roof, or the weather.
+The control law and the state machine are pure: they take numbers and return
+numbers, with no I/O of their own. collector.py owns the network and drives
+them tick by tick. That split is what makes a control system testable without
+a car, a roof, or the weather.
+
+The persistence functions below them are the deliberate exception: they are
+where the control law's and state machine's numbers live between ticks --
+config, machine state, tick history, and the request counter -- and they do
+touch a database. Nothing above them in this file does.
 
 THE CENTRAL IDEA. grid_power already contains the car's own draw, so the loop
 never needs to know what the car is consuming in absolute terms. It servos the
@@ -287,6 +293,20 @@ def machine_fields(m: Machine) -> dict:
     return {k: getattr(m, k) for k in MACHINE_FIELDS}
 
 
+def _begin_immediate(db: sqlite3.Connection) -> bool:
+    """Take SQLite's write lock BEFORE the read half of a read-modify-write.
+
+    Without it, two processes can both SELECT the old row, both compute an
+    update from it, and the second write silently discards the first. Returns
+    whether this call opened the transaction, so nested use does not commit
+    someone else's work out from under them.
+    """
+    if db.in_transaction:
+        return False
+    db.execute("BEGIN IMMEDIATE")
+    return True
+
+
 def load_config(db: sqlite3.Connection) -> dict:
     row = db.execute("SELECT * FROM solar_config WHERE id = 1").fetchone()
     if row is None:
@@ -294,10 +314,18 @@ def load_config(db: sqlite3.Connection) -> dict:
     return {k: row[k] for k in CONFIG_DEFAULTS}
 
 
+# WRITER SEPARATION, relied upon by the whole design: solar_config is written
+# only by the web app (the owner editing settings) and solar_state only by the
+# collector (one row per vehicle, one process). They never write the same table,
+# so cross-process contention on a single row does not arise in the current
+# wiring. BEGIN IMMEDIATE above is defence in depth, and this comment is the
+# thing to re-read before adding a config write to the collector or a state
+# write to the web app.
 def save_config(db: sqlite3.Connection, **fields) -> None:
     unknown = set(fields) - set(CONFIG_DEFAULTS)
     if unknown:
         raise ValueError(f"unknown solar_config fields: {sorted(unknown)}")
+    owned = _begin_immediate(db)
     current = load_config(db)
     current.update(fields)
     columns = list(CONFIG_DEFAULTS)
@@ -309,7 +337,8 @@ def save_config(db: sqlite3.Connection, **fields) -> None:
               updated_at = excluded.updated_at""",
         [current[c] for c in columns] + [int(time.time())],
     )
-    db.commit()
+    if owned:
+        db.commit()
 
 
 def tunables_from(cfg: dict, amps_max: int | None, volts: int | None) -> Tunables:
@@ -323,6 +352,10 @@ def tunables_from(cfg: dict, amps_max: int | None, volts: int | None) -> Tunable
     return Tunables(
         margin_w=cfg["margin_w"], deadband_w=cfg["deadband_w"],
         ramp_a=cfg["ramp_a"], min_a=cfg["min_a"],
+        # Truthy, not `is None`, deliberately: a zero from either field would
+        # reach control()'s `error_w / volts` and raise ZeroDivisionError.
+        # Coercing a nonsensical zero to the documented nominal is the safe
+        # failure.
         max_a=amps_max if amps_max else 48,
         volts=volts if volts else 240,
     )
@@ -340,10 +373,18 @@ def load_state(db: sqlite3.Connection, vin: str) -> dict:
     return {k: row[k] for k in STATE_DEFAULTS}
 
 
+# WRITER SEPARATION, relied upon by the whole design: solar_config is written
+# only by the web app (the owner editing settings) and solar_state only by the
+# collector (one row per vehicle, one process). They never write the same table,
+# so cross-process contention on a single row does not arise in the current
+# wiring. BEGIN IMMEDIATE above is defence in depth, and this comment is the
+# thing to re-read before adding a config write to the collector or a state
+# write to the web app.
 def save_state(db: sqlite3.Connection, vin: str, **fields) -> None:
     unknown = set(fields) - set(STATE_DEFAULTS)
     if unknown:
         raise ValueError(f"unknown solar_state fields: {sorted(unknown)}")
+    owned = _begin_immediate(db)
     current = load_state(db, vin)
     current.update(fields)
     columns = list(STATE_DEFAULTS)
@@ -355,7 +396,8 @@ def save_state(db: sqlite3.Connection, vin: str, **fields) -> None:
               updated_at = excluded.updated_at""",
         [vin] + [current[c] for c in columns] + [int(time.time())],
     )
-    db.commit()
+    if owned:
+        db.commit()
 
 
 def log_tick(db: sqlite3.Connection, vin: str, **fields) -> None:
@@ -364,6 +406,9 @@ def log_tick(db: sqlite3.Connection, vin: str, **fields) -> None:
     columns = ("ts", "state", "grid_w", "solar_w", "car_w", "surplus_w", "error_w",
                "amps_before", "amps_target", "amps_written", "soc", "import_w",
                "period_s", "note")
+    unknown = set(fields) - set(columns)
+    if unknown:
+        raise ValueError(f"unknown solar_ticks fields: {sorted(unknown)}")
     db.execute(
         f"""INSERT OR REPLACE INTO solar_ticks (vin, {', '.join(columns)})
             VALUES (?, {', '.join('?' * len(columns))})""",
