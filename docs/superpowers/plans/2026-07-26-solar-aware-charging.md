@@ -21,6 +21,7 @@
 - **`solar_routes.router` must be included BEFORE the static mount** in `app.py`. The mount at `app.py:240` is a catch-all; anything registered after it is unreachable.
 - **Every energy value from Tesla is watt-hours**; every power value is watts. Convert at the boundary, never in the middle.
 - **Timezone is `settings.timezone`** (`America/Denver`). All date boundaries are local midnight.
+- **API COST IS A HARD CONSTRAINT.** Confirmed rates: data 500/$1, commands 1,000/$1, wakes 50/$1, streaming 150,000/$1, against a $10/month credit — i.e. **5,000 data requests/month, ~167/day for everything.** Every avoidable request is real money. Specifically: never issue a `/vehicles/{vin}` state check when the car is known awake; never fetch `vehicle_data` on a tick that does not need it; treat a wake ($0.02, 20× a data call) as expensive and rate-limited. See spec §1.7.1.
 - Python: `from __future__ import annotations` at the top of every new module, matching the existing files.
 - Commit messages end with: `Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>`
 
@@ -459,7 +460,29 @@ import sqlite3; d=sqlite3.connect('car.db')
 print(d.execute('SELECT ts, battery_level, charging_state FROM samples ORDER BY ts DESC LIMIT 3').fetchall())"
 ```
 
-- [ ] **Step 6: Write the launchd agent**
+- [ ] **Step 6: Lengthen `poll_asleep` to fit the API budget**
+
+`config.py:79` defaults `poll_asleep` to 300 s. At 288 state checks/day that is
+**$14.40/month against a $10 credit** — the collector alone would bust the
+budget before the solar loop exists.
+
+Change the default to 1800:
+
+```python
+    poll_asleep: int = field(default_factory=lambda: int(_clean(os.getenv("POLL_ASLEEP")) or 1800))
+```
+
+Also change `poll_idle` from 900 to 1800 on the line above it, for the same
+reason. A parked, awake, idle car changes nothing worth sampling every 15
+minutes.
+
+Nothing is lost: a sleeping car emits no data, so the only casualty is
+precision about *when* it woke. Update `.env.example` if it documents these.
+
+Run `.venv/bin/python -m pytest tests/test_collector.py -v` — the interval
+tests pass explicit values via `SimpleNamespace` and must stay green.
+
+- [ ] **Step 7: Write the launchd agent**
 
 Create `com.tenxcious.tesla-collector.plist`:
 
@@ -493,7 +516,7 @@ Create `com.tenxcious.tesla-collector.plist`:
 
 Append `collector.log` to `.gitignore`.
 
-- [ ] **Step 7: Install and verify the agent is running**
+- [ ] **Step 8: Install and verify the agent is running**
 
 ```bash
 cp /Users/d/Code/tesla_automation/com.tenxcious.tesla-collector.plist ~/Library/LaunchAgents/
@@ -506,7 +529,7 @@ tail -5 /Users/d/Code/tesla_automation/collector.log
 
 Expected: `launchctl list` shows the label with exit status `0` in the second column, and the log shows a `collecting for 5YJSA...` line followed by a state line.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
 git add collector.py tests/test_collector.py com.tenxcious.tesla-collector.plist .gitignore
@@ -1590,7 +1613,7 @@ def test_config_defaults_exist_before_anything_is_written():
     assert cfg["period_s"] == 120
     assert cfg["soc_ceiling"] == 90
     assert cfg["min_a"] == 5
-    assert cfg["daily_request_cap"] == 1200
+    assert cfg["daily_request_cap"] == 400
 
 
 def test_config_partial_update_leaves_other_fields_alone():
@@ -1703,7 +1726,11 @@ CREATE TABLE IF NOT EXISTS solar_config (
   raise_hold_s      INTEGER NOT NULL DEFAULT 600,
   soc_ceiling       INTEGER NOT NULL DEFAULT 90,
   raise_limit       INTEGER NOT NULL DEFAULT 1,
-  daily_request_cap INTEGER NOT NULL DEFAULT 1200,
+  -- 400/day is a RUNAWAY BACKSTOP, set above the ~250 expected on a charging
+  -- day. It is not a budget enforcer. The earlier default of 1200 would have
+  -- been $72/month against a $10 credit.
+  daily_request_cap INTEGER NOT NULL DEFAULT 400,
+  view_refresh_ticks INTEGER NOT NULL DEFAULT 5,
   deadline_soc      INTEGER,
   deadline_hour     INTEGER,
   updated_at        INTEGER NOT NULL DEFAULT 0
@@ -1750,7 +1777,7 @@ CONFIG_DEFAULTS = {
     "enabled": 0, "period_s": 120, "margin_w": 100, "deadband_w": 250,
     "ramp_a": 8, "min_a": 5, "grace_s": 180, "restart_hold_s": 300,
     "start_hold_s": 60, "raise_hold_s": 600, "soc_ceiling": 90,
-    "raise_limit": 1, "daily_request_cap": 1200,
+    "raise_limit": 1, "daily_request_cap": 400, "view_refresh_ticks": 5,
     "deadline_soc": None, "deadline_hour": None,
 }
 
@@ -2137,7 +2164,8 @@ CONFIG_BOUNDS = {
     "grace_s": (0, 3600), "restart_hold_s": (60, 3600),
     "start_hold_s": (0, 3600), "raise_hold_s": (0, 7200),
     "soc_ceiling": (50, 100), "raise_limit": (0, 1),
-    "daily_request_cap": (0, 20000), "deadline_soc": (0, 100),
+    "daily_request_cap": (0, 20000), "view_refresh_ticks": (1, 60),
+    "deadline_soc": (0, 100),
     "deadline_hour": (0, 23),
 }
 
@@ -2561,25 +2589,87 @@ async def _restore(client: TeslaClient, db, vin: str, st: dict) -> None:
                      raised_to=None, engaged_at=None)
 ```
 
-- [ ] **Step 7: Call it from the run loop**
+- [ ] **Step 7: Call it from the run loop, with the budget call pattern**
 
-In `run()`, replace the body of the `while True:` block with:
+Read spec §1.7.1 before writing this. The naive version — `poll_once` every
+tick, then `live_status` — makes **three** billable calls per tick and costs
+**$21.78/month** at a 120 s period, against a $10 credit. The pattern below
+brings it to ~1.4 calls/tick and ~$13. This is a requirement, not a tuning
+opportunity.
+
+Two savings, both safe:
+
+- **No state check while engaged.** `poll_once`'s cheap `/vehicles/{vin}` call
+  exists so we don't pay for a `vehicle_data` that is going to 408. While
+  engaged the car is demonstrably awake — it is charging. If `vehicle_data`
+  later 408s, that *is* the signal it slept.
+- **`vehicle_data` only when it is needed:** after an amps write (the §3.7.2
+  readback invariant), every `view_refresh_ticks` (default 5) to catch unplug
+  and drive-away, and on any state transition. Between those, reuse the last
+  view and the last acknowledged amps.
+
+First change `poll_once` to stamp the location classification:
 
 ```python
+    store.record(view, at_home=home.classify(view, home.load(store._db)))
+    return car_state, view
+```
+
+Then add a helper beside it:
+
+```python
+async def refresh_view(client: TeslaClient, store_: Store, vin: str):
+    """A paid vehicle_data read with no preceding state check.
+
+    Only called when the car is already known awake. Returns None if it turns
+    out to be asleep after all -- which is the 408 doing the state check's job
+    for free.
+    """
+    try:
+        view = vehicle.derive(await client.vehicle_data(vin))
+    except VehicleAsleep:
+        return None
+    except TeslaAPIError as exc:
+        _log(f"vehicle_data failed: {exc}")
+        return None
+    store_.record(view, at_home=home.classify(view, home.load(store_._db)))
+    return view
+```
+
+Now replace the body of `run()`'s `while True:` block with:
+
+```python
+            conf = solar.load_config(store._db)
+            st = solar.load_state(store._db, vin)
+            solar_wanted = bool(conf["enabled"]) or bool(st["dirty"])
+
             try:
-                car_state, view = await poll_once(client, store, vin, settings)
+                if engaged and view is not None:
+                    # Awake by definition. Skip the state check, and only pay
+                    # for vehicle_data when this tick actually needs it.
+                    stale = ticks_since_view >= conf["view_refresh_ticks"]
+                    if stale or wrote_last_tick:
+                        fresh = await refresh_view(client, store, vin)
+                        if fresh is None:
+                            car_state, view, engaged = "asleep", None, 0
+                        else:
+                            view, ticks_since_view = fresh, 0
+                    else:
+                        ticks_since_view += 1
+                else:
+                    car_state, view = await poll_once(client, store, vin, settings)
+                    ticks_since_view = 0
             except TeslaAuthError as exc:
                 _log(f"auth lost: {exc}")
                 return 1
 
-            engaged = 0
-            if view is not None:
-                conf = solar.load_config(store._db)
-                st = solar.load_state(store._db, vin)
-                if conf["enabled"] or st["dirty"]:
-                    state = await solar_tick(client, store, vin, view, settings)
-                    if state in ENGAGED_STATES:
-                        engaged = conf["period_s"]
+            wrote_last_tick = False
+            if view is not None and solar_wanted:
+                state, wrote_last_tick = await solar_tick(
+                    client, store, vin, view, settings)
+                engaged = conf["period_s"] if state in ENGAGED_STATES else 0
+            else:
+                engaged = 0
 
             soc = (view or {}).get("soc")
             _log(f"{car_state}" + (f" soc={soc}%" if soc is not None else ""))
@@ -2588,12 +2678,60 @@ In `run()`, replace the body of the `while True:` block with:
             await asyncio.sleep(next_interval(car_state, view, settings, engaged))
 ```
 
-Also change `poll_once` to stamp the location classification:
+Initialise the three carried variables immediately above `while True:`:
 
 ```python
-    store.record(view, at_home=home.classify(view, home.load(store._db)))
-    return car_state, view
+    engaged, ticks_since_view, wrote_last_tick = 0, 0, False
+    car_state, view = "offline", None
 ```
+
+Finally, change `solar_tick` to return `(state, wrote)` rather than just the
+state — the loop needs to know whether an amps write happened so it can force
+the readback next tick. Its `return` statements become:
+
+```python
+    return machine.state, written is not None
+```
+
+and the early returns become `return st["state"], False`.
+
+**Add a test** to `tests/test_collector_solar.py` proving the saving is real:
+
+```python
+def test_engaged_ticks_skip_the_state_check_and_most_vehicle_data(monkeypatch):
+    """Three billable calls per tick is $22/month; this pattern is ~1.4."""
+    calls = []
+
+    class FakeClient:
+        async def vehicle(self, vin):
+            calls.append("state"); return {"state": "online"}
+        async def vehicle_data(self, vin, *a, **k):
+            calls.append("data"); return {"response": {}}
+
+    # With view_refresh_ticks=5 and no writes, 5 engaged ticks must issue
+    # exactly ONE vehicle_data and ZERO state checks.
+    assert collector.should_refresh_view(ticks_since_view=0, refresh_every=5,
+                                         wrote_last_tick=False) is False
+    assert collector.should_refresh_view(ticks_since_view=5, refresh_every=5,
+                                         wrote_last_tick=False) is True
+    assert collector.should_refresh_view(ticks_since_view=0, refresh_every=5,
+                                         wrote_last_tick=True) is True
+```
+
+which requires extracting the predicate as a pure function in `collector.py`:
+
+```python
+def should_refresh_view(ticks_since_view: int, refresh_every: int,
+                        wrote_last_tick: bool) -> bool:
+    """Whether this engaged tick must pay for a vehicle_data read.
+
+    Every avoidable call is $0.002 against a $10/month credit. See spec
+    section 1.7.1.
+    """
+    return wrote_last_tick or ticks_since_view >= refresh_every
+```
+
+and using it in the loop in place of the inline `stale or wrote_last_tick`.
 
 - [ ] **Step 8: Run the tests to verify they pass**
 
@@ -2713,7 +2851,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
         <div class="row"><label for="mina">Minimum amps</label>
           <input type="number" id="mina" min="5" max="32" step="1" value="5"></div>
         <div class="row"><label for="cap">Daily request cap</label>
-          <input type="number" id="cap" min="0" max="20000" step="50" value="1200"></div>
+          <input type="number" id="cap" min="0" max="20000" step="50" value="400"></div>
       </details>
 
       <button id="save-solar">Save</button>

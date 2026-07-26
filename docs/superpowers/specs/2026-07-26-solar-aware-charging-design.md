@@ -146,26 +146,58 @@ From Tesla's billing-and-limits page:
   on the account**: Realtime Data 60/min, Device Commands 30/min, Wakes 3/min.
 - $10/month credit for individual developers.
 - Commands ≈ $0.001 (Tesla's worked example: 1,211 commands → $1.21).
-- **Per-request data pricing is unpublished.** The widely-cited $0.002 traces to
-  a third-party blog from 2024.
+- **Per-request rates, supplied by the owner from Tesla's own pricing page:**
+  **data 500/$1 ($0.002), commands 1,000/$1 ($0.001), wakes 50/$1 ($0.02),
+  streaming signals 150,000/$1.** The $10 credit therefore buys **5,000 data
+  requests/month ≈ 167/day for everything.**
 
-**Call budget, corrected.** [R] The original "~215 data calls/day" was not
-derivable from its own inputs. With the merged process of §2.1 the real figure
-is:
+**The budget is a hard design constraint, not a footnote.** The owner's stated
+goal is to stay at or near the $10 credit.
 
-```
-6 h surplus window ÷ 120 s          = 180 ticks
-  live_status                       = 180 calls   (energy)
-  vehicle_data                      = 180 calls   (vehicle — same poll serves
-                                                   history AND control, §2.1)
-  set_charging_amps, write-on-change ≈  40 commands (empirical guess, logged)
-                                      ────────────
-                                      ~360 data + ~40 commands per active day
-```
+**[R] The first two call-budget estimates in this document were both wrong**, and
+the second failure is the instructive one: the loop does **three** billable calls
+per tick, not two. `poll_once` issues a state check *and* a `vehicle_data`, and
+the solar tick then adds `live_status`. Measured against the real rates:
 
-At the unverified $0.002 that is ~$22/month if every day is a charging day.
-**This is why `period_s` is a config knob and why §3.5 caps spend in requests,
-not dollars.**
+| Configuration | ticks/day | requests/mo | all-in $/mo |
+|---|---|---|---|
+| 120 s, 6 h window, **as originally written (3 calls/tick)** | 180 | 8,100 | **$21.78** |
+| 120 s, 6 h, call pattern fixed (~1.4 calls/tick) | 180 | 3,780 | $13.14 |
+| 120 s, 4.5 h realistic surplus window | 135 | 2,835 | $11.25 |
+| 300 s, 6 h, fixed | 72 | 1,512 | $8.60 |
+
+(All-in includes the collector baseline at `poll_asleep=1800`, commands, and
+dashboard browsing.)
+
+**Owner's decision: keep the 120 s period and accept ~$11–13/month**, slightly
+above the credit, with the cost surfaced in the UI and one switch to drop to
+300 s. That is only affordable with the call-pattern requirement below.
+
+### 1.7.1 Call-pattern requirements — REQUIRED, not an optimisation
+
+Without these, 120 s costs $22/month rather than $12.
+
+1. **One `live_status` per tick.** Non-negotiable: `grid_power` is the only
+   signal the controller servos.
+2. **No state check while engaged.** `poll_once`'s cheap `/vehicles/{vin}` call
+   exists to avoid paying for a `vehicle_data` that will 408. While the loop is
+   engaged the car is demonstrably awake (it is charging), so the check buys
+   nothing. If `vehicle_data` later 408s, that *is* the signal the car slept.
+3. **`vehicle_data` only when it is needed**, not every tick:
+   - after any amps write, to satisfy the §3.7.2 readback invariant;
+   - every `view_refresh_ticks` (default 5) to catch unplug and drive-away;
+   - on any state-machine transition.
+   Between those, reuse the cached view and the last acknowledged amps.
+4. **`poll_asleep` 300 s → 1800 s.** The single largest saving (~$11.50/month) at
+   almost no cost: a sleeping car emits nothing, so the only loss is precision
+   about *when* it woke.
+5. **Wakes are the sleeper cost.** At $0.02 each, ten restarts a day is
+   $6/month — more than the entire solar loop. `restart_hold_s` is a budget
+   control, not merely a mechanical one.
+
+§3.5's cap stays denominated in requests, and its default drops from 1,200/day
+(which would have been **$72/month**) to 400/day — a runaway backstop set above
+the expected ~250 on a charging day, not a budget enforcer.
 
 ### 1.8 Impossible — do not design around finding a way
 
