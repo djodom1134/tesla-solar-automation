@@ -18,6 +18,7 @@ const state = {
   map: null,
   marker: null,
   refreshing: false,
+  commands: null,
 };
 
 const RANGES = [
@@ -267,6 +268,7 @@ async function main() {
   });
 
   initRanges();
+  await loadCommands();
   await refresh();
   await loadHistory();
 
@@ -423,6 +425,193 @@ function renderSoc() {
     (gaps ? `Dashed segments are periods the car was asleep (${gaps}).` : "");
 }
 
-/* Temporary no-op stub. Task 12 (controls) replaces renderControlsAvailability.
-   Keep this task independently runnable until then — this is not dead code. */
-function renderControlsAvailability() {}
+/* --------------------------------------------------------------- controls */
+
+async function loadCommands() {
+  try {
+    state.commands = await api("/api/car/commands");
+    renderControls();
+  } catch (err) {
+    $("controls").textContent = err.message;
+  }
+}
+
+function renderControls() {
+  const host = $("controls");
+  host.replaceChildren();
+  const { groups, commands } = state.commands;
+
+  const head = document.createElement("div");
+  head.className = "card-head";
+  const h2 = document.createElement("h2");
+  h2.textContent = "Controls";
+  const note = document.createElement("span");
+  note.className = "muted small";
+  note.id = "controls-note";
+  head.append(h2, note);
+  host.append(head);
+
+  for (const group of groups) {
+    const inGroup = commands.filter((c) => c.group === group);
+    if (!inGroup.length) continue;
+
+    const details = document.createElement("details");
+    details.className = "control-group";
+    // Charging is what the page is mostly for; the rest stay folded away.
+    details.open = group === "Charging";
+    const summary = document.createElement("summary");
+    summary.textContent = group;
+    details.append(summary);
+
+    const grid = document.createElement("div");
+    grid.className = "control-grid";
+    for (const cmd of inGroup) grid.append(controlRow(cmd));
+    details.append(grid);
+    host.append(details);
+  }
+  renderControlsAvailability();
+}
+
+function controlRow(cmd) {
+  const row = document.createElement("div");
+  row.className = "control-row";
+  row.dataset.cmd = cmd.id;
+
+  const label = document.createElement("span");
+  label.className = "control-label";
+  label.textContent = cmd.label;
+  row.append(label);
+
+  const inputs = document.createElement("div");
+  inputs.className = "control-inputs";
+  const fields = {};
+
+  for (const param of cmd.params) {
+    let field;
+    if (param.type === "enum") {
+      field = document.createElement("select");
+      for (const opt of param.options) {
+        const o = document.createElement("option");
+        o.value = String(opt.value);
+        o.textContent = opt.label;
+        field.append(o);
+      }
+      field.value = String(param.default);
+    } else if (param.type === "bool") {
+      field = document.createElement("select");
+      for (const [v, t] of [["true", "On"], ["false", "Off"]]) {
+        const o = document.createElement("option");
+        o.value = v;
+        o.textContent = t;
+        field.append(o);
+      }
+      field.value = String(param.default);
+    } else if (param.type === "string") {
+      field = document.createElement("input");
+      // PINs are never prefilled and never echoed.
+      field.type = param.secret ? "password" : "text";
+      field.autocomplete = "off";
+      field.placeholder = param.label;
+    } else {
+      field = document.createElement("input");
+      field.type = "number";
+      if (param.min != null) field.min = param.min;
+      if (param.max != null) field.max = param.max;
+      field.value = param.default ?? "";
+      field.step = param.type === "float" ? "0.5" : "1";
+    }
+    field.setAttribute("aria-label", param.label);
+    field.className = "control-field";
+    fields[param.name] = field;
+    inputs.append(field);
+  }
+
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = cmd.risk === "high" ? "btn danger" : "btn";
+  btn.textContent = "Send";
+  btn.addEventListener("click", () => send(cmd, fields, btn));
+  inputs.append(btn);
+
+  row.append(inputs);
+  return row;
+}
+
+async function send(cmd, fields, btn) {
+  const payload = {};
+  for (const [name, field] of Object.entries(fields)) payload[name] = field.value;
+
+  if (cmd.confirm) {
+    const asleep = state.body?.car_state !== "online";
+    const extra = asleep ? "\n\nThe car is asleep — wake it first or this will fail." : "";
+    if (!window.confirm(`${cmd.label}?${extra}`)) return;
+  }
+
+  btn.disabled = true;
+  const original = btn.textContent;
+  btn.textContent = "…";
+  try {
+    const result = await api(`/api/car/command/${cmd.id}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    toast(result.message, result.ok);
+    // The car takes a moment to reflect the change; re-read rather than guess.
+    if (result.ok) setTimeout(refresh, 3000);
+  } catch (err) {
+    toast(err.message, false);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = original;
+  }
+}
+
+function renderControlsAvailability() {
+  const host = $("controls");
+  if (!host || !state.commands) return;
+  const health = state.health;
+  const v = state.body?.view;
+  const note = $("controls-note");
+
+  // One blocking reason at a time, most fundamental first — a list of four
+  // problems is less actionable than the one to fix now.
+  let blocked = null;
+  if (health && health.proxy === false) {
+    blocked = "Signing proxy is not running — start it to enable controls.";
+  } else if (health && health.key_paired === false) {
+    blocked = "This app's key is not paired with the car. Open tesla.com/_ak/tenxcious.com on your phone.";
+  } else if (health && health.missing_scopes?.length) {
+    blocked = `Missing scope: ${health.missing_scopes.join(", ")}. Reconnect your Tesla account.`;
+  }
+
+  note.textContent = blocked || (state.body?.car_state === "online"
+    ? "" : "Car is asleep — commands will wake it or fail.");
+
+  for (const row of host.querySelectorAll(".control-row")) {
+    const cmd = state.commands.commands.find((c) => c.id === row.dataset.cmd);
+    let disabled = Boolean(blocked);
+    let reason = blocked || "";
+
+    // Seat and wheel heaters are rejected outright unless climate is already
+    // running, so the UI says so rather than letting the car refuse.
+    if (!disabled && cmd.needs.includes("climate_on") && v && !v.climate_any) {
+      disabled = true;
+      reason = "Turn climate on first.";
+    }
+    if (!disabled && cmd.needs.includes("user_present") && v && !v.user_present) {
+      disabled = true;
+      reason = "Only works when someone is in the car.";
+    }
+    if (!disabled && cmd.id === "set_sentry_mode" && v && v.sentry_available === false) {
+      disabled = true;
+      reason = "Sentry is not available on this car right now.";
+    }
+
+    row.classList.toggle("disabled", disabled);
+    row.title = reason;
+    for (const control of row.querySelectorAll("button, input, select")) {
+      control.disabled = disabled;
+    }
+  }
+}

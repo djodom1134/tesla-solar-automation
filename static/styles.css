@@ -332,3 +332,17 @@ th .key { vertical-align: middle; margin-right: .35rem; }
          border-radius: var(--radius); font-size: .9rem; z-index: 1000; max-width: 90vw;
          box-shadow: var(--shadow); }
 .toast.bad { background: var(--import); color: #fff; }
+
+.control-group { border-top: 1px solid var(--border); padding: .5rem 0; }
+.control-group summary { cursor: pointer; font-weight: 600; padding: .5rem 0;
+                         list-style: revert; }
+.control-grid { display: grid; gap: .5rem; padding: .5rem 0 1rem; }
+.control-row { display: flex; align-items: center; justify-content: space-between;
+               gap: 1rem; flex-wrap: wrap; }
+.control-row.disabled { opacity: .45; }
+.control-label { font-size: .95rem; }
+.control-inputs { display: flex; gap: .5rem; align-items: center; }
+.control-field { padding: .35rem .5rem; font: inherit; font-size: .9rem;
+                 border: 1px solid var(--border); border-radius: .35rem;
+                 background: var(--surface); color: var(--ink); min-width: 5rem; }
+.btn.danger { background: var(--import); }
