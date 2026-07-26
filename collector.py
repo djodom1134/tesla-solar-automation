@@ -234,6 +234,22 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
         return st["state"], False
     grid_w = float(grid_w)
 
+    # Spec 5: a frozen meter must never be trusted as evidence of surplus. A
+    # gateway stuck at a large NEGATIVE (export) reading keeps error_w
+    # positive forever -- the controller ramps to max_a and holds there, and
+    # nothing downstream can ever observe the floor breach that would stop
+    # it. The current reading is included (this tick's own row is not
+    # written yet) alongside the prior logged ticks, newest first.
+    recent = [grid_w] + solar.recent_grid_w(db, vin, solar.GRID_STUCK_TICKS - 1)
+    if solar.grid_is_stuck(recent):
+        _log(f"grid_power stuck at {grid_w:.0f}W for >= {solar.GRID_STUCK_TICKS} "
+             "consecutive ticks; holding amps, flagging suspect")
+        solar.log_tick(db, vin, ts=int(time.time()), state=st["state"],
+                       grid_w=grid_w, solar_w=live.get("solar_power"),
+                       soc=view.get("soc"), period_s=conf["period_s"],
+                       note="grid_power stuck")
+        return st["state"], False
+
     # --- decide ------------------------------------------------------------
     tun = solar.tunables_from(conf, view.get("amps_max"), view.get("volts"))
     current_a = view.get("amps_actual") or view.get("charge_amps") or tun.min_a

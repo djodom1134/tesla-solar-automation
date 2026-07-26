@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from types import SimpleNamespace
 
 import httpx
@@ -531,3 +532,199 @@ async def test_restore_with_no_view_skips_the_limit_and_logs(tmp_path, capsys):
     assert not any(name == "set_charge_limit" for name, _ in client.calls)
     assert "view" in capsys.readouterr().out.lower()
     store_.close()
+
+
+# --------------------------------------------------------------------------
+# run()'s startup recovery latch (collector.py:359, 412-429). recover() must
+# run ONCE per process, before the very first engaged tick -- never gate
+# solar_tick on every subsequent tick. The existing loop test
+# (test_run_engaged_ticks_batch_vehicle_data) starts with dirty=0, so
+# recover() returns True immediately and the recovery-pending branch
+# (collector.py:417-429, the `continue`) is never exercised by anything.
+# Deleting the entire `if not recovery_done:` block would leave all other
+# tests green while silently removing startup crash recovery.
+# --------------------------------------------------------------------------
+
+class _AwayDirtyClient:
+    """Reachable and dirty, but parked far from home -- a recovery gate that
+    can never pass. wake_up and command must never be reached while
+    recovery is pending; solar_tick must never run at all."""
+
+    def __init__(self):
+        self.commands: list[tuple[str, dict]] = []
+
+    async def resolve_vin(self):
+        return "VIN1"
+
+    async def energy_sites(self):
+        return [{"energy_site_id": 1}]
+
+    async def vehicle(self, vin):
+        return {"state": "online"}
+
+    async def vehicle_data(self, vin, *a, **k):
+        return {
+            "charge_state": {"charging_state": "Charging",
+                              "charge_current_request": 5,
+                              "charger_actual_current": 5,
+                              "conn_charge_cable": "IEC"},
+            "drive_state": {"latitude": 0.0, "longitude": 0.0},   # far from home
+            "vehicle_state": {},
+        }
+
+    async def command(self, vin, name, params):
+        self.commands.append((name, dict(params)))
+        return 200, {"response": {"result": True}}
+
+    async def wake_up(self, vin):
+        raise AssertionError("must not wake while recovery is pending")
+
+    async def aclose(self):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_recovery_pending_blocks_solar_tick(tmp_path, monkeypatch):
+    """dirty=1 with a gate that can never pass (car parked away from home):
+    solar_tick must never run and no command may ever be issued, tick after
+    tick.
+
+    Drives the REAL run(), bounded via a faked asyncio.sleep -- NOT
+    once=True. once=True returns from INSIDE the recovery-pending branch
+    before the loop ever reaches the `continue` this test guards, so it
+    cannot discriminate a missing `continue` (see the report for the
+    red/green proof: removing `continue` only fails under the bounded-tick
+    style used here).
+    """
+    monkeypatch.setattr(tesla, "proxy_up", lambda url: True)  # isolate the
+    # failure to location, not the proxy gate
+
+    db_path = tmp_path / "car.db"
+    seed = Store(db_path)
+    home.save(seed._db, 40.0, -105.0, 100)   # home is far from the client's (0, 0)
+    solar.save_state(seed._db, "VIN1", dirty=1, original_amps=10, original_limit=80)
+    seed.close()
+
+    monkeypatch.setattr(collector.settings, "db_file", db_path)
+    client = _AwayDirtyClient()
+    monkeypatch.setattr(collector, "TeslaClient", lambda settings: client)
+
+    async def stub_solar_tick(*a, **k):
+        raise AssertionError("solar_tick must not run while recovery is pending")
+    monkeypatch.setattr(collector, "solar_tick", stub_solar_tick)
+
+    sleep_count = 0
+
+    async def fake_sleep(seconds):
+        nonlocal sleep_count
+        sleep_count += 1
+        if sleep_count >= 3:
+            raise StopTest()
+    monkeypatch.setattr(collector.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(StopTest):
+        await collector.run()
+
+    assert client.commands == [], (
+        f"a blocked recovery gate must never command: {client.commands}")
+
+
+class _HomeChargingClient:
+    """Reachable, at home, plugged in, steady solar export -- the ordinary,
+    healthy dirty=0 startup that must engage and hold. Used to prove
+    recover() runs exactly once, not once per tick."""
+
+    def __init__(self):
+        self.commands: list[tuple[str, dict]] = []
+
+    async def resolve_vin(self):
+        return "VIN1"
+
+    async def energy_sites(self):
+        return [{"energy_site_id": 1}]
+
+    async def vehicle(self, vin):
+        return {"state": "online"}
+
+    async def vehicle_data(self, vin, *a, **k):
+        return {
+            "charge_state": {"charging_state": "Charging",
+                              "charger_actual_current": 24,
+                              "charge_current_request_max": 48,
+                              "charger_voltage": 240,
+                              "charge_current_request": 24,
+                              "battery_level": 55, "charge_limit_soc": 80,
+                              "conn_charge_cable": "IEC",
+                              "fast_charger_present": False,
+                              "fast_charger_type": None},
+            "drive_state": {"latitude": 40.0, "longitude": -105.0},
+            "vehicle_state": {},
+        }
+
+    async def _get(self, path, ttl=0):
+        return {"grid_power": -6000.0, "solar_power": 6000.0}
+
+    async def command(self, vin, name, params):
+        self.commands.append((name, dict(params)))
+        return 200, {"response": {"result": True}}
+
+    async def wake_up(self, vin):
+        raise AssertionError("must never wake a car that never slept")
+
+    async def aclose(self):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_recovery_latches_once_when_dirty_is_clear(tmp_path, monkeypatch):
+    """dirty=0 (the ordinary, healthy start): recover() must run on tick one
+    and never again, however many ticks follow.
+
+    recover() itself is harmless to call every tick when dirty=0 -- it
+    short-circuits True immediately -- so a behavioural assertion alone
+    (state reaches "charging") would stay green even if the `if not
+    recovery_done:` gate were deleted entirely. The call-count assertion is
+    what actually pins the latch.
+    """
+    db_path = tmp_path / "car.db"
+    seed = Store(db_path)
+    solar.save_config(seed._db, enabled=1)     # a tmp, throwaway DB
+    home.save(seed._db, 40.0, -105.0, 100)
+    # Pre-seed past start_hold_s so engagement fires on the very first tick,
+    # matching the C5 test's style above.
+    solar.save_state(seed._db, "VIN1", state="idle", hold_s=10_000)
+    seed.close()
+
+    monkeypatch.setattr(collector.settings, "db_file", db_path)
+    client = _HomeChargingClient()
+    monkeypatch.setattr(collector, "TeslaClient", lambda settings: client)
+
+    recover_calls = []
+    real_recover = collector.recover
+
+    async def counting_recover(*args, **kwargs):
+        recover_calls.append(1)
+        return await real_recover(*args, **kwargs)
+    monkeypatch.setattr(collector, "recover", counting_recover)
+
+    sleep_count = 0
+
+    async def fake_sleep(seconds):
+        nonlocal sleep_count
+        sleep_count += 1
+        if sleep_count >= 4:
+            raise StopTest()
+    monkeypatch.setattr(collector.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(StopTest):
+        await collector.run()
+
+    assert len(recover_calls) == 1, (
+        f"recover() must latch after the first tick, called "
+        f"{len(recover_calls)} times")
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    st = solar.load_state(conn, "VIN1")
+    conn.close()
+    assert st["state"] == "charging", "the latch must not have blocked normal engagement"

@@ -83,6 +83,33 @@ def surplus_watts(car_w: float, grid_w: float) -> float:
     return car_w - grid_w
 
 
+# Spec 5: "grid_power stuck | same value > 5 consecutive ticks | hold amps,
+# flag suspect". Six consecutive byte-identical readings (">5") is the trigger;
+# named here so collector.py's history fetch and this check can never drift
+# out of sync with each other.
+GRID_STUCK_TICKS = 6
+
+
+def grid_is_stuck(recent: list[float], threshold: int = GRID_STUCK_TICKS) -> bool:
+    """True when the grid meter has reported the SAME value too many ticks running.
+
+    The meter refreshes every 60 s against a 120 s loop, so one or two repeats
+    are normal and expected. A long run of byte-identical readings is not: it
+    means the gateway has frozen, and a frozen NEGATIVE reading is the dangerous
+    one -- error_w stays positive, the controller ramps to max_a and holds, and
+    nothing in the state machine can ever observe the floor breach that would
+    stop it. It would draw full power from the grid all night while the meter
+    insisted it was sunny.
+
+    Compares exact equality deliberately: a live meter essentially never repeats
+    a float bit-for-bit, and any tolerance would mask a genuinely frozen value
+    that happens to sit near a real one.
+    """
+    if len(recent) < threshold:
+        return False
+    return all(v == recent[0] for v in recent[:threshold])
+
+
 def control(grid_w: float, current_a: int, tun: Tunables) -> Decision:
     """One tick of the integral controller."""
     error_w = -grid_w - tun.margin_w
@@ -472,6 +499,23 @@ def may_restore(dirty: int, location: str, online: bool, proxy_up: bool) -> bool
     giving up.
     """
     return bool(dirty) and location == "home" and online and proxy_up
+
+
+def recent_grid_w(db: sqlite3.Connection, vin: str, limit: int) -> list[float]:
+    """The last `limit` LOGGED grid_w readings for vin, newest first.
+
+    Feeds grid_is_stuck(): the stuck-meter detector needs the raw tick
+    history, not a derived quantity, and solar_ticks already logs grid_w
+    every tick regardless of whether anything changed -- the history is
+    already there for the reading.
+    """
+    rows = db.execute(
+        """SELECT grid_w FROM solar_ticks
+           WHERE vin = ? AND grid_w IS NOT NULL
+           ORDER BY ts DESC LIMIT ?""",
+        (vin, limit),
+    ).fetchall()
+    return [row["grid_w"] for row in rows]
 
 
 def grace_import_wh(db: sqlite3.Connection, vin: str, since_ts: int) -> float:
