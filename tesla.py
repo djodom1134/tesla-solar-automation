@@ -91,16 +91,55 @@ def _acquire_lock(token_path: Path) -> int:
     uses os.replace(), which swaps the inode, and an flock follows the inode —
     so a lock taken on the token file would be silently released mid-write.
     Blocking, so callers on an event loop must acquire via asyncio.to_thread.
+
+    Test-only entry point (blocking). Production async code uses
+    `_acquire_lock_async`, which never lets an fd survive an `await` while
+    unlocked, so a cancelled task can't leak a held lock.
     """
     lock_path = token_path.with_suffix(".lock")
     fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except BaseException:
+        os.close(fd)
+        raise
     return fd
 
 
 def _release_lock(fd: int) -> None:
-    fcntl.flock(fd, fcntl.LOCK_UN)
-    os.close(fd)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)  # closing alone also releases the flock
+
+
+async def _acquire_lock_async(token_path: Path, timeout: float = 60.0) -> int:
+    """Cancellation-safe cross-process lock acquisition.
+
+    A non-blocking retry loop rather than `asyncio.to_thread(_acquire_lock, ...)`:
+    if the awaiting task were cancelled while a worker thread sat blocked in a
+    blocking `flock`, the CancelledError would propagate before the fd is bound
+    and before a `try` is entered, so the thread would go on to acquire the
+    lock with nobody left holding (or able to release) the fd — wedging every
+    other process out until this one exits. Here, no fd ever survives an
+    `await` while unlocked: each iteration opens, tries LOCK_NB, and closes
+    immediately on failure before the next `await asyncio.sleep`.
+    """
+    lock_path = token_path.with_suffix(".lock")
+    deadline = time.monotonic() + timeout
+    while True:
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            os.close(fd)  # fd never survives an await
+            if time.monotonic() >= deadline:
+                raise TeslaAuthError("Timed out waiting for the token refresh lock.")
+            await asyncio.sleep(0.05)
+        except BaseException:
+            os.close(fd)
+            raise
 
 
 class TokenStore:
@@ -244,19 +283,25 @@ class TeslaClient:
         self.store.save(tokens)  # persist BEFORE use — the old refresh token is now spent
         return tokens
 
-    async def _locked_refresh(self) -> Tokens:
+    async def _locked_refresh(self, stale: str | None = None) -> Tokens:
         """The ONLY path permitted to call _refresh.
 
         Holds an inter-process lock and re-reads from disk after acquiring it,
         because the process that held the lock before us may have already
         refreshed — in which case its token is valid and ours is spent.
+
+        `stale` is the access token that just got rejected by the API, if any.
+        A fresh-on-disk token only counts as "someone else already refreshed"
+        when it differs from `stale` — otherwise this is the same token that
+        just failed, and it must actually be sent through `_refresh`, not
+        handed back unchanged for another doomed retry.
         """
-        fd = await asyncio.to_thread(_acquire_lock, self.store.path)
+        fd = await _acquire_lock_async(self.store.path)
         try:
             tokens = self.store.reload()
             if tokens is None:
                 raise TeslaAuthError("Not logged in.")
-            if not tokens.expired:
+            if not tokens.expired and (stale is None or tokens.access_token != stale):
                 return tokens          # another process already did the work
             return await self._refresh(tokens)
         finally:
@@ -298,7 +343,7 @@ class TeslaClient:
                 # Access token rejected despite not looking expired — force one
                 # refresh, retry once.
                 async with self._refresh_lock:
-                    await self._locked_refresh()
+                    await self._locked_refresh(stale=token)
                 continue
             if resp.status_code != 200:
                 raise TeslaAPIError(resp.status_code, resp.text)
@@ -319,7 +364,7 @@ class TeslaClient:
                 # Access token rejected despite not looking expired — force one
                 # refresh, retry once.
                 async with self._refresh_lock:
-                    await self._locked_refresh()
+                    await self._locked_refresh(stale=token)
                 continue
             if resp.status_code != 200:
                 raise TeslaAPIError(resp.status_code, resp.text)
