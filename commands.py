@@ -23,9 +23,17 @@ _PROXY_PREFIXES = ("car could not execute command: ",
                    "vcsec could not execute command: ")
 
 
-def _cmd(cid, label, group, params=(), confirm=False, needs=(), risk="normal"):
+def _cmd(cid, label, group, params=(), confirm=False, needs=(), risk="normal",
+         needs_location=False):
+    """`needs_location` marks commands the proxy rejects without lat/lon in the
+    body (trigger_homelink today — field reference line 372, unlike
+    window_control's optional/ignored lat/lon at line 345). This module stays a
+    pure catalog/coercion layer: it only declares the need. car_routes.py is
+    the one with access to the stored vehicle snapshot, so it does the
+    injection."""
     return {"id": cid, "label": label, "group": group, "params": list(params),
-            "confirm": confirm, "needs": list(needs), "risk": risk}
+            "confirm": confirm, "needs": list(needs), "risk": risk,
+            "needs_location": needs_location}
 
 
 def _int(name, label, lo=None, hi=None, default=None):
@@ -130,7 +138,10 @@ CATALOG: list[dict[str, Any]] = [
     _cmd("adjust_volume", "Volume", "More",
          [{"name": "volume", "type": "float", "label": "0-10",
            "min": 0, "max": 10, "default": 5}], needs=["user_present"]),
-    _cmd("trigger_homelink", "HomeLink", "More", confirm=True),
+    # The proxy requires lat/lon for this one (unlike window_control's, which
+    # are optional and ignored) — the route injects the car's last known
+    # location server-side rather than faking coordinates here.
+    _cmd("trigger_homelink", "HomeLink", "More", confirm=True, needs_location=True),
     _cmd("schedule_software_update", "Install update", "More",
          [_int("offset_sec", "Delay (s)", 0, 86400, 0)], confirm=True),
     _cmd("cancel_software_update", "Cancel update", "More"),

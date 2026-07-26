@@ -139,6 +139,33 @@ async def car_command(cmd_id: str, payload: dict[str, Any] = Body(default={})):
         return {"ok": True, "reason": "", "message": f"Demo: {spec['label']} sent"}
 
     vin = await _vin()
+
+    if spec.get("needs_location"):
+        # trigger_homelink 400s at the proxy without lat/lon in the body
+        # (field reference line 372). The car's own location is the only
+        # honest source — inject it here rather than shipping a doomed POST.
+        snap = store().snapshot(vin)
+        if snap is None:
+            raise HTTPException(
+                400,
+                f"{spec['label']} needs the car's last known location, but "
+                "nothing has been recorded yet. Load the car page once while "
+                "the car is reachable, then try again.",
+            )
+        lat, lon = snap["view"].get("lat"), snap["view"].get("lon")
+        if lat is None or lon is None:
+            # Tesla OMITS these keys rather than nulling them when the
+            # vehicle_location scope is missing or location sharing is off —
+            # both collapse to None once stored, so we can't tell them apart
+            # here, only report that neither coordinate is available.
+            raise HTTPException(
+                400,
+                f"{spec['label']} needs the car's location, but the last "
+                "snapshot has none. Check that location sharing is on and "
+                "the vehicle_location scope is granted.",
+            )
+        body = {**body, "lat": lat, "lon": lon}
+
     status, raw = await _client().command(vin, cmd_id, body)
     result = command_catalog.interpret(status, raw)
 

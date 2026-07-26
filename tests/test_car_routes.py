@@ -28,6 +28,40 @@ class _FakeClientNotAuthenticated:
         return {"key_paired_vins": []}
 
 
+class _FakeStoreWithView:
+    """Stands in for car_routes.store() with a controllable snapshot, to drive
+    the trigger_homelink lat/lon injection without touching car.db."""
+
+    def __init__(self, view):
+        self._view = view
+
+    def snapshot(self, vin):
+        return None if self._view is None else {"ts": 0, "view": self._view}
+
+    def count_since(self, ts):
+        return 0
+
+
+class _FakeCache:
+    def clear(self):
+        pass
+
+
+class _FakeClientCommand:
+    """Records what car_routes actually sent to TeslaClient.command()."""
+
+    def __init__(self):
+        self.calls = []
+        self.cache = _FakeCache()
+
+    async def resolve_vin(self):
+        return "5YJSA00000F000000"
+
+    async def command(self, vin, name, body):
+        self.calls.append((vin, name, dict(body)))
+        return 200, {"response": {"result": True, "reason": ""}}
+
+
 class _FakeClientBadToken:
     """Returns a token that isn't a decodable JWT -- a decode failure,
     distinct from never having a token at all."""
@@ -99,6 +133,64 @@ def test_health_reports_scopes_decode_failure_distinctly(monkeypatch):
     body = client.get("/api/car/health").json()
     assert body["auth_error"] == "scopes_decode_failed"
     assert body["scopes"] == []
+
+
+def test_trigger_homelink_injects_lat_lon_from_the_snapshot(monkeypatch):
+    """A needs_location command must reach TeslaClient.command() with lat/lon
+    merged in from the last stored view, not sent empty."""
+    monkeypatch.setattr(car_routes, "DEMO", False)
+    monkeypatch.setattr(
+        car_routes, "store",
+        lambda: _FakeStoreWithView({"lat": 37.4, "lon": -122.1}),
+    )
+    fake_client = _FakeClientCommand()
+    monkeypatch.setattr(car_routes, "_client", lambda: fake_client)
+
+    client = TestClient(app_module.app)
+    resp = client.post("/api/car/command/trigger_homelink", json={})
+
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is True
+    assert len(fake_client.calls) == 1
+    _, name, body = fake_client.calls[0]
+    assert name == "trigger_homelink"
+    assert body == {"lat": 37.4, "lon": -122.1}
+
+
+def test_trigger_homelink_refuses_with_no_snapshot(monkeypatch):
+    """No location on record must fail loudly with an actionable 400, and
+    must never reach the proxy with a doomed empty body."""
+    monkeypatch.setattr(car_routes, "DEMO", False)
+    monkeypatch.setattr(car_routes, "store", lambda: _FakeStoreWithView(None))
+    fake_client = _FakeClientCommand()
+    monkeypatch.setattr(car_routes, "_client", lambda: fake_client)
+
+    client = TestClient(app_module.app)
+    resp = client.post("/api/car/command/trigger_homelink", json={})
+
+    assert resp.status_code == 400
+    assert "location" in resp.json()["detail"].lower()
+    assert fake_client.calls == []
+
+
+def test_trigger_homelink_refuses_when_lat_lon_are_none(monkeypatch):
+    """Tesla omits latitude/longitude entirely (not null) when the
+    vehicle_location scope is missing -- once stored that collapses to None,
+    and it must be treated the same as no snapshot: refuse, don't guess."""
+    monkeypatch.setattr(car_routes, "DEMO", False)
+    monkeypatch.setattr(
+        car_routes, "store",
+        lambda: _FakeStoreWithView({"lat": None, "lon": None}),
+    )
+    fake_client = _FakeClientCommand()
+    monkeypatch.setattr(car_routes, "_client", lambda: fake_client)
+
+    client = TestClient(app_module.app)
+    resp = client.post("/api/car/command/trigger_homelink", json={})
+
+    assert resp.status_code == 400
+    assert "location" in resp.json()["detail"].lower()
+    assert fake_client.calls == []
 
 
 def test_demo_gap_threshold_tracks_store_gap_seconds(monkeypatch):

@@ -84,3 +84,13 @@ def test_interpret_408_is_asleep():
     r = commands.interpret(408, {})
     assert r["ok"] is False
     assert "asleep" in r["message"].lower()
+
+
+def test_interpret_malformed_body_with_no_response_object():
+    """`response` missing or not a dict, with no recognized error and a
+    status outside the named cases (408/403/429) — the generic fallback
+    branch. Previously only reachable indirectly through other tests."""
+    r = commands.interpret(400, {"response": None, "error": ""})
+    assert r["ok"] is False
+    assert r["reason"] == "http_400"
+    assert "400" in r["message"]
