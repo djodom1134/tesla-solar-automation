@@ -99,6 +99,14 @@ STATES = frozenset({"idle", "charging", "grace", "stopped"})
 @dataclass(frozen=True)
 class Policy:
     grace_s: int = 180          # hold at min_a this long before giving up
+    # start_hold_s and restart_hold_s are enforced as WHOLE TICKS, not raw
+    # seconds: the timer is compared as carried in from the previous tick, so
+    # the real wait is period_s * (ceil(threshold / period_s) + 1) and is never
+    # less than two ticks. At the default 120 s tick, start_hold_s=60 means a
+    # 240 s wait, and restart_hold_s=300 means 480 s. At a 300 s tick they
+    # become 600 s and 600 s. This is deliberate -- one grid-meter reading is
+    # not evidence of a *sustained* condition, and both transitions issue
+    # billed commands -- but the numbers are not the wait in seconds.
     restart_hold_s: int = 300   # sustained surplus before spending a wake
     start_hold_s: int = 60      # sustained surplus before starting from idle
     enabled: bool = True

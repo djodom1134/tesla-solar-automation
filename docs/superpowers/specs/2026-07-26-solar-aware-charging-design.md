@@ -426,6 +426,12 @@ Starting}`; cache the last valid value; default 240 V. Never use `charger_power`
  any ── unknown ──▶ freeze in place, take no action  (§5)
 ```
 
+**`start_hold_s` and `restart_hold_s` are enforced as whole ticks, not raw
+seconds:** the timer is compared as carried in from the previous tick, so the
+real wait is `period_s × (ceil(threshold / period_s) + 1)`, never less than
+two ticks — at the default 120 s tick that is 240 s and 480 s, not the 60 s
+and 300 s the diagram above and the field names suggest.
+
 **[R] Four corrections from review are folded in:**
 
 - **Two-tick dwell on `charging → grace`.** `grid_w` refreshes at 60 s while

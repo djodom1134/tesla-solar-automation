@@ -91,6 +91,35 @@ def test_grace_recovery_needs_two_ticks_above_a_hysteresis_band():
     assert machine.grace_s_elapsed == 0, "timer must reset on recovery"
 
 
+def test_grace_does_not_recover_inside_the_hysteresis_band():
+    """Recovery needs raw_target >= min_a + 1, not merely >= min_a.
+
+    That one amp is the whole anti-chatter margin: a surplus hovering exactly
+    at the floor would otherwise flip grace<->charging on every tick. This
+    lands raw_target at 5.5 -- above min_a, inside the band -- and must NOT
+    recover, however many consecutive ticks it persists.
+
+    Uses a policy with an effectively infinite grace_s. At the real
+    grace_s=180 and period_s=120, the grace *timeout* alone (elapsed >
+    grace_s) forces a transition to "stopped" by the second tick regardless
+    of the recovery condition -- verified this fires even against the
+    correct, unmutated code -- which would mask the exact property this test
+    exists to isolate. Decoupling it is what lets the loop below prove the
+    band holds for as many ticks as you care to run it.
+    """
+    d = solar.control(-220, 5, TUN)
+    assert TUN.min_a <= d.raw_target < TUN.min_a + 1, "premise of this test changed"
+    t = solar.Tick(surplus_w=1420, decision=d, location="home",
+                   plugged=True, period_s=PERIOD)
+    no_timeout = solar.Policy(grace_s=10_000, restart_hold_s=POL.restart_hold_s,
+                              start_hold_s=POL.start_hold_s, enabled=True)
+    machine = m("grace", grace_s_elapsed=60)
+    for _ in range(3):
+        machine, actions = solar.advance(machine, t, no_timeout, TUN)
+        assert machine.state == "grace"
+        assert actions == []
+
+
 def test_stopped_requires_a_long_hold_before_spending_a_wake():
     machine = m("stopped")
     machine, actions = solar.advance(machine, tick(5000), POL, TUN)
