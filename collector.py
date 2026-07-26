@@ -145,8 +145,14 @@ async def recover(client: TeslaClient, db, vin: str, st: dict, location: str,
         return False
     ok, _ = await _restore(client, db, vin, st)
     if ok:
+        # Reset the machine, not just the flags. _restore() nulls the
+        # originals, so a machine left in "charging" resumes on the next tick
+        # and goes straight to set_amps -- commanding the car with nothing
+        # recorded to restore. The re-arm guard only covers charge_start, so
+        # it does not catch this path.
+        solar.save_state(db, vin, **solar.machine_fields(solar.Machine()))
         _log(f"recovered: restored amps={st['original_amps']} "
-             f"limit={st['original_limit']}")
+             f"limit={st['original_limit']}, machine reset to idle")
     return ok
 
 

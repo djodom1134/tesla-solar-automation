@@ -184,3 +184,40 @@ async def test_recovery_leaves_dirty_set_when_the_restore_is_refused(tmp_path, m
     assert st["original_amps"] == 16, "the only way back to the owner's amps must survive"
     assert st["original_limit"] == 90
     store_.close()
+
+
+@pytest.mark.asyncio
+async def test_recovery_resets_the_machine_not_just_the_flags(tmp_path, monkeypatch):
+    """After recovery the machine must be clean idle.
+
+    _restore() nulls the originals; a machine left in "charging" would resume
+    next tick, emit set_amps, and command the car with nothing recorded to
+    restore. The re-arm guard only covers charge_start, so it cannot catch it.
+    """
+    store_ = Store(tmp_path / "car.db")
+    db = store_._db
+    # seed: dirty, mid-charge, originals recorded -- exactly what a crash
+    # mid-session leaves behind.
+    solar.save_state(db, "VIN1", dirty=1, original_amps=16, original_limit=90,
+                     state="charging", breach_ticks=1, recover_ticks=1,
+                     grace_s_elapsed=45, hold_s=30, engaged_at=1234)
+
+    monkeypatch.setattr(tesla, "proxy_up", lambda url: True)
+
+    class FakeClient:
+        async def command(self, vin, name, params):
+            return 200, {"response": {"result": True}}
+
+    cfg = SimpleNamespace(proxy_url="https://localhost:4443")
+    ok = await collector.recover(FakeClient(), db, "VIN1",
+                                 solar.load_state(db, "VIN1"), "home", cfg)
+
+    assert ok is True
+    st = solar.load_state(db, "VIN1")
+    assert st["dirty"] == 0
+    assert st["state"] == "idle", "a leftover 'charging' would go straight to set_amps next tick"
+    assert st["breach_ticks"] == 0
+    assert st["recover_ticks"] == 0
+    assert st["grace_s_elapsed"] == 0
+    assert st["hold_s"] == 0
+    store_.close()
