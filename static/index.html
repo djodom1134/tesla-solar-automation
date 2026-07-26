@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Solar · Import & Export</title>
+<link rel="stylesheet" href="/styles.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>☀️</text></svg>">
+</head>
+<body>
+
+<!-- Not configured / not logged in -->
+<section id="gate" class="gate" hidden>
+  <div class="gate-card">
+    <h1 id="gate-title">Connect your Tesla account</h1>
+    <p id="gate-body" class="muted"></p>
+    <div id="gate-actions" class="gate-actions"></div>
+    <p id="gate-error" class="gate-error" hidden></p>
+  </div>
+</section>
+
+<!-- Dashboard -->
+<main id="app" hidden>
+
+  <header class="topbar">
+    <div class="titles">
+      <h1 id="site-name">Solar</h1>
+      <p id="updated" class="muted small"></p>
+    </div>
+    <div class="topbar-actions">
+      <button id="theme-toggle" class="ghost-btn" type="button" aria-label="Toggle dark mode" title="Toggle dark mode">◐</button>
+      <button id="logout" class="ghost-btn" type="button">Disconnect</button>
+    </div>
+  </header>
+
+  <!-- Live strip: instantaneous power. Hidden when the site has no live feed. -->
+  <section id="live" class="live" hidden aria-label="Live power">
+    <div class="live-tile">
+      <span class="tile-label"><span class="key key-solar" aria-hidden="true"></span>Solar now</span>
+      <span class="tile-value"><span id="live-solar">—</span><span class="unit">kW</span></span>
+    </div>
+    <div class="live-tile">
+      <span class="tile-label"><span class="key key-home" aria-hidden="true"></span>Home now</span>
+      <span class="tile-value"><span id="live-home">—</span><span class="unit">kW</span></span>
+    </div>
+    <div class="live-tile" id="live-grid-tile">
+      <span class="tile-label"><span class="key" id="live-grid-key" aria-hidden="true"></span><span id="live-grid-label">Grid now</span></span>
+      <span class="tile-value"><span id="live-grid">—</span><span class="unit">kW</span></span>
+    </div>
+    <div class="live-tile" id="live-battery-tile">
+      <span class="tile-label"><span class="key key-battery" aria-hidden="true"></span><span id="live-battery-label">Battery now</span></span>
+      <span class="tile-value"><span id="live-battery">—</span><span class="unit">kW</span></span>
+    </div>
+  </section>
+
+  <!-- One filter row, scoping everything below it. -->
+  <nav class="filters" aria-label="Time range">
+    <div id="period" class="segmented" role="tablist" aria-label="Period"></div>
+    <div class="filters-right">
+      <label class="switch">
+        <input type="checkbox" id="table-toggle">
+        <span>Table view</span>
+      </label>
+    </div>
+  </nav>
+
+  <div id="content" class="content">
+
+    <!-- Hero: the single number this dashboard leads with. -->
+    <section class="hero-card" aria-labelledby="hero-label">
+      <div class="hero-main">
+        <p id="hero-label" class="tile-label">Net grid position · <span id="hero-period">today</span></p>
+        <p class="hero-figure"><span id="hero-value">—</span><span class="hero-unit">kWh</span></p>
+        <p id="hero-sub" class="muted"></p>
+      </div>
+      <div id="hero-money" class="hero-money" hidden>
+        <p class="tile-label">Estimated value</p>
+        <p class="money-figure" id="money-net">—</p>
+        <p class="muted small" id="money-detail"></p>
+      </div>
+    </section>
+
+    <!-- KPI row -->
+    <section class="kpis" aria-label="Period totals">
+      <div class="stat">
+        <span class="tile-label"><span class="key key-solar" aria-hidden="true"></span>Solar produced</span>
+        <span class="tile-value"><span id="kpi-solar">—</span><span class="unit">kWh</span></span>
+      </div>
+      <div class="stat">
+        <span class="tile-label"><span class="key key-home" aria-hidden="true"></span>Home used</span>
+        <span class="tile-value"><span id="kpi-home">—</span><span class="unit">kWh</span></span>
+      </div>
+      <div class="stat">
+        <span class="tile-label"><span class="key key-import" aria-hidden="true"></span>Imported from grid</span>
+        <span class="tile-value"><span id="kpi-import">—</span><span class="unit">kWh</span></span>
+      </div>
+      <div class="stat">
+        <span class="tile-label"><span class="key key-export" aria-hidden="true"></span>Exported to grid</span>
+        <span class="tile-value"><span id="kpi-export">—</span><span class="unit">kWh</span></span>
+      </div>
+      <div class="stat">
+        <span class="tile-label">Self-sufficiency</span>
+        <span class="tile-value"><span id="kpi-self">—</span><span class="unit">%</span></span>
+        <div class="meter" aria-hidden="true"><div id="kpi-self-fill" class="meter-fill"></div></div>
+      </div>
+    </section>
+
+    <!-- Chart 1: the import/export story. Diverging around zero. -->
+    <section class="card" id="card-grid">
+      <div class="card-head">
+        <div>
+          <h2 id="grid-title">Grid import & export</h2>
+          <p id="grid-sub" class="muted small"></p>
+        </div>
+        <div class="legend" id="grid-legend"></div>
+      </div>
+      <div class="chart-host" id="chart-grid"></div>
+    </section>
+
+    <!-- Chart 2: where the home's energy came from. -->
+    <section class="card" id="card-mix">
+      <div class="card-head">
+        <div>
+          <h2 id="mix-title">Where your home's energy came from</h2>
+          <p id="mix-sub" class="muted small"></p>
+        </div>
+        <div class="legend" id="mix-legend"></div>
+      </div>
+      <div class="chart-host" id="chart-mix"></div>
+    </section>
+
+    <!-- Table view: the WCAG-clean twin. Every value here, no hover needed. -->
+    <section class="card" id="card-table" hidden>
+      <div class="card-head"><h2>All values</h2></div>
+      <div class="table-scroll">
+        <table id="data-table">
+          <thead></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <p id="empty" class="empty" hidden></p>
+  </div>
+
+  <div id="error-bar" class="error-bar" hidden></div>
+</main>
+
+<div id="tooltip" class="tooltip" role="tooltip" hidden></div>
+
+<script src="/app.js"></script>
+</body>
+</html>
