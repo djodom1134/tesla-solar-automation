@@ -278,11 +278,151 @@ async function main() {
 
 main().catch((err) => showGate(err.message));
 
-/* Temporary no-op stubs. Task 9 (SoC history chart + range picker) replaces
-   initRanges/loadHistory/renderSoc; Task 12 (controls) replaces
-   renderControlsAvailability. Keep this task independently runnable until
-   then — these are not dead code. */
-function initRanges() {}
-async function loadHistory() {}
-function renderSoc() {}
+/* ------------------------------------------------------------ range picker */
+
+function initRanges() {
+  const host = $("soc-range");
+  host.replaceChildren();
+  for (const r of RANGES) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.role = "tab";
+    btn.textContent = r.label;
+    btn.setAttribute("aria-selected", String(r.key === state.range));
+    btn.addEventListener("click", () => {
+      state.range = r.key;
+      for (const b of host.children) b.setAttribute("aria-selected", String(b === btn));
+      loadHistory();
+    });
+    host.append(btn);
+  }
+}
+
+async function loadHistory() {
+  try {
+    state.history = await api(`/api/car/history?range=${state.range}`);
+    renderSoc();
+  } catch (err) {
+    $("soc-note").textContent = err.message;
+  }
+}
+
+/* ------------------------------------------------------------- SoC chart */
+
+function renderSoc() {
+  const host = $("soc-chart");
+  const data = state.history;
+  if (!host) return;
+
+  if (!data || !data.rows.length) {
+    host.replaceChildren();
+    const since = data?.since;
+    $("soc-note").textContent = since
+      ? "No samples in this range."
+      : "No history yet — the collector starts recording from now on.";
+    return;
+  }
+
+  const rows = data.rows;
+  const socs = rows.map((r) => r.soc);
+  // SoC is a percentage; anchoring to 0-100 stops a flat day looking dramatic.
+  const lo = Math.max(0, Math.min(...socs) - 10);
+  const hi = Math.min(100, Math.max(...socs) + 10);
+  const { ticks } = niceTicks(lo, hi, 4);
+  const { svg, plotW, plotH, yScale } =
+    chartFrame(host, { yLo: lo, yHi: hi, yTicks: ticks, unit: "%" });
+
+  const t0 = rows[0].ts;
+  const span = Math.max(1, rows[rows.length - 1].ts - t0);
+  const xScale = (i) => PAD.left + ((rows[i].ts - t0) / span) * plotW;
+
+  // Charging stretches get a subtle band, so "why did it go up" is answered
+  // without reading the tooltip.
+  let runStart = null;
+  rows.forEach((r, i) => {
+    if (r.charging && runStart === null) runStart = i;
+    if ((!r.charging || i === rows.length - 1) && runStart !== null) {
+      const x1 = xScale(runStart);
+      const x2 = xScale(i);
+      if (x2 - x1 > 1) {
+        svg.append(el("rect", {
+          x: x1, y: PAD.top, width: x2 - x1, height: plotH,
+          fill: COLOR("solar"), opacity: 0.12,
+        }));
+      }
+      runStart = null;
+    }
+  });
+
+  // Two paths: measured (solid) and inferred-across-sleep (dashed).
+  let solid = "";
+  let dashed = "";
+  rows.forEach((r, i) => {
+    const x = xScale(i);
+    const y = yScale(r.soc);
+    if (i === 0) { solid += `M${x},${y}`; return; }
+    if (r.gap) {
+      const px = xScale(i - 1);
+      const py = yScale(rows[i - 1].soc);
+      dashed += `M${px},${py}L${x},${y}`;
+      solid += `M${x},${y}`;
+    } else {
+      solid += `L${x},${y}`;
+    }
+  });
+
+  if (dashed) {
+    svg.append(el("path", {
+      d: dashed, fill: "none", stroke: COLOR("battery"), "stroke-width": 2,
+      "stroke-dasharray": "4 4", opacity: 0.45,
+    }));
+  }
+  svg.append(el("path", {
+    d: solid, fill: "none", stroke: COLOR("battery"), "stroke-width": 2,
+    "stroke-linejoin": "round", "stroke-linecap": "round",
+  }));
+
+  // X labels: dates for multi-day ranges, clock time for a single day.
+  const multiDay = span > 36 * 3600;
+  const step = Math.max(1, Math.ceil(rows.length / Math.max(2, Math.floor(plotW / 70))));
+  rows.forEach((r, i) => {
+    if (i % step !== 0) return;
+    const d = new Date(r.ts * 1000);
+    const label = multiDay
+      ? d.toLocaleDateString(undefined, { month: "short", day: "numeric" })
+      : d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+    const text = el("text", {
+      x: xScale(i), y: PAD.top + plotH + 20, "text-anchor": "middle", class: "tick-label",
+    });
+    text.textContent = label;
+    svg.append(text);
+  });
+
+  attachCrosshair(
+    svg, rows, xScale, plotW, plotH,
+    (r) => {
+      const out = [{ name: "Charge", value: `${r.soc}%`, color: COLOR("battery") }];
+      // usable and displayed SoC diverge when the pack is cold; showing both on
+      // the line would read as a rendering bug, so it lives here.
+      if (r.usable_soc != null && r.usable_soc !== r.soc) {
+        out.push({ name: "Usable", value: `${r.usable_soc}%`, color: COLOR("export") });
+      }
+      if (r.charging) out.push({ name: "Charging", value: "yes", color: COLOR("solar") });
+      if (r.gap) out.push({ name: "Gap", value: "car asleep", color: COLOR("baseline") });
+      return out;
+    },
+    (r) => new Date(r.ts * 1000).toLocaleString(undefined, {
+      month: "short", day: "numeric", hour: "numeric", minute: "2-digit",
+    })
+  );
+
+  const since = data.since ? new Date(data.since * 1000) : null;
+  const gaps = rows.filter((r) => r.gap).length;
+  $("soc-note").textContent =
+    (since ? `Recording since ${since.toLocaleDateString()}. ` : "") +
+    (gaps ? `Dashed segments are periods the car was asleep (${gaps}).` : "");
+}
+
+/* Temporary no-op stub. Task 12 (controls) replaces renderControlsAvailability.
+   Keep this task independently runnable until then — this is not dead code. */
 function renderControlsAvailability() {}
