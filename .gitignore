@@ -1,7 +1,9 @@
 # Secrets — never commit these.
 .env
-.tokens.json
-.tokens.json.bak
+.env.*
+# Glob, not exact names: rotations and hand-made backups (.bak, .manual-backup)
+# are just as sensitive as the original and must never be committable.
+.tokens.json*
 .tokens.tmp
 keys/
 
