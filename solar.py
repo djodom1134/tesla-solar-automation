@@ -462,6 +462,18 @@ def count_request(db: sqlite3.Connection, vin: str, today: str) -> tuple[int, bo
     return count, capped
 
 
+def may_restore(dirty: int, location: str, online: bool, proxy_up: bool) -> bool:
+    """Whether a crash-recovery restore may be attempted right now.
+
+    Restoring writes amps and a charge limit to the car. Doing that
+    unconditionally at startup would push home settings into whatever session
+    the car is actually in -- including a Supercharger. If any gate fails the
+    dirty flag STAYS SET and we retry next tick; it is never cleared by
+    giving up.
+    """
+    return bool(dirty) and location == "home" and online and proxy_up
+
+
 def grace_import_wh(db: sqlite3.Connection, vin: str, since_ts: int) -> float:
     """Watt-hours imported while riding out a cloud.
 

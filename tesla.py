@@ -6,11 +6,13 @@ import fcntl
 import json
 import os
 import shutil
+import socket
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -493,6 +495,20 @@ class TeslaClient:
             return resp.status_code, resp.json()
         except ValueError:
             return resp.status_code, {"error": resp.text[:300]}
+
+
+def proxy_up(proxy_url: str) -> bool:
+    """TCP reachability of the signing proxy. BLOCKING -- callers on an event
+    loop must use asyncio.to_thread. Commands are impossible without the proxy,
+    so this gates anything that would write to the car."""
+    parsed = urlparse(proxy_url)
+    try:
+        with socket.create_connection(
+            (parsed.hostname or "localhost", parsed.port or 443), timeout=0.5
+        ):
+            return True
+    except OSError:
+        return False
 
 
 def _iso(dt: datetime) -> str:

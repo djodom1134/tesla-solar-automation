@@ -182,3 +182,14 @@ def test_no_set_amps_action_inside_the_deadband_even_when_target_differs():
     machine, actions = solar.advance(m("charging"), t, POL, TUN)
     assert actions == []
     assert machine.state == "charging"
+
+
+def test_recovery_gate_refuses_to_restore_away_from_home():
+    """An unconditional restore would write home amps into a Supercharger
+    session -- the exact hazard the home gate exists to prevent."""
+    assert solar.may_restore(dirty=1, location="away", online=True, proxy_up=True) is False
+    assert solar.may_restore(dirty=1, location="unknown", online=True, proxy_up=True) is False
+    assert solar.may_restore(dirty=1, location="home", online=False, proxy_up=True) is False
+    assert solar.may_restore(dirty=1, location="home", online=True, proxy_up=False) is False
+    assert solar.may_restore(dirty=1, location="home", online=True, proxy_up=True) is True
+    assert solar.may_restore(dirty=0, location="home", online=True, proxy_up=True) is False

@@ -8,15 +8,14 @@ from __future__ import annotations
 
 import asyncio
 import os
-import socket
 import time
 from typing import Any
-from urllib.parse import urlparse
 
 from fastapi import APIRouter, Body, HTTPException, Query
 
 import commands as command_catalog
 import demo
+import tesla
 import vehicle
 from config import settings
 from store import Store
@@ -227,13 +226,4 @@ async def car_health() -> dict[str, Any]:
 
 
 def _proxy_up() -> bool:
-    """TCP reachability only — cheap, and enough to tell the UI whether to
-    enable the controls."""
-    parsed = urlparse(settings.proxy_url)
-    try:
-        with socket.create_connection(
-            (parsed.hostname or "localhost", parsed.port or 443), timeout=0.5
-        ):
-            return True
-    except OSError:
-        return False
+    return tesla.proxy_up(settings.proxy_url)
