@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
 import os
 import shutil
@@ -83,6 +84,25 @@ class Tokens:
         )
 
 
+def _acquire_lock(token_path: Path) -> int:
+    """Take an exclusive cross-process lock guarding token refresh.
+
+    Locks a sidecar `.lock` file, never the token file itself: TokenStore.save()
+    uses os.replace(), which swaps the inode, and an flock follows the inode —
+    so a lock taken on the token file would be silently released mid-write.
+    Blocking, so callers on an event loop must acquire via asyncio.to_thread.
+    """
+    lock_path = token_path.with_suffix(".lock")
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
+def _release_lock(fd: int) -> None:
+    fcntl.flock(fd, fcntl.LOCK_UN)
+    os.close(fd)
+
+
 class TokenStore:
     """Persists tokens to disk.
 
@@ -105,6 +125,12 @@ class TokenStore:
                 self._tokens = None
             self._loaded = True
         return self._tokens
+
+    def reload(self) -> Tokens | None:
+        """Force a read from disk. Another process may have refreshed since we
+        last looked, and its token is the only valid one."""
+        self._loaded = False
+        return self.load()
 
     def save(self, tokens: Tokens) -> None:
         # A new grant invalidates the previous refresh token. If a re-auth
@@ -218,21 +244,32 @@ class TeslaClient:
         self.store.save(tokens)  # persist BEFORE use — the old refresh token is now spent
         return tokens
 
+    async def _locked_refresh(self) -> Tokens:
+        """The ONLY path permitted to call _refresh.
+
+        Holds an inter-process lock and re-reads from disk after acquiring it,
+        because the process that held the lock before us may have already
+        refreshed — in which case its token is valid and ours is spent.
+        """
+        fd = await asyncio.to_thread(_acquire_lock, self.store.path)
+        try:
+            tokens = self.store.reload()
+            if tokens is None:
+                raise TeslaAuthError("Not logged in.")
+            if not tokens.expired:
+                return tokens          # another process already did the work
+            return await self._refresh(tokens)
+        finally:
+            _release_lock(fd)
+
     async def _access_token(self) -> str:
         tokens = self.store.load()
         if tokens is None:
             raise TeslaAuthError("Not logged in.")
         if not tokens.expired:
             return tokens.access_token
-
-        async with self._refresh_lock:
-            # Another coroutine may have refreshed while we waited for the lock.
-            tokens = self.store.load()
-            if tokens is None:
-                raise TeslaAuthError("Not logged in.")
-            if not tokens.expired:
-                return tokens.access_token
-            return (await self._refresh(tokens)).access_token
+        async with self._refresh_lock:            # coroutines in THIS process
+            return (await self._locked_refresh()).access_token
 
     @property
     def authenticated(self) -> bool:
@@ -258,12 +295,10 @@ class TeslaClient:
                 url, params=params, headers={"Authorization": f"Bearer {token}"}
             )
             if resp.status_code == 401 and attempt == 0:
-                # Access token rejected despite not looking expired — force one refresh, retry once.
-                current = self.store.load()
-                if current is None:
-                    raise TeslaAuthError("Not logged in.")
+                # Access token rejected despite not looking expired — force one
+                # refresh, retry once.
                 async with self._refresh_lock:
-                    await self._refresh(current)
+                    await self._locked_refresh()
                 continue
             if resp.status_code != 200:
                 raise TeslaAPIError(resp.status_code, resp.text)
@@ -281,11 +316,10 @@ class TeslaClient:
                 url, json=body, headers={"Authorization": f"Bearer {token}"}
             )
             if resp.status_code == 401 and attempt == 0:
-                current = self.store.load()
-                if current is None:
-                    raise TeslaAuthError("Not logged in.")
+                # Access token rejected despite not looking expired — force one
+                # refresh, retry once.
                 async with self._refresh_lock:
-                    await self._refresh(current)
+                    await self._locked_refresh()
                 continue
             if resp.status_code != 200:
                 raise TeslaAPIError(resp.status_code, resp.text)

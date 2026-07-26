@@ -72,7 +72,8 @@ class Settings:
             _clean(os.getenv("TESLA_PROXY_CERT")) or BASE_DIR / "keys" / "tls-cert.pem"
         )
     )
-    # Adaptive poll intervals, seconds. Asleep uses the FREE state check only.
+    # Adaptive poll intervals, seconds. Asleep uses the cheap, sleep-safe state
+    # check only. NOT free: Tesla bills every response with status < 500.
     poll_driving: int = field(default_factory=lambda: int(_clean(os.getenv("POLL_DRIVING")) or 120))
     poll_charging: int = field(default_factory=lambda: int(_clean(os.getenv("POLL_CHARGING")) or 300))
     poll_idle: int = field(default_factory=lambda: int(_clean(os.getenv("POLL_IDLE")) or 900))
