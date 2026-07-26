@@ -326,19 +326,30 @@ def save_config(db: sqlite3.Connection, **fields) -> None:
     if unknown:
         raise ValueError(f"unknown solar_config fields: {sorted(unknown)}")
     owned = _begin_immediate(db)
-    current = load_config(db)
-    current.update(fields)
-    columns = list(CONFIG_DEFAULTS)
-    db.execute(
-        f"""INSERT INTO solar_config (id, {', '.join(columns)}, updated_at)
-            VALUES (1, {', '.join('?' * len(columns))}, ?)
-            ON CONFLICT(id) DO UPDATE SET
-              {', '.join(f'{c} = excluded.{c}' for c in columns)},
-              updated_at = excluded.updated_at""",
-        [current[c] for c in columns] + [int(time.time())],
-    )
-    if owned:
-        db.commit()
+    try:
+        current = load_config(db)
+        current.update(fields)
+        columns = list(CONFIG_DEFAULTS)
+        db.execute(
+            f"""INSERT INTO solar_config (id, {', '.join(columns)}, updated_at)
+                VALUES (1, {', '.join('?' * len(columns))}, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                  {', '.join(f'{c} = excluded.{c}' for c in columns)},
+                  updated_at = excluded.updated_at""",
+            [current[c] for c in columns] + [int(time.time())],
+        )
+    except BaseException:
+        # Roll back ONLY what we opened. Leaving it open would make
+        # _begin_immediate see in_transaction on every later call, return
+        # owned=False, and silently skip the commit forever -- turning one
+        # transient error into a permanent persistence outage on a connection
+        # that lives as long as the process.
+        if owned:
+            db.rollback()
+        raise
+    else:
+        if owned:
+            db.commit()
 
 
 def tunables_from(cfg: dict, amps_max: int | None, volts: int | None) -> Tunables:
@@ -385,19 +396,30 @@ def save_state(db: sqlite3.Connection, vin: str, **fields) -> None:
     if unknown:
         raise ValueError(f"unknown solar_state fields: {sorted(unknown)}")
     owned = _begin_immediate(db)
-    current = load_state(db, vin)
-    current.update(fields)
-    columns = list(STATE_DEFAULTS)
-    db.execute(
-        f"""INSERT INTO solar_state (vin, {', '.join(columns)}, updated_at)
-            VALUES (?, {', '.join('?' * len(columns))}, ?)
-            ON CONFLICT(vin) DO UPDATE SET
-              {', '.join(f'{c} = excluded.{c}' for c in columns)},
-              updated_at = excluded.updated_at""",
-        [vin] + [current[c] for c in columns] + [int(time.time())],
-    )
-    if owned:
-        db.commit()
+    try:
+        current = load_state(db, vin)
+        current.update(fields)
+        columns = list(STATE_DEFAULTS)
+        db.execute(
+            f"""INSERT INTO solar_state (vin, {', '.join(columns)}, updated_at)
+                VALUES (?, {', '.join('?' * len(columns))}, ?)
+                ON CONFLICT(vin) DO UPDATE SET
+                  {', '.join(f'{c} = excluded.{c}' for c in columns)},
+                  updated_at = excluded.updated_at""",
+            [vin] + [current[c] for c in columns] + [int(time.time())],
+        )
+    except BaseException:
+        # Roll back ONLY what we opened. Leaving it open would make
+        # _begin_immediate see in_transaction on every later call, return
+        # owned=False, and silently skip the commit forever -- turning one
+        # transient error into a permanent persistence outage on a connection
+        # that lives as long as the process.
+        if owned:
+            db.rollback()
+        raise
+    else:
+        if owned:
+            db.commit()
 
 
 def log_tick(db: sqlite3.Connection, vin: str, **fields) -> None:
@@ -420,8 +442,16 @@ def log_tick(db: sqlite3.Connection, vin: str, **fields) -> None:
 def count_request(db: sqlite3.Connection, vin: str, today: str) -> tuple[int, bool]:
     """Increment the daily request counter. Returns (count, capped).
 
-    Denominated in REQUESTS, not dollars: Tesla no longer publishes per-request
-    data pricing, so a dollar cap would be a guess dressed as a limit.
+    Denominated in REQUESTS, not dollars: Tesla no longer publishes
+    per-request data pricing, so a dollar cap would be a guess dressed as a
+    limit.
+
+    NOT atomic end to end -- the read happens outside the transaction that
+    save_state opens, so two concurrent callers could both read the same count
+    and one increment would be lost. Safe only under the writer-separation
+    invariant documented above save_state: solar_state is written by the
+    collector alone, and there is exactly one collector process. Re-read that
+    invariant before calling this from anywhere else.
     """
     st = load_state(db, vin)
     count = st["requests_today"] + 1 if st["requests_day"] == today else 1

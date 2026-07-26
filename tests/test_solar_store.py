@@ -79,6 +79,71 @@ def test_state_updates_survive_each_other():
     assert st["state"] == "charging"
 
 
+def test_a_failed_write_does_not_strand_the_transaction():
+    """A mid-transaction failure must roll back, not leave the connection
+    stuck in a transaction.
+
+    If it stranded, _begin_immediate would see in_transaction on every later
+    call, return owned=False, and skip the commit forever -- so writes would
+    keep appearing to work (reads see uncommitted data) while nothing was
+    durable. That is a silent, permanent persistence outage, and it is worse
+    than the race the transaction was added to close.
+    """
+    conn = db()
+    solar.save_config(conn, enabled=1)
+
+    owned = solar._begin_immediate(conn)
+    assert owned is True
+    try:
+        conn.execute("INSERT INTO solar_config (id) VALUES (2)")  # CHECK id = 1
+    except sqlite3.IntegrityError:
+        conn.rollback()
+    assert conn.in_transaction is False, "transaction stranded"
+
+    # And the writer must still durably persist afterwards.
+    solar.save_config(conn, soc_ceiling=100)
+    assert conn.in_transaction is False, "commit did not fire"
+    assert solar.load_config(conn)["soc_ceiling"] == 100
+    assert solar.load_config(conn)["enabled"] == 1
+
+
+class _BoomOnConfigInsert(sqlite3.Connection):
+    """A connection that fails its own INSERT on command.
+
+    monkeypatch.setattr(conn, "execute", ...) does not work here: `execute` on
+    a live sqlite3.Connection instance is a read-only C-level attribute
+    (AttributeError: 'sqlite3.Connection' object attribute 'execute' is
+    read-only), so the instance cannot be monkeypatched directly. Subclassing
+    and overriding the method is the equivalent that still proves the writer
+    -- not the caller -- rolls back its own failed transaction.
+    """
+    trip = False
+
+    def execute(self, sql, *a):
+        if self.trip and sql.strip().upper().startswith("INSERT INTO SOLAR_CONFIG"):
+            raise sqlite3.OperationalError("simulated write failure")
+        return super().execute(sql, *a)
+
+
+def test_writer_rolls_back_its_own_failed_transaction():
+    """The writer itself must clean up, not rely on the caller."""
+    conn = sqlite3.connect(":memory:", factory=_BoomOnConfigInsert)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(solar.SCHEMA)
+    solar.save_config(conn, enabled=1)
+
+    conn.trip = True
+    try:
+        solar.save_config(conn, soc_ceiling=100)
+    except sqlite3.OperationalError:
+        pass
+    conn.trip = False
+
+    assert conn.in_transaction is False, "writer stranded its own transaction"
+    solar.save_config(conn, soc_ceiling=95)
+    assert solar.load_config(conn)["soc_ceiling"] == 95, "writes still durable"
+
+
 def test_request_cap_counts_and_trips():
     conn = db()
     solar.save_config(conn, daily_request_cap=3)
