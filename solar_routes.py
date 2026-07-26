@@ -57,7 +57,8 @@ def _midnight_ts() -> int:
 async def get_home() -> dict[str, Any]:
     db = store()._db
     cfg = home.load(db)
-    snap = store().snapshot(_vin()) if _vin() else None
+    vin = _vin()
+    snap = store().snapshot(vin) if vin else None
     view = (snap or {}).get("view") or {}
     car = None
     if view.get("lat") is not None and view.get("lon") is not None:

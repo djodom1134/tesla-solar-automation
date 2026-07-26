@@ -76,6 +76,37 @@ def test_config_rejects_a_period_below_the_meter_refresh(client):
     assert client.put("/api/car/solar/config", json={"period_s": 30}).status_code == 400
 
 
+def test_config_updates_survive_a_later_unrelated_put(client):
+    """The guarantee the setup page depends on: changing one setting must not
+    silently revert another. A handler that rebuilt the payload from
+    CONFIG_DEFAULTS on every write would pass every other test in this file."""
+    client.put("/api/car/solar/config", json={"soc_ceiling": 100})
+    client.put("/api/car/solar/config", json={"grace_s": 300})
+    cfg = client.get("/api/car/solar/config").json()
+    assert cfg["soc_ceiling"] == 100, "second PUT reverted the first"
+    assert cfg["grace_s"] == 300
+    assert cfg["period_s"] == 120, "untouched field should still be default"
+
+
+def test_deadline_fields_accept_an_explicit_null(client):
+    """Clearing a deadline is how the owner turns the warning off, so null is
+    a legitimate value -- but ONLY for these two fields."""
+    assert client.put("/api/car/solar/config",
+                      json={"deadline_soc": 70, "deadline_hour": 7}).status_code == 200
+    assert client.put("/api/car/solar/config",
+                      json={"deadline_soc": None}).status_code == 200
+    cfg = client.get("/api/car/solar/config").json()
+    assert cfg["deadline_soc"] is None
+    assert cfg["deadline_hour"] == 7, "clearing one must not clear the other"
+
+
+def test_other_fields_reject_an_explicit_null(client):
+    assert client.put("/api/car/solar/config",
+                      json={"soc_ceiling": None}).status_code == 400
+    assert client.put("/api/car/solar/config",
+                      json={"period_s": None}).status_code == 400
+
+
 def test_status_reports_idle_before_anything_runs(client):
     body = client.get("/api/car/solar/status").json()
     assert body["state"] == "idle"
