@@ -25,6 +25,8 @@ dead one.
 """
 from __future__ import annotations
 
+import sqlite3
+import time
 from dataclasses import dataclass
 
 # charger_voltage reads 2 (not 0) when idle, so power is only meaningful in
@@ -191,3 +193,210 @@ def advance(m: Machine, t: Tick, pol: Policy, tun: Tunables) -> tuple[Machine, l
     if m.hold_s >= pol.restart_hold_s:
         return Machine(state="charging"), ["wake", "charge_start", "set_amps"]
     return Machine(state="stopped", hold_s=m.hold_s + t.period_s), []
+
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS solar_config (
+  id                INTEGER PRIMARY KEY CHECK (id = 1),
+  enabled           INTEGER NOT NULL DEFAULT 0,
+  period_s          INTEGER NOT NULL DEFAULT 120,
+  margin_w          INTEGER NOT NULL DEFAULT 100,
+  deadband_w        INTEGER NOT NULL DEFAULT 250,
+  ramp_a            INTEGER NOT NULL DEFAULT 8,
+  min_a             INTEGER NOT NULL DEFAULT 5,
+  grace_s           INTEGER NOT NULL DEFAULT 180,
+  restart_hold_s    INTEGER NOT NULL DEFAULT 300,
+  start_hold_s      INTEGER NOT NULL DEFAULT 60,
+  raise_hold_s      INTEGER NOT NULL DEFAULT 600,
+  soc_ceiling       INTEGER NOT NULL DEFAULT 90,
+  raise_limit       INTEGER NOT NULL DEFAULT 1,
+  -- 400/day is a RUNAWAY BACKSTOP, set above the ~250 expected on a charging
+  -- day. It is not a budget enforcer. The earlier default of 1200 would have
+  -- been $72/month against a $10 credit.
+  daily_request_cap INTEGER NOT NULL DEFAULT 400,
+  view_refresh_ticks INTEGER NOT NULL DEFAULT 5,
+  deadline_soc      INTEGER,
+  deadline_hour     INTEGER,
+  updated_at        INTEGER NOT NULL DEFAULT 0
+);
+
+-- The machine's counters live here, not just its state name. Each tick is a
+-- separate pass that reloads from the database, so a dwell counter held only
+-- in memory would reset every time and the two-tick hysteresis would never
+-- fire -- the exact flapping it exists to prevent.
+CREATE TABLE IF NOT EXISTS solar_state (
+  vin             TEXT PRIMARY KEY,
+  state           TEXT    NOT NULL DEFAULT 'idle',
+  breach_ticks    INTEGER NOT NULL DEFAULT 0,
+  recover_ticks   INTEGER NOT NULL DEFAULT 0,
+  grace_s_elapsed INTEGER NOT NULL DEFAULT 0,
+  hold_s          INTEGER NOT NULL DEFAULT 0,
+  dirty           INTEGER NOT NULL DEFAULT 0,
+  original_amps   INTEGER,
+  original_limit  INTEGER,
+  raised_to       INTEGER,
+  requests_today  INTEGER NOT NULL DEFAULT 0,
+  requests_day    TEXT,
+  capped          INTEGER NOT NULL DEFAULT 0,
+  engaged_at      INTEGER,
+  updated_at      INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS solar_ticks (
+  ts           INTEGER NOT NULL,
+  vin          TEXT    NOT NULL,
+  state        TEXT    NOT NULL,
+  grid_w       REAL, solar_w REAL, car_w REAL, surplus_w REAL, error_w REAL,
+  amps_before  INTEGER, amps_target INTEGER, amps_written INTEGER,
+  soc          INTEGER,
+  import_w     REAL,
+  period_s     INTEGER,
+  note         TEXT,
+  PRIMARY KEY (vin, ts)
+);
+CREATE INDEX IF NOT EXISTS solar_ticks_state ON solar_ticks (vin, state, ts);
+"""
+
+CONFIG_DEFAULTS = {
+    "enabled": 0, "period_s": 120, "margin_w": 100, "deadband_w": 250,
+    "ramp_a": 8, "min_a": 5, "grace_s": 180, "restart_hold_s": 300,
+    "start_hold_s": 60, "raise_hold_s": 600, "soc_ceiling": 90,
+    "raise_limit": 1, "daily_request_cap": 400, "view_refresh_ticks": 5,
+    "deadline_soc": None, "deadline_hour": None,
+}
+
+STATE_DEFAULTS = {
+    "state": "idle", "breach_ticks": 0, "recover_ticks": 0,
+    "grace_s_elapsed": 0, "hold_s": 0,
+    "dirty": 0, "original_amps": None, "original_limit": None,
+    "raised_to": None, "requests_today": 0, "requests_day": None,
+    "capped": 0, "engaged_at": None,
+}
+
+# The Machine fields that must survive between ticks. Anything here that is
+# not persisted silently disables the dwell and hysteresis logic.
+MACHINE_FIELDS = ("state", "breach_ticks", "recover_ticks",
+                  "grace_s_elapsed", "hold_s")
+
+
+def machine_from(st: dict) -> Machine:
+    return Machine(**{k: st[k] for k in MACHINE_FIELDS})
+
+
+def machine_fields(m: Machine) -> dict:
+    return {k: getattr(m, k) for k in MACHINE_FIELDS}
+
+
+def load_config(db: sqlite3.Connection) -> dict:
+    row = db.execute("SELECT * FROM solar_config WHERE id = 1").fetchone()
+    if row is None:
+        return dict(CONFIG_DEFAULTS)
+    return {k: row[k] for k in CONFIG_DEFAULTS}
+
+
+def save_config(db: sqlite3.Connection, **fields) -> None:
+    unknown = set(fields) - set(CONFIG_DEFAULTS)
+    if unknown:
+        raise ValueError(f"unknown solar_config fields: {sorted(unknown)}")
+    current = load_config(db)
+    current.update(fields)
+    columns = list(CONFIG_DEFAULTS)
+    db.execute(
+        f"""INSERT INTO solar_config (id, {', '.join(columns)}, updated_at)
+            VALUES (1, {', '.join('?' * len(columns))}, ?)
+            ON CONFLICT(id) DO UPDATE SET
+              {', '.join(f'{c} = excluded.{c}' for c in columns)},
+              updated_at = excluded.updated_at""",
+        [current[c] for c in columns] + [int(time.time())],
+    )
+    db.commit()
+
+
+def tunables_from(cfg: dict, amps_max: int | None, volts: int | None) -> Tunables:
+    """Config plus whatever the car actually reports.
+
+    amps_max comes from charge_current_request_max (the session ceiling, which
+    changes when the car is replugged elsewhere) and volts from charger_voltage,
+    which is only meaningful mid-session. Both fall back to this site's measured
+    nominal.
+    """
+    return Tunables(
+        margin_w=cfg["margin_w"], deadband_w=cfg["deadband_w"],
+        ramp_a=cfg["ramp_a"], min_a=cfg["min_a"],
+        max_a=amps_max if amps_max else 48,
+        volts=volts if volts else 240,
+    )
+
+
+def policy_from(cfg: dict) -> Policy:
+    return Policy(grace_s=cfg["grace_s"], restart_hold_s=cfg["restart_hold_s"],
+                  start_hold_s=cfg["start_hold_s"], enabled=bool(cfg["enabled"]))
+
+
+def load_state(db: sqlite3.Connection, vin: str) -> dict:
+    row = db.execute("SELECT * FROM solar_state WHERE vin = ?", (vin,)).fetchone()
+    if row is None:
+        return dict(STATE_DEFAULTS)
+    return {k: row[k] for k in STATE_DEFAULTS}
+
+
+def save_state(db: sqlite3.Connection, vin: str, **fields) -> None:
+    unknown = set(fields) - set(STATE_DEFAULTS)
+    if unknown:
+        raise ValueError(f"unknown solar_state fields: {sorted(unknown)}")
+    current = load_state(db, vin)
+    current.update(fields)
+    columns = list(STATE_DEFAULTS)
+    db.execute(
+        f"""INSERT INTO solar_state (vin, {', '.join(columns)}, updated_at)
+            VALUES (?, {', '.join('?' * len(columns))}, ?)
+            ON CONFLICT(vin) DO UPDATE SET
+              {', '.join(f'{c} = excluded.{c}' for c in columns)},
+              updated_at = excluded.updated_at""",
+        [vin] + [current[c] for c in columns] + [int(time.time())],
+    )
+    db.commit()
+
+
+def log_tick(db: sqlite3.Connection, vin: str, **fields) -> None:
+    """Every tick is logged, written or not, so a quiet loop and a broken loop
+    look different in the record."""
+    columns = ("ts", "state", "grid_w", "solar_w", "car_w", "surplus_w", "error_w",
+               "amps_before", "amps_target", "amps_written", "soc", "import_w",
+               "period_s", "note")
+    db.execute(
+        f"""INSERT OR REPLACE INTO solar_ticks (vin, {', '.join(columns)})
+            VALUES (?, {', '.join('?' * len(columns))})""",
+        [vin] + [fields.get(c) for c in columns],
+    )
+    db.commit()
+
+
+def count_request(db: sqlite3.Connection, vin: str, today: str) -> tuple[int, bool]:
+    """Increment the daily request counter. Returns (count, capped).
+
+    Denominated in REQUESTS, not dollars: Tesla no longer publishes per-request
+    data pricing, so a dollar cap would be a guess dressed as a limit.
+    """
+    st = load_state(db, vin)
+    count = st["requests_today"] + 1 if st["requests_day"] == today else 1
+    cap = load_config(db)["daily_request_cap"]
+    capped = count >= cap
+    save_state(db, vin, requests_today=count, requests_day=today,
+               capped=1 if capped else 0)
+    return count, capped
+
+
+def grace_import_wh(db: sqlite3.Connection, vin: str, since_ts: int) -> float:
+    """Watt-hours imported while riding out a cloud.
+
+    ONLY grace ticks. Summing every tick would total ordinary house import and
+    the no-grid-electrons promise would become unmeasurable.
+    """
+    row = db.execute(
+        """SELECT COALESCE(SUM(import_w * period_s), 0) / 3600.0 AS wh
+           FROM solar_ticks
+           WHERE vin = ? AND state = 'grace' AND ts >= ? AND import_w > 0""",
+        (vin, since_ts),
+    ).fetchone()
+    return float(row["wh"])

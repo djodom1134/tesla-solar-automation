@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import home
+import solar
 
 # A sleeping car emits nothing. Anything longer than this between samples is a
 # hole rather than a slope, and the chart draws it as such.
@@ -88,6 +89,7 @@ class Store:
         self._db.executescript(SCHEMA)
         _migrate(self._db)
         self._db.executescript(home.SCHEMA)
+        self._db.executescript(solar.SCHEMA)
         self._db.commit()
 
     def close(self) -> None:
