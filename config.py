@@ -21,8 +21,19 @@ AUTH_BASE = "https://auth.tesla.com"
 # Token exchange must go to fleet-auth, not auth.tesla.com — different rate limits.
 TOKEN_URL = "https://fleet-auth.prd.vn.cloud.tesla.com/oauth2/v3/token"
 
-# Read-only energy access. openid+offline_access are what get us a refresh token.
-SCOPES = ["openid", "offline_access", "energy_device_data"]
+# Read-only energy access plus vehicle reads and commands.
+# openid+offline_access are what get us a refresh token.
+# `vehicle_location` is the scope; `location_data` is a value of the
+# vehicle_data `endpoints` param — both are required for coordinates.
+SCOPES = [
+    "openid",
+    "offline_access",
+    "energy_device_data",
+    "vehicle_device_data",
+    "vehicle_location",
+    "vehicle_cmds",
+    "vehicle_charging_cmds",
+]
 
 
 def _clean(value: str | None) -> str:

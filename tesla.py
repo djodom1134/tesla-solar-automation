@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -80,6 +81,10 @@ class TokenStore:
         return self._tokens
 
     def save(self, tokens: Tokens) -> None:
+        # A new grant invalidates the previous refresh token. If a re-auth
+        # half-fails we want the old grant on disk to fall back to.
+        if self.path.exists():
+            shutil.copy2(self.path, self.path.with_suffix(".json.bak"))
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(tokens.to_dict(), indent=2))
         os.chmod(tmp, 0o600)
@@ -134,6 +139,9 @@ class TeslaClient:
                 "scope": " ".join(SCOPES),
                 "state": state,
                 "prompt": "login",
+                # Without this, an account that already consented to the old
+                # scope set is silently re-issued a token missing the new ones.
+                "prompt_missing_scopes": "true",
             }
         )
         return f"{AUTH_BASE}/oauth2/v3/authorize?{params}"
