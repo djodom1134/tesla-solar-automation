@@ -28,6 +28,32 @@ class TeslaAPIError(RuntimeError):
         self.body = body
 
 
+class VehicleAsleep(RuntimeError):
+    """HTTP 408 — the car is asleep or offline. Not an error path; the normal
+    resting state. The response has no body at all."""
+
+
+# Every group the car page reads. `location_data` is what actually yields
+# coordinates; the `vehicle_location` scope alone is not enough.
+VEHICLE_ENDPOINTS = [
+    "charge_state",
+    "climate_state",
+    "drive_state",
+    "location_data",
+    "vehicle_state",
+    "vehicle_config",
+    "gui_settings",
+]
+
+
+def endpoints_param(groups: list[str]) -> str:
+    """Tesla wants semicolons. Commas silently return a partial payload."""
+    for g in groups:
+        if "," in g:
+            raise ValueError(f"endpoint group {g!r} contains a comma; pass a list instead")
+    return ";".join(groups)
+
+
 @dataclass
 class Tokens:
     access_token: str
@@ -244,6 +270,25 @@ class TeslaClient:
             return payload
         raise TeslaAuthError("Could not authenticate to Fleet API.")
 
+    async def _post(self, path: str, body: dict[str, Any]) -> Any:
+        url = f"{self.settings.api_base}{path}"
+        for attempt in range(2):
+            token = await self._access_token()
+            resp = await self._http.post(
+                url, json=body, headers={"Authorization": f"Bearer {token}"}
+            )
+            if resp.status_code == 401 and attempt == 0:
+                current = self.store.load()
+                if current is None:
+                    raise TeslaAuthError("Not logged in.")
+                async with self._refresh_lock:
+                    await self._refresh(current)
+                continue
+            if resp.status_code != 200:
+                raise TeslaAPIError(resp.status_code, resp.text)
+            return resp.json().get("response")
+        raise TeslaAuthError("Could not authenticate to Fleet API.")
+
     async def products(self) -> list[dict[str, Any]]:
         return await self._get("/api/1/products", ttl=300) or []
 
@@ -299,6 +344,47 @@ class TeslaClient:
             },
             ttl=120,
         )
+
+    # ---------- vehicles ----------
+
+    async def vehicles(self) -> list[dict[str, Any]]:
+        return await self._get("/api/1/vehicles", ttl=60) or []
+
+    async def resolve_vin(self) -> str:
+        """Configured VIN wins; otherwise the single vehicle on the account."""
+        if self.settings.vin:
+            return self.settings.vin
+        cars = await self.vehicles()
+        if not cars:
+            raise TeslaAPIError(404, "No vehicles on this Tesla account.")
+        return str(cars[0]["vin"])
+
+    async def vehicle(self, vin: str) -> dict[str, Any]:
+        """Cheap state check: online | asleep | offline. Gate paid calls on this."""
+        return await self._get(f"/api/1/vehicles/{vin}", ttl=10)
+
+    async def fleet_status(self, vins: list[str]) -> dict[str, Any]:
+        return await self._post("/api/1/vehicles/fleet_status", {"vins": vins})
+
+    async def vehicle_data(
+        self, vin: str, endpoints: list[str] | None = None
+    ) -> dict[str, Any]:
+        try:
+            return await self._get(
+                f"/api/1/vehicles/{vin}/vehicle_data",
+                params={"endpoints": endpoints_param(endpoints or VEHICLE_ENDPOINTS)},
+                ttl=10,
+            )
+        except TeslaAPIError as exc:
+            if exc.status == 408:
+                raise VehicleAsleep(vin) from exc
+            raise
+
+    async def wake_up(self, vin: str) -> dict[str, Any]:
+        """Returns a vehicle object with `state`, NOT a {result, reason} envelope.
+        Expensive and rate-limited to 3/min. Only ever call this on explicit
+        user action."""
+        return await self._post(f"/api/1/vehicles/{vin}/wake_up", {})
 
 
 def _iso(dt: datetime) -> str:

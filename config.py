@@ -59,6 +59,24 @@ class Settings:
     token_file: Path = field(
         default_factory=lambda: Path(_clean(os.getenv("TESLA_TOKEN_FILE")) or BASE_DIR / ".tokens.json")
     )
+    vin: str = field(default_factory=lambda: _clean(os.getenv("TESLA_VIN")))
+    db_file: Path = field(
+        default_factory=lambda: Path(_clean(os.getenv("CAR_DB")) or BASE_DIR / "car.db")
+    )
+    # Signed commands only. Reads go direct so proxy downtime costs us buttons, not data.
+    proxy_url: str = field(
+        default_factory=lambda: _clean(os.getenv("TESLA_PROXY_URL")) or "https://localhost:4443"
+    )
+    proxy_cert: Path = field(
+        default_factory=lambda: Path(
+            _clean(os.getenv("TESLA_PROXY_CERT")) or BASE_DIR / "keys" / "tls-cert.pem"
+        )
+    )
+    # Adaptive poll intervals, seconds. Asleep uses the FREE state check only.
+    poll_driving: int = field(default_factory=lambda: int(_clean(os.getenv("POLL_DRIVING")) or 120))
+    poll_charging: int = field(default_factory=lambda: int(_clean(os.getenv("POLL_CHARGING")) or 300))
+    poll_idle: int = field(default_factory=lambda: int(_clean(os.getenv("POLL_IDLE")) or 900))
+    poll_asleep: int = field(default_factory=lambda: int(_clean(os.getenv("POLL_ASLEEP")) or 300))
 
     # Optional: price per kWh, purely for the cost/credit readout. Blank disables it.
     import_rate: float | None = field(
