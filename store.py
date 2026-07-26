@@ -12,6 +12,8 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+import home
+
 # A sleeping car emits nothing. Anything longer than this between samples is a
 # hole rather than a slope, and the chart draws it as such.
 GAP_SECONDS = 1800
@@ -85,6 +87,7 @@ class Store:
         self._db.execute("PRAGMA busy_timeout=10000")
         self._db.executescript(SCHEMA)
         _migrate(self._db)
+        self._db.executescript(home.SCHEMA)
         self._db.commit()
 
     def close(self) -> None:
