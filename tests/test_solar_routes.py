@@ -125,9 +125,29 @@ def test_status_reports_idle_before_anything_runs(client, monkeypatch):
 
 
 def test_demo_status_reports_a_live_session(client):
-    """DEMO=1 must render every field the card shows, without a car."""
+    """DEMO=1 must render every field the card shows, without a car.
+
+    This guards the payload *shape* (a fixture missing a key the card reads),
+    not the DEMO short-circuit itself -- the real store-backed defaults satisfy
+    key-presence and a valid `state` equally well. See
+    test_demo_status_returns_the_fixture_not_real_data for the test that pins
+    the short-circuit."""
     body = client.get("/api/car/solar/status").json()
     assert body["state"] in {"idle", "charging", "grace", "stopped"}
     for key in ("surplus_w", "amps", "soc", "grace_import_wh_today",
                 "capped", "dirty", "raised_to", "original_limit"):
         assert key in body, key
+
+
+def test_demo_status_returns_the_fixture_not_real_data(client):
+    """Pins the DEMO short-circuit itself, not merely the payload shape.
+
+    Key-presence and a valid `state` are satisfied by the real store-backed
+    defaults too, so the previous test would still pass if the short-circuit
+    were deleted. These values can only come from the fixture.
+    """
+    body = client.get("/api/car/solar/status").json()
+    assert body["state"] == "charging"
+    assert body["surplus_w"] == 6240.0
+    assert body["raised_to"] == 90 and body["original_limit"] == 80
+    assert body["grace_import_wh_today"] == 41.3
