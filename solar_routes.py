@@ -7,6 +7,7 @@ commands and makes the signing proxy's per-VIN mutex a non-issue.
 """
 from __future__ import annotations
 
+import os
 import time
 from datetime import datetime
 from typing import Any
@@ -14,10 +15,13 @@ from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Body, HTTPException
 
+import demo
 import home
 import solar
 from config import settings
 from store import Store
+
+DEMO = os.getenv("DEMO", "").strip() in {"1", "true", "yes"}
 
 router = APIRouter(prefix="/api/car")
 
@@ -55,6 +59,9 @@ def _midnight_ts() -> int:
 
 @router.get("/home")
 async def get_home() -> dict[str, Any]:
+    if DEMO:
+        return demo.home_config()
+
     db = store()._db
     cfg = home.load(db)
     vin = _vin()
@@ -134,6 +141,9 @@ async def put_solar_config(body: dict[str, Any] = Body(...)) -> dict[str, bool]:
 
 @router.get("/solar/status")
 async def get_solar_status() -> dict[str, Any]:
+    if DEMO:
+        return demo.solar_status()
+
     db = store()._db
     vin = _vin()
     state = solar.load_state(db, vin) if vin else dict(solar.STATE_DEFAULTS)

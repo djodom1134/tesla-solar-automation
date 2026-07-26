@@ -358,3 +358,15 @@ th .key { vertical-align: middle; margin-right: .35rem; }
 #setup-app .msg { margin-left: .6rem; font-size: .9rem; }
 #setup-app .msg.ok { color: var(--good, #22c55e); }
 #setup-app .msg.err { color: var(--bad, #ef4444); }
+
+/* ---- solar status card ---- */
+#solar-card .solar-head { display: flex; align-items: baseline; gap: .75rem; }
+#solar-card .big { font-size: 1.6rem; font-weight: 600; }
+#solar-card .pill {
+  padding: .15rem .55rem; border-radius: 999px; font-size: .8rem;
+  background: var(--chip, #33333322);
+}
+#solar-card .pill.state-charging { background: var(--good, #22c55e); color: #fff; }
+#solar-card .pill.state-grace    { background: var(--warn, #f59e0b); color: #fff; }
+#solar-card .warn { color: var(--bad, #ef4444); }
+#solar-card .hint { color: var(--muted, #888); font-size: .85rem; margin: .35rem 0 .6rem; }

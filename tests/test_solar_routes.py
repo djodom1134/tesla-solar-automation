@@ -21,13 +21,18 @@ def client(tmp_path, monkeypatch):
     return TestClient(app)
 
 
-def test_home_is_null_until_set(client):
+def test_home_is_null_until_set(client, monkeypatch):
+    # Real (store-backed) path -- see the comment on
+    # test_status_reports_idle_before_anything_runs for why this override
+    # is needed despite the module-level DEMO default.
+    monkeypatch.setattr(solar_routes, "DEMO", False)
     body = client.get("/api/car/home").json()
     assert body["home"] is None
     assert body["classification"] == "unknown"
 
 
-def test_home_round_trips(client):
+def test_home_round_trips(client, monkeypatch):
+    monkeypatch.setattr(solar_routes, "DEMO", False)
     r = client.put("/api/car/home",
                    json={"latitude": 40.1672, "longitude": -105.1019, "radius_m": 120})
     assert r.status_code == 200
@@ -107,7 +112,22 @@ def test_other_fields_reject_an_explicit_null(client):
                       json={"period_s": None}).status_code == 400
 
 
-def test_status_reports_idle_before_anything_runs(client):
+def test_status_reports_idle_before_anything_runs(client, monkeypatch):
+    # This test exercises the real (store-backed) status path. The module-level
+    # DEMO flag defaults to True across the whole suite (tests/conftest.py sets
+    # DEMO=1 globally) -- without this override the DEMO short-circuit added
+    # below would return the fixed demo fixture instead of hitting the store,
+    # same convention as test_car_routes.py's `monkeypatch.setattr(..., "DEMO", False)`.
+    monkeypatch.setattr(solar_routes, "DEMO", False)
     body = client.get("/api/car/solar/status").json()
     assert body["state"] == "idle"
     assert body["grace_import_wh_total"] == 0
+
+
+def test_demo_status_reports_a_live_session(client):
+    """DEMO=1 must render every field the card shows, without a car."""
+    body = client.get("/api/car/solar/status").json()
+    assert body["state"] in {"idle", "charging", "grace", "stopped"}
+    for key in ("surplus_w", "amps", "soc", "grace_import_wh_today",
+                "capped", "dirty", "raised_to", "original_limit"):
+        assert key in body, key

@@ -216,6 +216,7 @@ async function refresh() {
     const [body, health] = await Promise.all([
       api("/api/car/state"),
       api("/api/car/health"),
+      loadSolar(),   // never throws -- the card just stays hidden on failure
     ]);
     state.health = health;
     $("error-bar").hidden = true;
@@ -227,6 +228,52 @@ async function refresh() {
     $("error-bar").textContent = err.message;
   } finally {
     state.refreshing = false;
+  }
+}
+
+/* --------------------------------------------------------------- solar */
+
+async function loadSolar() {
+  let s;
+  try {
+    s = await api("/api/car/solar/status");
+  } catch (_) {
+    return;                       // the card simply stays hidden
+  }
+  const card = $("solar-card");
+  card.hidden = false;
+
+  $("solar-state").textContent = s.state;
+  $("solar-state").className = "pill state-" + s.state;
+  $("solar-surplus").textContent =
+    s.surplus_w === null ? "—" : (s.surplus_w / 1000).toFixed(2) + " kW surplus";
+  $("solar-amps").textContent = s.amps === null ? "" : s.amps + " A";
+
+  // Show the raised limit NEXT TO the original, so a stuck raise is visible
+  // rather than something you discover next month.
+  const note = $("solar-limit-note");
+  if (s.raised_to && s.original_limit && s.raised_to !== s.original_limit) {
+    note.textContent = `Charge limit raised to ${s.raised_to}% for solar `
+                     + `(your setting: ${s.original_limit}%)`;
+    note.hidden = false;
+  } else {
+    note.hidden = true;
+  }
+
+  $("solar-grace").textContent =
+    `Imported while riding out clouds: ${s.grace_import_wh_today} Wh today, `
+    + `${s.grace_import_wh_total} Wh total`;
+
+  const warn = $("solar-warn");
+  if (s.capped) {
+    warn.textContent = "Paused: daily API request cap reached. Resumes tomorrow.";
+    warn.hidden = false;
+  } else if (s.dirty) {
+    warn.textContent = "Your original charge settings have not been restored yet — "
+                     + "waiting for the car to be home and reachable.";
+    warn.hidden = false;
+  } else {
+    warn.hidden = true;
   }
 }
 

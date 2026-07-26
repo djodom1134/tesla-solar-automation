@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import random
+import time
 from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -349,3 +350,33 @@ def soc_history(days: int, tz: str) -> list[dict]:
     for i in range(1, len(rows)):
         rows[i]["gap"] = rows[i]["ts"] - rows[i - 1]["ts"] > store.GAP_SECONDS
     return rows
+
+
+# ---------------------------------------------------------------- solar controller
+
+def solar_status() -> dict:
+    """A mid-session solar charge, so the card can be built without a car."""
+    return {
+        "state": "charging",
+        "surplus_w": 6240.0,
+        "amps": 26,
+        "soc": 72,
+        "limit": 90,
+        "raised_to": 90,
+        "original_limit": 80,
+        "grace_import_wh_today": 41.3,
+        "grace_import_wh_total": 512.8,
+        "capped": False,
+        "dirty": False,
+        "engaged_at": int(time.time()) - 4200,
+        "last_tick_ts": int(time.time()) - 40,
+        "requests_today": 173,
+    }
+
+
+def home_config() -> dict:
+    return {
+        "home": {"latitude": 40.1672, "longitude": -105.1019, "radius_m": 100},
+        "classification": "home",
+        "car": {"lat": 40.1673, "lon": -105.1018},
+    }
