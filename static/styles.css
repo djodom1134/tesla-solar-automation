@@ -312,13 +312,17 @@ th .key { vertical-align: middle; margin-right: .35rem; }
              padding: .6rem .9rem; border-radius: var(--radius); margin-bottom: 1rem;
              font-size: .9rem; }
 
-.map { height: 320px; border-radius: var(--radius); overflow: hidden;
-       border: 1px solid var(--border); }
+/* `position: relative; z-index: 0` gives the map its own stacking context, so
+   Leaflet's internal panes (which run up to z-index 1000 for controls) are
+   scoped inside it and can never paint over the page's fixed-position
+   tooltip/toast — without touching any of Leaflet's own per-pane z-indexes,
+   which stay intact for its internal stacking (tiles under markers under
+   popups, etc). */
+.map { position: relative; z-index: 0; height: 320px; border-radius: var(--radius);
+       overflow: hidden; border: 1px solid var(--border); }
 .map.empty { display: grid; place-content: center; background: var(--plane);
              color: var(--muted); }
 .map.empty::after { content: "No location"; }
-/* Leaflet panes stack above the tooltip layer by default. */
-.leaflet-pane { z-index: 1; }
 
 .foot { display: flex; gap: 1.5rem; flex-wrap: wrap; padding: 2rem 0 1rem;
         border-top: 1px solid var(--border); margin-top: 2rem; }

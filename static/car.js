@@ -17,6 +17,7 @@ const state = {
   history: null,
   map: null,
   marker: null,
+  refreshing: false,
 };
 
 const RANGES = [
@@ -33,7 +34,7 @@ const celsius = (v) => (v == null ? "—" : `${nfmt(v, 0)}°C`);
 const psi = (bar) => (bar == null ? "—" : `${nfmt(bar * 14.5038, 0)} psi`);
 
 function ago(seconds) {
-  if (seconds == null) return "";
+  if (seconds == null) return "an unknown time ago";
   if (seconds < 90) return "just now";
   const m = Math.round(seconds / 60);
   if (m < 60) return `${m} min ago`;
@@ -138,7 +139,7 @@ function renderTiles(v) {
     ["Sentry", v.sentry == null ? "—" : v.sentry ? "On" : "Off"],
     // The closest thing to a camera the API offers. There is no footage endpoint.
     ["Dashcam", v.dashcam || "—"],
-    ["Charge port", v.port_open ? "Open" : "Closed"],
+    ["Charge port", v.port_open == null ? "—" : v.port_open ? "Open" : "Closed"],
   ];
 
   const openDoors = Object.entries(v.doors || {}).filter(([, open]) => open);
@@ -196,7 +197,7 @@ function renderMap(v) {
   }
 
   state.marker.bindPopup(
-    v.shift && v.shift !== "P" ? `Moving · ${v.speed_mph} mph` : "Parked"
+    v.shift && v.shift !== "P" ? `Moving · ${v.speed_mph ?? 0} mph` : "Parked"
   );
   // A map created inside a hidden element measures zero; recompute once shown.
   setTimeout(() => state.map.invalidateSize(), 0);
@@ -205,6 +206,11 @@ function renderMap(v) {
 /* ------------------------------------------------------------------- boot */
 
 async function refresh() {
+  // The 60s poll, the post-wake retry, and a slow prior request can all land
+  // close together. Without this, an older response can resolve last and
+  // overwrite a newer render with stale data.
+  if (state.refreshing) return;
+  state.refreshing = true;
   try {
     const [body, health] = await Promise.all([
       api("/api/car/state"),
@@ -218,6 +224,8 @@ async function refresh() {
     if (err.status === 401) { showGate(err.message); return; }
     $("error-bar").hidden = false;
     $("error-bar").textContent = err.message;
+  } finally {
+    state.refreshing = false;
   }
 }
 

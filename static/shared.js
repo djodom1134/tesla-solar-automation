@@ -41,10 +41,11 @@ export function initTheme(onChange) {
 
 /* -------------------------------------------------------------------- gate */
 
+/* Populates the gate card's contents only. Each page's own wrapper is
+   responsible for showing #gate and hiding its app container — the two pages
+   don't share a container id (#app vs #car-app), so this function must not
+   guess at one. */
 export function showGate(config, message) {
-  $("app").hidden = true;
-  $("gate").hidden = false;
-
   const cfg = config;
   const actions = $("gate-actions");
   actions.replaceChildren();
