@@ -285,3 +285,46 @@ th .key { vertical-align: middle; margin-right: .35rem; }
   .hero-figure { font-size: 2.5rem; }
   .hero-money { text-align: left; }
 }
+
+/* ---------------------------------------------------------------- car page */
+
+.hero { display: flex; gap: 2rem; align-items: center; flex-wrap: wrap;
+        padding: 1.5rem 0; }
+.hero-ring { position: relative; width: 160px; height: 160px; flex: none; }
+.hero-ring svg { width: 100%; height: 100%; transform: rotate(-90deg); }
+.ring-track { fill: none; stroke: var(--grid); stroke-width: 10; }
+.ring-fill  { fill: none; stroke: var(--battery); stroke-width: 10;
+              stroke-linecap: round; transition: stroke-dasharray .6s ease; }
+.ring-fill.charging { stroke: var(--solar); }
+.ring-limit { fill: none; stroke: var(--ink); stroke-width: 12; opacity: .55; }
+.hero-ring-label { position: absolute; inset: 0; display: grid; place-content: center;
+                   font-size: 2.25rem; font-weight: 650; letter-spacing: -.02em; }
+.hero-ring-label .unit { font-size: 1.1rem; font-weight: 500; opacity: .6; }
+.hero-facts { flex: 1 1 16rem; }
+.hero-headline { font-size: 1.5rem; font-weight: 600; margin: 0 0 .25rem; }
+.hero-dl { display: flex; gap: 2rem; margin: 1rem 0 0; flex-wrap: wrap; }
+.hero-dl dt { font-size: .8rem; color: var(--muted); margin: 0; }
+.hero-dl dd { margin: .15rem 0 0; font-size: 1.05rem; font-variant-numeric: tabular-nums; }
+
+/* Staleness reads as information, not as an error — it is the normal state. */
+.stale-bar { background: var(--plane); color: var(--ink); border: 1px solid var(--border);
+             border-left: 3px solid var(--solar);
+             padding: .6rem .9rem; border-radius: var(--radius); margin-bottom: 1rem;
+             font-size: .9rem; }
+
+.map { height: 320px; border-radius: var(--radius); overflow: hidden;
+       border: 1px solid var(--border); }
+.map.empty { display: grid; place-content: center; background: var(--plane);
+             color: var(--muted); }
+.map.empty::after { content: "No location"; }
+/* Leaflet panes stack above the tooltip layer by default. */
+.leaflet-pane { z-index: 1; }
+
+.foot { display: flex; gap: 1.5rem; flex-wrap: wrap; padding: 2rem 0 1rem;
+        border-top: 1px solid var(--border); margin-top: 2rem; }
+
+.toast { position: fixed; left: 50%; bottom: 2rem; transform: translateX(-50%);
+         background: var(--ink); color: var(--surface); padding: .7rem 1.1rem;
+         border-radius: var(--radius); font-size: .9rem; z-index: 1000; max-width: 90vw;
+         box-shadow: var(--shadow); }
+.toast.bad { background: var(--import); color: #fff; }
