@@ -12,6 +12,8 @@ from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import store
+
 SITE_ID = "demo-1"
 _rng = random.Random(7)  # fixed seed: the demo looks the same every reload
 
@@ -341,6 +343,9 @@ def soc_history(days: int, tz: str) -> list[dict]:
         t += timedelta(seconds=step)
 
     # Mark the first sample after each hole, exactly as store.history does.
+    # Reads store.GAP_SECONDS live (module attribute access, not a bound
+    # local) so this can never silently drift from the store's real
+    # definition of what counts as a sleep gap.
     for i in range(1, len(rows)):
-        rows[i]["gap"] = rows[i]["ts"] - rows[i - 1]["ts"] > 1800
+        rows[i]["gap"] = rows[i]["ts"] - rows[i - 1]["ts"] > store.GAP_SECONDS
     return rows

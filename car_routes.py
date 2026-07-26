@@ -6,6 +6,7 @@ state — a request that cannot reach the vehicle falls back to the last stored
 snapshot with its age, rather than failing."""
 from __future__ import annotations
 
+import asyncio
 import os
 import socket
 import time
@@ -18,7 +19,7 @@ import demo
 import vehicle
 from config import settings
 from store import Store
-from tesla import TeslaAPIError, TeslaClient, VehicleAsleep
+from tesla import TeslaAPIError, TeslaAuthError, TeslaClient, VehicleAsleep
 
 DEMO = os.getenv("DEMO", "").strip() in {"1", "true", "yes"}
 
@@ -122,17 +123,27 @@ async def car_health() -> dict[str, Any]:
     vin = await _vin()
     scopes: list[str] = []
     key_paired: bool | None = None
+    # Distinguishes "not logged in" from "logged in but the token didn't
+    # decode" from "no problem" (None). Both failure modes used to collapse
+    # into scopes: [] with no way for an operator to tell them apart -- and
+    # because missing_scopes short-circuits on falsy scopes, into an
+    # identical missing_scopes: [] too.
+    auth_error: str | None = None
 
     if not DEMO:
         import base64
         import json
         try:
             token = await _client()._access_token()
-            payload = token.split(".")[1]
-            payload += "=" * (-len(payload) % 4)
-            scopes = json.loads(base64.urlsafe_b64decode(payload)).get("scp", [])
-        except Exception:
-            scopes = []
+        except TeslaAuthError:
+            auth_error = "not_authenticated"
+        else:
+            try:
+                payload = token.split(".")[1]
+                payload += "=" * (-len(payload) % 4)
+                scopes = json.loads(base64.urlsafe_b64decode(payload)).get("scp", [])
+            except Exception:
+                auth_error = "scopes_decode_failed"
         try:
             status = await _client().fleet_status([vin])
             key_paired = vin in (status or {}).get("key_paired_vins", [])
@@ -145,7 +156,12 @@ async def car_health() -> dict[str, Any]:
         "scopes": scopes,
         "missing_scopes": [s for s in REQUIRED_SCOPES if scopes and s not in scopes],
         "key_paired": True if DEMO else key_paired,
-        "proxy": True if DEMO else _proxy_up(),
+        "auth_error": auth_error,
+        # Off the event loop: this is a blocking socket call with a 0.5s
+        # timeout, hit on every page load and every 60s health poll. Run
+        # synchronously it would stall the whole single-threaded app for up
+        # to half a second per call.
+        "proxy": True if DEMO else await asyncio.to_thread(_proxy_up),
         "collector": {
             "running": bool(last and int(time.time()) - last["ts"] < 3600),
             "last_sample": last["ts"] if last else None,
