@@ -87,3 +87,35 @@ def test_empty_payload_does_not_raise():
     v = vehicle.derive({})
     assert v["soc"] is None
     assert v["doors"] == {}
+
+
+def test_derive_surfaces_the_fields_the_solar_loop_needs():
+    import json
+    from pathlib import Path
+    import vehicle
+    raw = json.loads((Path(__file__).parent / "fixtures" / "vehicle_data.json").read_text())
+    view = vehicle.derive(raw)
+    for key in ("volts", "fast_charger_present", "homelink_nearby", "homelink_devices"):
+        assert key in view, f"{key} missing from derive()"
+    assert view["homelink_devices"] == 2
+
+
+def test_volts_is_none_when_idle_because_the_sensor_reads_two():
+    # derive() consumes the raw vehicle_data dict directly (no "response"
+    # wrapper) -- tesla.py already unwraps that before calling derive(), and
+    # the `raw` fixture above has charge_state at the top level too.
+    import vehicle
+    view = vehicle.derive({
+        "charge_state": {"charging_state": "Disconnected", "charger_voltage": 2},
+        "climate_state": {}, "drive_state": {}, "vehicle_state": {},
+        "gui_settings": {}, "vehicle_config": {}})
+    assert view["volts"] is None
+
+
+def test_volts_is_reported_while_charging():
+    import vehicle
+    view = vehicle.derive({
+        "charge_state": {"charging_state": "Charging", "charger_voltage": 241},
+        "climate_state": {}, "drive_state": {}, "vehicle_state": {},
+        "gui_settings": {}, "vehicle_config": {}})
+    assert view["volts"] == 241

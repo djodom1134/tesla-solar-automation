@@ -125,3 +125,63 @@ def test_gap_boundary_is_exclusive(db):
     db.record(view(1000 + store.GAP_SECONDS, 78))
     rows = db.history("VIN1", 0, 10 ** 9)
     assert [r["gap"] for r in rows] == [False, False]
+
+
+def test_migration_adds_columns_to_an_existing_database(tmp_path):
+    """CREATE TABLE IF NOT EXISTS will not alter an existing table."""
+    import sqlite3
+    path = tmp_path / "old.db"
+    legacy = sqlite3.connect(path)
+    legacy.executescript("""
+        CREATE TABLE samples (
+          ts INTEGER NOT NULL, vin TEXT NOT NULL, battery_level INTEGER,
+          usable_battery_level INTEGER, charge_limit_soc INTEGER,
+          charging_state TEXT, charging INTEGER, charger_power INTEGER,
+          range_mi REAL, odometer REAL, inside_temp REAL, outside_temp REAL,
+          latitude REAL, longitude REAL, shift_state TEXT,
+          PRIMARY KEY (vin, ts));
+    """)
+    legacy.commit()
+    legacy.close()
+
+    from store import Store
+    s = Store(path)
+    cols = {r[1] for r in s._db.execute("PRAGMA table_info(samples)")}
+    for name in ("charge_energy_added", "charger_actual_current", "charger_voltage",
+                 "fast_charger_present", "fast_charger_type", "at_home"):
+        assert name in cols, f"{name} missing after migration"
+    s.close()
+
+
+def test_record_persists_the_new_columns(tmp_path):
+    from store import Store
+    s = Store(tmp_path / "n.db")
+    s.record({
+        "vin": "V1", "sampled_at": 1000, "soc": 50, "usable_soc": 50, "limit": 80,
+        "charging_state": "Charging", "charging": True, "charge_power_kw": 7,
+        "range_mi": 200.0, "odometer_mi": 1.0, "inside_c": 20.0, "outside_c": 10.0,
+        "lat": 40.0, "lon": -105.0, "shift": "P",
+        "energy_added_kwh": 12.5, "amps_actual": 24, "volts": 240,
+        "fast_charger_present": False, "fast_charger": "SNA",
+    }, at_home="home")
+    row = s._db.execute(
+        "SELECT charge_energy_added, charger_actual_current, charger_voltage,"
+        " fast_charger_present, fast_charger_type, at_home FROM samples").fetchone()
+    assert row["charge_energy_added"] == 12.5
+    assert row["charger_actual_current"] == 24
+    assert row["charger_voltage"] == 240
+    assert row["fast_charger_present"] == 0
+    assert row["fast_charger_type"] == "SNA"
+    assert row["at_home"] == "home"
+    s.close()
+
+
+def test_record_tolerates_a_view_missing_the_new_keys(tmp_path):
+    """Pre-existing callers pass views without them; NULL means unknown."""
+    from store import Store
+    s = Store(tmp_path / "m.db")
+    s.record({"vin": "V1", "sampled_at": 1, "soc": 50})
+    row = s._db.execute("SELECT charge_energy_added, at_home FROM samples").fetchone()
+    assert row["charge_energy_added"] is None
+    assert row["at_home"] is None
+    s.close()

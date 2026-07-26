@@ -33,6 +33,12 @@ CREATE TABLE IF NOT EXISTS samples (
   latitude             REAL,
   longitude            REAL,
   shift_state          TEXT,
+  charge_energy_added    REAL,
+  charger_actual_current INTEGER,
+  charger_voltage        INTEGER,
+  fast_charger_present   INTEGER,
+  fast_charger_type      TEXT,
+  at_home                TEXT,
   PRIMARY KEY (vin, ts)
 );
 CREATE INDEX IF NOT EXISTS samples_vin_ts ON samples (vin, ts);
@@ -45,6 +51,30 @@ CREATE TABLE IF NOT EXISTS snapshot (
 """
 
 
+NEW_COLUMNS = (
+    ("charge_energy_added", "REAL"),
+    ("charger_actual_current", "INTEGER"),
+    ("charger_voltage", "INTEGER"),
+    ("fast_charger_present", "INTEGER"),
+    ("fast_charger_type", "TEXT"),
+    ("at_home", "TEXT"),
+)
+
+
+def _migrate(db: sqlite3.Connection) -> None:
+    """Add columns to an EXISTING samples table.
+
+    `CREATE TABLE IF NOT EXISTS` in SCHEMA is a no-op against a table that
+    already exists, so a schema edit alone never reaches a live car.db.
+    Rows written before this runs keep NULL in every new column forever --
+    consumers must read NULL as "unknown", never as zero.
+    """
+    existing = {row[1] for row in db.execute("PRAGMA table_info(samples)")}
+    for name, decl in NEW_COLUMNS:
+        if name not in existing:
+            db.execute(f"ALTER TABLE samples ADD COLUMN {name} {decl}")
+
+
 class Store:
     def __init__(self, path: Path):
         self.path = Path(path)
@@ -54,12 +84,13 @@ class Store:
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA busy_timeout=10000")
         self._db.executescript(SCHEMA)
+        _migrate(self._db)
         self._db.commit()
 
     def close(self) -> None:
         self._db.close()
 
-    def record(self, view: dict[str, Any]) -> None:
+    def record(self, view: dict[str, Any], at_home: str | None = None) -> None:
         """Store one sample plus the full snapshot. Idempotent per (vin, second)
         so a collector poll and a page load landing together cannot double-count."""
         vin = view.get("vin")
@@ -70,13 +101,20 @@ class Store:
             """INSERT OR REPLACE INTO samples
                (ts, vin, battery_level, usable_battery_level, charge_limit_soc,
                 charging_state, charging, charger_power, range_mi, odometer,
-                inside_temp, outside_temp, latitude, longitude, shift_state)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                inside_temp, outside_temp, latitude, longitude, shift_state,
+                charge_energy_added, charger_actual_current, charger_voltage,
+                fast_charger_present, fast_charger_type, at_home)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (ts, vin, view.get("soc"), view.get("usable_soc"), view.get("limit"),
              view.get("charging_state"), int(bool(view.get("charging"))),
              view.get("charge_power_kw"), view.get("range_mi"),
              view.get("odometer_mi"), view.get("inside_c"), view.get("outside_c"),
-             view.get("lat"), view.get("lon"), view.get("shift")),
+             view.get("lat"), view.get("lon"), view.get("shift"),
+             view.get("energy_added_kwh"), view.get("amps_actual"),
+             view.get("volts"),
+             None if view.get("fast_charger_present") is None
+                  else int(bool(view.get("fast_charger_present"))),
+             view.get("fast_charger"), at_home),
         )
         self._db.execute(
             "INSERT OR REPLACE INTO snapshot (vin, ts, json) VALUES (?,?,?)",

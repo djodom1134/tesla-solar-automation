@@ -76,6 +76,11 @@ def derive(raw: dict[str, Any]) -> dict[str, Any]:
         "port_latch": _s(charge.get("charge_port_latch")),
         "port_color": _s(charge.get("charge_port_color")),
         "fast_charger": _s(charge.get("fast_charger_type")),
+        "fast_charger_present": charge.get("fast_charger_present"),
+        # charger_voltage reads 2, not 0, when idle -- so it is only meaningful
+        # mid-session. The solar controller converts amps to watts with it.
+        "volts": (charge.get("charger_voltage")
+                  if charging_state in CHARGING_STATES else None),
         "scheduled_mode": _s(charge.get("scheduled_charging_mode")),
 
         # ---- climate ----
@@ -159,6 +164,8 @@ def derive(raw: dict[str, Any]) -> dict[str, Any]:
             if f"tpms_pressure_{corner}" in state
         },
         "software": _software(state.get("software_update")),
+        "homelink_nearby": state.get("homelink_nearby"),
+        "homelink_devices": state.get("homelink_device_count"),
 
         # ---- capability flags, for hiding controls the car cannot do ----
         "has_sunroof": bool(config.get("sun_roof_installed")),

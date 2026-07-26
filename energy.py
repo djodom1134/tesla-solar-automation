@@ -56,11 +56,13 @@ def derive(row: dict[str, Any]) -> dict[str, Any]:
     )
     battery_discharged = _wh(row, "battery_energy_exported")
 
+    grid_export_from_solar = _wh(row, "grid_energy_exported_from_solar")
+
     # Share of the home's consumption that never touched the grid.
     self_sufficiency = ((home - home_from_grid) / home * 100) if home > 0 else None
     # Share of generated solar consumed on site rather than exported.
     self_consumption = (
-        ((solar - _wh(row, "grid_energy_exported_from_solar")) / solar * 100) if solar > 0 else None
+        ((solar - grid_export_from_solar) / solar * 100) if solar > 0 else None
     )
 
     kwh = lambda v: round(v / WH_PER_KWH, 3)  # noqa: E731
@@ -75,6 +77,7 @@ def derive(row: dict[str, Any]) -> dict[str, Any]:
         "home_from_generator": kwh(home_from_generator),
         "grid_import": kwh(grid_import),
         "grid_export": kwh(grid_export),
+        "grid_export_from_solar": kwh(grid_export_from_solar),
         "grid_net": kwh(grid_export - grid_import),  # positive = net exporter
         "battery_charged": kwh(battery_charged),
         "battery_discharged": kwh(battery_discharged),
