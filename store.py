@@ -109,42 +109,51 @@ class Store:
     ) -> list[dict[str, Any]]:
         """Samples in [start, end], downsampled to at most `buckets` points.
 
-        Bucketing takes the last sample in each bucket rather than an average,
-        so a charge that finishes mid-bucket still reads as finished.
+        Guarantees, for any input (not just uniformly-spaced data):
+          1. Never returns more than `buckets` rows.
+          2. Never drops a sample when the matching sample count is <= `buckets`.
 
-        Bucket width is derived from the span of the *matching* samples, not
-        the raw (start, end) window. Callers pass wide sentinel windows (e.g.
-        start=0, end=10**9) to mean "everything, whatever it spans" — if
-        width were end-start over buckets, a couple of samples a minute
-        apart inside a 30-year-wide window would land in the same
-        multi-decade bucket and one would be silently dropped, even though
-        there are far fewer samples than the bucket budget.
+        Real SoC data is not uniformly spaced — dense while driving or
+        charging, then nothing for hours while the car sleeps. An earlier
+        version of this bucketed by a fixed *time* width (span / buckets),
+        which broke both guarantees: a width that evenly divided the span
+        produced one bucket index past the intended range (budget overflow),
+        and a handful of tightly-clustered samples plus one far-off outlier
+        could still land in the same wide time-bucket even when the total
+        sample count was far under budget (silent drop).
+
+        Buckets are instead sized by sample *rank*, not by elapsed time:
+        matching rows are numbered 0..n-1 in timestamp order, and bucket
+        index = rn * buckets // n. For any n and buckets, this produces
+        exactly min(n, buckets) distinct bucket values — never more, and
+        never fewer than n when n <= buckets — so both guarantees hold
+        unconditionally, independent of how the samples are spaced in time.
+        The last (highest-rn / latest-ts) sample in each bucket is kept, so
+        a charge that finishes mid-bucket still reads as finished.
+
+        This runs as a single SQL statement (one CTE, referenced twice)
+        rather than a bounds pre-query followed by a bucketing query, so
+        there's no gap between two reads for a concurrent writer (the
+        collector or another web request) to land in. SQLite gives a single
+        statement a consistent snapshot for its entire execution, even
+        without an explicit transaction, so this is race-free by construction.
         """
-        bounds = self._db.execute(
-            "SELECT MIN(ts) AS lo, MAX(ts) AS hi FROM samples WHERE vin = ? AND ts >= ? AND ts <= ?",
-            (vin, start, end),
-        ).fetchone()
-        if bounds is None or bounds["lo"] is None:
-            return []
-        span = max(1, bounds["hi"] - bounds["lo"])
         buckets = max(1, buckets)
-        # Ceiling division: a floored width under-covers the span by the
-        # remainder, which — combined with the grouping offset below sitting
-        # exactly on the first sample — synthesizes one extra partial bucket
-        # at the far edge and blows the caller's budget by one row.
-        width = max(1, -(-span // buckets))
-        lo = bounds["lo"]
         rows = self._db.execute(
-            """SELECT ts, battery_level, usable_battery_level, charging
-               FROM samples
-               WHERE vin = ? AND ts >= ? AND ts <= ?
-                 AND ts IN (
-                   SELECT MAX(ts) FROM samples
-                   WHERE vin = ? AND ts >= ? AND ts <= ?
-                   GROUP BY (ts - ?) / ?
-                 )
+            """WITH matched AS (
+                 SELECT ts, battery_level, usable_battery_level, charging,
+                        ROW_NUMBER() OVER (ORDER BY ts) - 1 AS rn,
+                        COUNT(*) OVER () AS n
+                 FROM samples
+                 WHERE vin = ? AND ts >= ? AND ts <= ?
+               )
+               SELECT ts, battery_level, usable_battery_level, charging
+               FROM matched
+               WHERE rn IN (
+                 SELECT MAX(rn) FROM matched GROUP BY (rn * ?) / n
+               )
                ORDER BY ts""",
-            (vin, start, end, vin, start, end, lo, width),
+            (vin, start, end, buckets),
         ).fetchall()
 
         out: list[dict[str, Any]] = []
