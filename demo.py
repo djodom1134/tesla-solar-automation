@@ -233,3 +233,114 @@ def site_info() -> dict[str, Any]:
         "components": {"solar": True, "battery": True},
         "solar_power": 9_000,
     }
+
+
+# ---------------------------------------------------------------- vehicle
+
+def vehicle_data(tz: str) -> dict:
+    """Synthetic vehicle_data shaped exactly like Tesla's, so it flows through
+    the real vehicle.derive path. The car page cannot be built against a real
+    car that is asleep most of the time."""
+    now = datetime.now(ZoneInfo(tz))
+    charging = 1 <= now.hour < 5
+    soc = 62 + (now.hour % 7)
+    return {
+        "vin": "5YJSA00000F000000",
+        "state": "online",
+        "charge_state": {
+            "battery_level": soc,
+            "usable_battery_level": soc - 2,
+            "charge_limit_soc": 80,
+            "charge_limit_soc_min": 50,
+            "charge_limit_soc_max": 100,
+            "charging_state": "Charging" if charging else "Disconnected",
+            "charger_power": 11 if charging else 0,
+            "charger_voltage": 240 if charging else 2,
+            "charger_actual_current": 48 if charging else 0,
+            "charge_current_request": 48,
+            "charge_current_request_max": 48,
+            "minutes_to_full_charge": 95 if charging else 0,
+            "charge_energy_added": 14.2 if charging else 0.0,
+            "battery_range": soc * 3.4,
+            "est_battery_range": soc * 3.1,
+            "conn_charge_cable": "IEC" if charging else "<invalid>",
+            "charge_port_door_open": charging,
+            "charge_port_latch": "Engaged" if charging else "Disengaged",
+            "charge_port_color": "FlashingGreen" if charging else "Off",
+            "fast_charger_type": "<invalid>",
+            "scheduled_charging_mode": "Off",
+        },
+        "climate_state": {
+            "inside_temp": 21.5, "outside_temp": 14.0,
+            "driver_temp_setting": 21.0, "passenger_temp_setting": 21.0,
+            "min_avail_temp": 15.0, "max_avail_temp": 28.0,
+            "is_climate_on": False, "is_auto_conditioning_on": False,
+            "is_preconditioning": False, "climate_keeper_mode": "off",
+            "defrost_mode": 0,
+            "seat_heater_left": 0, "seat_heater_right": 0,
+            "steering_wheel_heater": False,
+            "remote_heater_control_enabled": True,
+        },
+        "drive_state": {
+            # Denver, so the map has somewhere to point.
+            "latitude": 39.7392, "longitude": -104.9903, "heading": 215,
+            "speed": None, "shift_state": None, "power": 0,
+            "gps_as_of": int(now.timestamp()),
+            "timestamp": int(now.timestamp() * 1000),
+        },
+        "vehicle_state": {
+            "vehicle_name": "Stallion (demo)",
+            "odometer": 24680.5,
+            "locked": True,
+            "df": 0, "dr": 0, "pf": 0, "pr": 0, "ft": 0, "rt": 0,
+            "fd_window": 0, "fp_window": 0, "rd_window": 0, "rp_window": 0,
+            "sentry_mode": True, "sentry_mode_available": True,
+            "dashcam_state": "Recording",
+            "is_user_present": False, "valet_mode": False,
+            "car_version": "2026.14.3 abcdef0",
+            "tpms_pressure_fl": 3.1, "tpms_pressure_fr": 3.1,
+            "tpms_pressure_rl": 3.0, "tpms_pressure_rr": 2.6,
+            "tpms_soft_warning_rr": True,
+            "software_update": {"status": "", "version": " ",
+                                "download_perc": 0, "install_perc": 1},
+        },
+        "vehicle_config": {"rear_seat_heaters": 1, "has_seat_cooling": False,
+                           "sun_roof_installed": 0},
+        "gui_settings": {"gui_distance_units": "mi/hr"},
+    }
+
+
+def soc_history(days: int, tz: str) -> list[dict]:
+    """A week of plausible SoC: overnight charges, daily drives, and — the point
+    of this fixture — sleep gaps the chart has to render as dashed."""
+    zone = ZoneInfo(tz)
+    now = datetime.now(zone)
+    rows: list[dict] = []
+    soc = 70
+    start = now - timedelta(days=days)
+    step = 300
+    t = start
+    while t < now:
+        hour = t.hour
+        asleep = 5 <= hour < 7 or 10 <= hour < 15
+        if not asleep:
+            if 1 <= hour < 5 and soc < 80:
+                soc = min(80, soc + 1)
+                charging = True
+            else:
+                charging = False
+                if 7 <= hour < 9 or 17 <= hour < 19:
+                    soc = max(12, soc - 1)
+            rows.append({
+                "ts": int(t.timestamp()),
+                "soc": soc,
+                "usable_soc": soc - 2,
+                "charging": charging,
+                "gap": False,
+            })
+        t += timedelta(seconds=step)
+
+    # Mark the first sample after each hole, exactly as store.history does.
+    for i in range(1, len(rows)):
+        rows[i]["gap"] = rows[i]["ts"] - rows[i - 1]["ts"] > 1800
+    return rows

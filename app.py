@@ -18,6 +18,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
+import car_routes
 import demo
 import energy
 from config import BASE_DIR, settings
@@ -232,6 +233,10 @@ async def api_dashboard(
     }
 
 
+app.include_router(car_routes.router)
+
+# The static mount is a catch-all: any router included after this line is
+# unreachable. car_routes must be included above it.
 app.mount("/", StaticFiles(directory=BASE_DIR / "static", html=True), name="static")
 
 
