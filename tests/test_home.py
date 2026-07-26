@@ -75,3 +75,27 @@ def test_save_and_load_round_trip():
     home.save(db, 41.0, -106.0, 75)      # single row, overwritten
     assert db.execute("SELECT COUNT(*) FROM home_config").fetchone()[0] == 1
     assert home.load(db).radius_m == 75
+
+
+def test_missing_coordinates_beat_charger_evidence():
+    """Deliberate precedence: "freeze, do not guess" wins over any inference.
+    unknown makes the controller send NO command; away makes it send a restore.
+    When we do not know where the car is, sending nothing is the safe answer."""
+    assert home.classify(_view(lat=None, lon=None, fast_charger_present=True), CFG) == "unknown"
+    assert home.classify(_view(lat=None, lon=None, fast_charger="Supercharger"), CFG) == "unknown"
+
+
+def test_either_coordinate_alone_missing_is_unknown():
+    assert home.classify(_view(lon=None), CFG) == "unknown"
+    v = _view()
+    del v["lon"]
+    assert home.classify(v, CFG) == "unknown"
+
+
+def test_distance_exactly_at_the_radius_counts_as_home():
+    """The comparison is <=, so the boundary is inclusive. Pinning it so a
+    later refactor to < is caught rather than silently shrinking the geofence."""
+    import math
+    # 100 m due north of home, to within a metre.
+    dlat = CFG.radius_m / home.EARTH_RADIUS_M * 180.0 / math.pi
+    assert home.classify(_view(lat=DENVER[0] + dlat * 0.999), CFG) == "home"

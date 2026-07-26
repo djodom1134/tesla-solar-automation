@@ -28,6 +28,18 @@ CREATE TABLE IF NOT EXISTS home_config (
 
 # A DC fast charger proves the car is not on home AC, whatever the coordinates
 # say. Values per docs/tesla-field-reference.md:118.
+#
+# DELIBERATELY EXCLUDES "Tesla", which is also an attested fast_charger_type
+# (field-reference:31). This enum mixes AC and DC connector types -- it also
+# contains ACSingleWireCAN -- so membership does not imply DC, and a Tesla
+# WALL CONNECTOR is the most likely thing to report "Tesla". Including it would
+# classify home AC charging as "away" and silently prevent the solar controller
+# from ever engaging. fast_charger_present is checked first and is the reliable
+# DC signal, so this set is belt-and-braces.
+#
+# UNRESOLVED: read fast_charger_type while charging at home, and again while
+# Supercharging, before changing this set. Do not change it on documentation
+# alone.
 DC_CHARGER_TYPES = {"Supercharger", "Combo", "Chademo", "Gb"}
 
 EARTH_RADIUS_M = 6_371_000.0
@@ -57,6 +69,8 @@ def classify(view: dict, cfg: HomeConfig | None) -> str:
     """"home" | "away" | "unknown". Never a boolean -- see the module docstring."""
     if cfg is None:
         return "unknown"
+    # Coordinates first, deliberately: "we cannot tell" outranks every other
+    # signal, because unknown freezes the controller while away makes it act.
     lat, lon = view.get("lat"), view.get("lon")
     if lat is None or lon is None:
         return "unknown"
