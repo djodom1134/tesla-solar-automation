@@ -92,10 +92,18 @@ def test_either_coordinate_alone_missing_is_unknown():
     assert home.classify(v, CFG) == "unknown"
 
 
-def test_distance_exactly_at_the_radius_counts_as_home():
-    """The comparison is <=, so the boundary is inclusive. Pinning it so a
-    later refactor to < is caught rather than silently shrinking the geofence."""
-    import math
-    # 100 m due north of home, to within a metre.
-    dlat = CFG.radius_m / home.EARTH_RADIUS_M * 180.0 / math.pi
-    assert home.classify(_view(lat=DENVER[0] + dlat * 0.999), CFG) == "home"
+def test_the_radius_boundary_is_inclusive(monkeypatch):
+    """`distance <= radius` counts as home; one millimetre further does not.
+
+    distance_m is patched rather than approached by an offset: haversine
+    floating-point drift puts a nominal 100 m offset at 100.0000000002 m,
+    already outside the boundary, so an offset-based test cannot land on the
+    line at all. Patching the distance makes this a test of the comparison
+    operator -- which is the thing worth pinning, since a refactor from `<=`
+    to `<` would silently shrink every geofence by one floating-point step.
+    """
+    monkeypatch.setattr(home, "distance_m", lambda *args: float(CFG.radius_m))
+    assert home.classify(_view(), CFG) == "home"
+
+    monkeypatch.setattr(home, "distance_m", lambda *args: CFG.radius_m + 0.001)
+    assert home.classify(_view(), CFG) == "away"
