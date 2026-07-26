@@ -2251,11 +2251,12 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 This is where pure logic meets the car. Read spec §3.3, §3.5 and §3.6 before starting.
 
 **Files:**
-- Modify: `collector.py`
-- Test: `tests/test_collector_solar.py` (create)
+- Modify: `collector.py`, `solar.py` (add `may_restore`), `tesla.py` (add `proxy_up`), `car_routes.py:229-239` (delegate to it)
+- Test: `tests/test_collector_solar.py` (create), `tests/test_solar_state.py` (extend)
 
 **Interfaces:**
 - Consumes: everything from Tasks 3-7.
+- Produces: `tesla.proxy_up(proxy_url: str) -> bool` — blocking; call via `asyncio.to_thread`.
 - Produces:
   - `collector.next_interval(car_state, view, cfg, solar_engaged: bool = False) -> int`
   - `collector.recover(db, client, vin, view, location) -> bool` — the §3.6 crash-recovery gate; returns True when the state is clean
@@ -2352,7 +2353,43 @@ def next_interval(car_state: str, view: dict | None, cfg,
     return cfg.poll_idle
 ```
 
-- [ ] **Step 5: Add the solar tick to `collector.py`**
+- [ ] **Step 5: Lift `proxy_up` into `tesla.py` so both callers share it**
+
+`car_routes.py:229` already has this helper, and `car_routes.py:220` calls it
+through `asyncio.to_thread` because a prior review caught the blocking socket
+sitting in an async handler. The collector needs the same check, so move it
+rather than copy it.
+
+Add to `tesla.py` at module level (it already imports `socket` and `urlparse`;
+add them if not):
+
+```python
+def proxy_up(proxy_url: str) -> bool:
+    """TCP reachability of the signing proxy. BLOCKING -- callers on an event
+    loop must use asyncio.to_thread. Commands are impossible without the proxy,
+    so this gates anything that would write to the car."""
+    parsed = urlparse(proxy_url)
+    try:
+        with socket.create_connection(
+            (parsed.hostname or "localhost", parsed.port or 443), timeout=0.5
+        ):
+            return True
+    except OSError:
+        return False
+```
+
+Then replace the body of `car_routes._proxy_up` (lines 229-239) with a
+delegation, keeping its existing signature so line 220 is untouched:
+
+```python
+def _proxy_up() -> bool:
+    return tesla.proxy_up(settings.proxy_url)
+```
+
+and add `import tesla` to `car_routes.py`'s imports. Run
+`.venv/bin/python -m pytest tests/test_car_routes.py -v` — it must stay green.
+
+- [ ] **Step 6: Add the solar tick to `collector.py`**
 
 Add these imports at the top of `collector.py`:
 
@@ -2362,6 +2399,7 @@ from zoneinfo import ZoneInfo
 
 import home
 import solar
+import tesla
 ```
 
 Then append these functions above `run()`:
@@ -2370,27 +2408,27 @@ Then append these functions above `run()`:
 ENGAGED_STATES = {"charging", "grace", "stopped"}
 
 
-async def _proxy_up(cfg) -> bool:
-    """Cheap TCP reachability check for the signing proxy. Commands are
-    impossible without it, so a restore must not be attempted."""
-    import socket
-    from urllib.parse import urlparse
-    parsed = urlparse(cfg.proxy_url)
-    try:
-        with socket.create_connection(
-                (parsed.hostname or "localhost", parsed.port or 443), timeout=0.5):
-            return True
-    except OSError:
-        return False
+async def _command(client: TeslaClient, vin: str, name: str, **params) -> bool:
+    """Issue one signed command. Returns True only when the car accepted it.
 
-
-async def _command(client: TeslaClient, vin: str, name: str, **params):
-    """Issue one signed command and return the raw response, or None on failure."""
+    client.command() returns a (status, body) TUPLE, and the proxy answers 200
+    with result:false for a refusal. Treating any non-exception as success
+    would let the controller integrate against an amps value the car never
+    adopted -- the exact failure invariant 2 of the spec exists to prevent.
+    """
     try:
-        return await client.command(vin, name, params)
+        status, body = await client.command(vin, name, params)
     except (TeslaAPIError, TeslaAuthError) as exc:
         _log(f"command {name} failed: {exc}")
-        return None
+        return False
+    if status != 200:
+        _log(f"command {name} rejected: HTTP {status}")
+        return False
+    result = (body or {}).get("response") or {}
+    if result.get("result") is False:
+        _log(f"command {name} refused: {result.get('reason')}")
+        return False
+    return True
 
 
 async def solar_tick(client: TeslaClient, store_: Store, vin: str,
@@ -2411,7 +2449,10 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
 
     # --- crash recovery, before anything else can engage -------------------
     if st["dirty"]:
-        if solar.may_restore(st["dirty"], location, True, await _proxy_up(cfg)):
+        # to_thread because proxy_up opens a blocking socket. car_routes made
+        # exactly this mistake and its review caught it; do not reintroduce it.
+        proxy_ok = await asyncio.to_thread(tesla.proxy_up, cfg.proxy_url)
+        if solar.may_restore(st["dirty"], location, True, proxy_ok):
             if st["original_amps"] is not None:
                 await _command(client, vin, "set_charging_amps",
                                charging_amps=st["original_amps"])
@@ -2473,8 +2514,14 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
         if action == "restore":
             await _restore(client, db, vin, st)
         elif action == "wake":
-            await _command(client, vin, "wake_up")
-            await asyncio.sleep(5)
+            # wake_up is a dedicated REST endpoint, NOT a signed command --
+            # routing it through the proxy would 400. tesla.py:386.
+            try:
+                await client.wake_up(vin)
+                await asyncio.sleep(5)
+            except (TeslaAPIError, TeslaAuthError) as exc:
+                _log(f"wake failed: {exc}")
+                return st["state"]
         elif action == "charge_start":
             if st["original_amps"] is None:      # remember BEFORE we change it
                 solar.save_state(db, vin, dirty=1,
@@ -2488,7 +2535,7 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
         elif action == "set_amps":
             target = tun.min_a if machine.state == "grace" else decision.target_a
             if await _command(client, vin, "set_charging_amps",
-                              charging_amps=target) is not None:
+                              charging_amps=target):
                 written = target
 
     solar.save_state(db, vin, **solar.machine_fields(machine))
@@ -2514,7 +2561,7 @@ async def _restore(client: TeslaClient, db, vin: str, st: dict) -> None:
                      raised_to=None, engaged_at=None)
 ```
 
-- [ ] **Step 6: Call it from the run loop**
+- [ ] **Step 7: Call it from the run loop**
 
 In `run()`, replace the body of the `while True:` block with:
 
@@ -2548,12 +2595,12 @@ Also change `poll_once` to stamp the location classification:
     return car_state, view
 ```
 
-- [ ] **Step 7: Run the tests to verify they pass**
+- [ ] **Step 8: Run the tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/test_collector_solar.py tests/test_solar_state.py -v`
 Expected: all pass.
 
-- [ ] **Step 8: Run one real tick with the controller disabled**
+- [ ] **Step 9: Run one real tick with the controller disabled**
 
 ```bash
 .venv/bin/python collector.py --once
@@ -2561,7 +2608,7 @@ Expected: all pass.
 
 Expected: normal collector output, **no** `solar` line — `enabled` defaults to 0, so the loop must not engage or spend a single command.
 
-- [ ] **Step 9: Run the full suite and commit**
+- [ ] **Step 10: Run the full suite and commit**
 
 ```bash
 git add collector.py solar.py tests/test_collector_solar.py tests/test_solar_state.py
@@ -3147,7 +3194,7 @@ def test_energy_buckets_convert_to_average_watts():
 
 def test_a_sunny_day_charges_without_importing():
     day = [bucket(exported_solar=800, solar_wh=1000) for _ in range(96)]
-    out = backtest.simulate(day, solar.load_config.__defaults__ and {} or {})
+    out = backtest.simulate(day, {})
     assert out["imported_wh"] == 0
     assert out["captured_kwh"] > 0
 
