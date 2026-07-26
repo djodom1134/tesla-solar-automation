@@ -149,10 +149,13 @@ class TeslaClient:
         self.store = TokenStore(settings.token_file)
         self.cache = _Cache()
         self._http = httpx.AsyncClient(timeout=30.0)
+        self._proxy: httpx.AsyncClient | None = None
         self._refresh_lock = asyncio.Lock()
 
     async def aclose(self) -> None:
         await self._http.aclose()
+        if self._proxy is not None:
+            await self._proxy.aclose()
 
     # ---------- OAuth ----------
 
@@ -385,6 +388,32 @@ class TeslaClient:
         Expensive and rate-limited to 3/min. Only ever call this on explicit
         user action."""
         return await self._post(f"/api/1/vehicles/{vin}/wake_up", {})
+
+    # ---------- signed commands ----------
+
+    async def command(
+        self, vin: str, name: str, body: dict[str, Any]
+    ) -> tuple[int, dict[str, Any]]:
+        """Signed commands via the local proxy.
+
+        Only /command/* goes through the proxy — reads stay direct so a stopped
+        proxy costs us buttons, not data. The proxy's certificate is self-signed,
+        so it is supplied as this client's CA bundle; verification stays ON."""
+        if self._proxy is None:
+            self._proxy = httpx.AsyncClient(
+                verify=str(self.settings.proxy_cert), timeout=30.0
+            )
+        token = await self._access_token()
+        url = f"{self.settings.proxy_url}/api/1/vehicles/{vin}/command/{name}"
+        resp = await self._proxy.post(
+            url, json=body,
+            headers={"Authorization": f"Bearer {token}",
+                     "Content-Type": "application/json"},
+        )
+        try:
+            return resp.status_code, resp.json()
+        except ValueError:
+            return resp.status_code, {"error": resp.text[:300]}
 
 
 def _iso(dt: datetime) -> str:

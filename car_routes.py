@@ -13,8 +13,9 @@ import time
 from typing import Any
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Body, HTTPException, Query
 
+import commands as command_catalog
 import demo
 import vehicle
 from config import settings
@@ -116,6 +117,34 @@ async def car_wake() -> dict[str, Any]:
     vin = await _vin()
     result = await _client().wake_up(vin)
     return {"state": (result or {}).get("state", "unknown")}
+
+
+@router.get("/commands")
+async def car_commands() -> dict[str, Any]:
+    """The UI is data-driven off this, so adding a command needs no JS change."""
+    return {"groups": command_catalog.GROUPS, "commands": command_catalog.CATALOG}
+
+
+@router.post("/command/{cmd_id}")
+async def car_command(cmd_id: str, payload: dict[str, Any] = Body(default={})):
+    spec = command_catalog.find(cmd_id)
+    if spec is None:
+        raise HTTPException(404, f"unknown command {cmd_id!r}")
+    try:
+        body = command_catalog.validate(spec, payload)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    if DEMO:
+        return {"ok": True, "reason": "", "message": f"Demo: {spec['label']} sent"}
+
+    vin = await _vin()
+    status, raw = await _client().command(vin, cmd_id, body)
+    result = command_catalog.interpret(status, raw)
+
+    # Command effects change state; drop the read cache so the next poll is fresh.
+    _client().cache.clear()
+    return result
 
 
 @router.get("/health")
