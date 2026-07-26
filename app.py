@@ -21,6 +21,7 @@ from fastapi.staticfiles import StaticFiles
 import car_routes
 import demo
 import energy
+import solar_routes
 from config import BASE_DIR, settings
 from tesla import TeslaAPIError, TeslaAuthError, TeslaClient, day_bounds, period_end
 
@@ -234,6 +235,7 @@ async def api_dashboard(
 
 
 app.include_router(car_routes.router)
+app.include_router(solar_routes.router)
 
 # The static mount is a catch-all: any router included after this line is
 # unreachable. car_routes must be included above it.
