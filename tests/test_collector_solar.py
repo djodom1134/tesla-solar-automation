@@ -535,6 +535,65 @@ async def test_restore_with_no_view_skips_the_limit_and_logs(tmp_path, capsys):
 
 
 # --------------------------------------------------------------------------
+# Task 14 -- the dynamic charge-limit raise (spec 3.4).
+# --------------------------------------------------------------------------
+
+class _NearLimitSteadyExportClient:
+    """Steady 3 kW export with the car already charging 1% under its limit --
+    exactly the scenario that should trigger one raise and then hold it."""
+
+    def __init__(self):
+        self.commands: list[tuple[str, dict]] = []
+
+    async def _get(self, path, ttl=0):
+        return {"grid_power": -3000.0, "solar_power": 3000.0}
+
+    async def command(self, vin, name, params):
+        self.commands.append((name, dict(params)))
+        return 200, {"response": {"result": True}}
+
+    async def wake_up(self, vin):
+        raise AssertionError("must never wake an already-charging car")
+
+
+@pytest.mark.asyncio
+async def test_raises_the_charge_limit_exactly_once_across_many_ticks(tmp_path):
+    """Task 14: near the limit with sustained export, set_charge_limit must
+    fire exactly once across many ticks. raised_to is the guard -- without it
+    the hold timer itself does not fall back below raise_hold_s once a raise
+    has fired (see raise_decision's fire branch, which returns hold_elapsed_s
+    unchanged), so the same command would be re-issued every following tick.
+    """
+    store_ = Store(tmp_path / "car.db")
+    db = store_._db
+    solar.save_config(db, enabled=1, raise_limit=1, raise_hold_s=600,
+                      period_s=120, soc_ceiling=90)
+    home.save(db, 40.0, -105.0, 100)
+    solar.save_state(db, "VIN1", state="charging", dirty=1, original_amps=24,
+                     original_limit=80, engaged_at=1)
+
+    client = _NearLimitSteadyExportClient()
+    cfg = SimpleNamespace(timezone="America/Denver", proxy_url="https://localhost:4443")
+    view = {
+        "charging_state": "Charging", "amps_actual": 24, "amps_max": 48,
+        "volts": 240, "charge_amps": 24, "soc": 79, "limit": 80,
+        "lat": 40.0, "lon": -105.0,
+        "fast_charger_present": False, "fast_charger": None,
+    }
+
+    for _ in range(8):
+        state, _ = await collector.solar_tick(client, store_, "VIN1", view, cfg, site_id=1)
+        assert state == "charging"
+
+    limit_commands = [c for c in client.commands if c[0] == "set_charge_limit"]
+    assert limit_commands == [("set_charge_limit", {"percent": 90})], (
+        f"set_charge_limit issued {len(limit_commands)} times across 8 ticks: "
+        f"{client.commands}")
+    assert solar.load_state(db, "VIN1")["raised_to"] == 90
+    store_.close()
+
+
+# --------------------------------------------------------------------------
 # run()'s startup recovery latch (collector.py:359, 412-429). recover() must
 # run ONCE per process, before the very first engaged tick -- never gate
 # solar_tick on every subsequent tick. The existing loop test

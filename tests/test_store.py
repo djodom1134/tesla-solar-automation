@@ -153,6 +153,51 @@ def test_migration_adds_columns_to_an_existing_database(tmp_path):
     s.close()
 
 
+def test_solar_state_migration_adds_raise_hold_elapsed_to_an_existing_table(tmp_path):
+    """The owner's live car.db already has a solar_state table from before
+    task 14 -- CREATE TABLE IF NOT EXISTS is a no-op against it, so opening
+    Store must ALTER TABLE the new column in rather than crash the next
+    load_state() call, and existing rows must survive untouched."""
+    import sqlite3
+    path = tmp_path / "old.db"
+    legacy = sqlite3.connect(path)
+    legacy.executescript("""
+        CREATE TABLE solar_state (
+          vin             TEXT PRIMARY KEY,
+          state           TEXT    NOT NULL DEFAULT 'idle',
+          breach_ticks    INTEGER NOT NULL DEFAULT 0,
+          recover_ticks   INTEGER NOT NULL DEFAULT 0,
+          grace_s_elapsed INTEGER NOT NULL DEFAULT 0,
+          hold_s          INTEGER NOT NULL DEFAULT 0,
+          dirty           INTEGER NOT NULL DEFAULT 0,
+          original_amps   INTEGER,
+          original_limit  INTEGER,
+          raised_to       INTEGER,
+          requests_today  INTEGER NOT NULL DEFAULT 0,
+          requests_day    TEXT,
+          capped          INTEGER NOT NULL DEFAULT 0,
+          engaged_at      INTEGER,
+          updated_at      INTEGER NOT NULL DEFAULT 0
+        );
+    """)
+    legacy.execute(
+        "INSERT INTO solar_state (vin, state, raised_to, updated_at) "
+        "VALUES ('VIN1', 'charging', 90, 0)")
+    legacy.commit()
+    legacy.close()
+
+    from store import Store
+    import solar
+    s = Store(path)
+    cols = {r[1] for r in s._db.execute("PRAGMA table_info(solar_state)")}
+    assert "raise_hold_elapsed" in cols, "missing after migration"
+
+    st = solar.load_state(s._db, "VIN1")
+    assert st["raised_to"] == 90, "pre-existing data must survive the migration"
+    assert st["raise_hold_elapsed"] == 0, "new column must default cleanly"
+    s.close()
+
+
 def test_record_persists_the_new_columns(tmp_path):
     from store import Store
     s = Store(tmp_path / "n.db")

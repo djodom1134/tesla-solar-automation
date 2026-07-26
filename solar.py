@@ -128,6 +128,45 @@ def control(grid_w: float, current_a: int, tun: Tunables) -> Decision:
     )
 
 
+def raise_decision(*, enabled: bool, state: str, soc: int | None,
+                   limit: int | None, ceiling: int, grid_w: float,
+                   raised_to: int | None, hold_elapsed_s: int,
+                   raise_hold_s: int, period_s: int) -> tuple[int | None, int]:
+    """Whether to raise the charge limit, and the updated hold timer.
+
+    Returns (limit_to_raise_to or None, new_hold_elapsed_s).
+
+    Headroom, not surplus, is the binding constraint on this system: at an 80%
+    limit with the car at 76% there are ~4 kWh of room against a median
+    13.8 kWh/day of export, so without a raise the controller fills the pack in
+    under two hours and the rest goes to the grid anyway.
+
+    Every gate here exists for a reason:
+      * ACTUALLY EXPORTING (grid_w < 0), never speculatively -- raising the
+        limit on a forecast would park an NCA pack high for nothing.
+      * NEAR THE LIMIT (soc >= limit - 2) -- while headroom remains there is
+        somewhere to put the energy already, and time spent high is what ages
+        the pack, not reaching high.
+      * ONCE PER ENGAGEMENT (raised_to is None) -- re-issuing the command every
+        tick would spend a billed write to assert a value the car holds.
+      * UNKNOWN NEVER GUESSES -- a missing soc or limit returns None, matching
+        the three-valued discipline used for location.
+
+    The hold is compared AS CARRIED IN, like start_hold_s, so the real wait is
+    period_s * (ceil(raise_hold_s / period_s) + 1) -- never under two ticks.
+    """
+    if not enabled or state != "charging" or raised_to is not None:
+        return None, 0
+    if soc is None or limit is None:
+        return None, 0
+    if grid_w >= 0 or soc < limit - 2:
+        return None, 0
+    if hold_elapsed_s >= raise_hold_s:
+        target = min(int(ceiling), 100)
+        return (target if target > limit else None), hold_elapsed_s
+    return None, hold_elapsed_s + period_s
+
+
 STATES = frozenset({"idle", "charging", "grace", "stopped"})
 
 
@@ -268,6 +307,7 @@ CREATE TABLE IF NOT EXISTS solar_state (
   original_amps   INTEGER,
   original_limit  INTEGER,
   raised_to       INTEGER,
+  raise_hold_elapsed INTEGER NOT NULL DEFAULT 0,
   requests_today  INTEGER NOT NULL DEFAULT 0,
   requests_day    TEXT,
   capped          INTEGER NOT NULL DEFAULT 0,
@@ -302,7 +342,8 @@ STATE_DEFAULTS = {
     "state": "idle", "breach_ticks": 0, "recover_ticks": 0,
     "grace_s_elapsed": 0, "hold_s": 0,
     "dirty": 0, "original_amps": None, "original_limit": None,
-    "raised_to": None, "requests_today": 0, "requests_day": None,
+    "raised_to": None, "raise_hold_elapsed": 0,
+    "requests_today": 0, "requests_day": None,
     "capped": 0, "engaged_at": None,
 }
 
@@ -318,6 +359,25 @@ def machine_from(st: dict) -> Machine:
 
 def machine_fields(m: Machine) -> dict:
     return {k: getattr(m, k) for k in MACHINE_FIELDS}
+
+
+# Columns added to solar_state AFTER it first shipped. `CREATE TABLE IF NOT
+# EXISTS` in SCHEMA is a no-op against a table that already exists -- see
+# store.py's _migrate, which this mirrors -- so a schema edit alone never
+# reaches a live car.db whose solar_state predates the column. migrate_state()
+# must run once at startup, after SCHEMA is applied, before any load_state or
+# save_state call.
+STATE_NEW_COLUMNS = (
+    ("raise_hold_elapsed", "INTEGER NOT NULL DEFAULT 0"),
+)
+
+
+def migrate_state(db: sqlite3.Connection) -> None:
+    """Add columns to an EXISTING solar_state table."""
+    existing = {row[1] for row in db.execute("PRAGMA table_info(solar_state)")}
+    for name, decl in STATE_NEW_COLUMNS:
+        if name not in existing:
+            db.execute(f"ALTER TABLE solar_state ADD COLUMN {name} {decl}")
 
 
 def _begin_immediate(db: sqlite3.Connection) -> bool:

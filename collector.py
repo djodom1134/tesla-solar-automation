@@ -323,6 +323,27 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
                               charging_amps=target):
                 written = target
 
+    # --- charge-limit raise (spec 3.4) -------------------------------------
+    target_limit, raise_hold = solar.raise_decision(
+        enabled=bool(conf["raise_limit"]),
+        state=machine.state,
+        soc=view.get("soc"),
+        limit=view.get("limit"),
+        ceiling=conf["soc_ceiling"],
+        grid_w=grid_w,
+        raised_to=st["raised_to"],
+        hold_elapsed_s=st["raise_hold_elapsed"],
+        raise_hold_s=conf["raise_hold_s"],
+        period_s=conf["period_s"],
+    )
+    raised = st["raised_to"]
+    if target_limit is not None:
+        if await _command(client, vin, "set_charge_limit", percent=target_limit):
+            raised = target_limit
+            _log(f"raised charge limit {view.get('limit')} -> {target_limit} "
+                 f"for solar")
+    solar.save_state(db, vin, raised_to=raised, raise_hold_elapsed=raise_hold)
+
     solar.save_state(db, vin, **solar.machine_fields(machine))
     solar.log_tick(db, vin, ts=int(time.time()), state=machine.state,
                    grid_w=grid_w, solar_w=live.get("solar_power"), car_w=car_w,

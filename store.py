@@ -90,6 +90,7 @@ class Store:
         _migrate(self._db)
         self._db.executescript(home.SCHEMA)
         self._db.executescript(solar.SCHEMA)
+        solar.migrate_state(self._db)
         self._db.commit()
 
     def close(self) -> None:
