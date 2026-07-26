@@ -346,3 +346,15 @@ th .key { vertical-align: middle; margin-right: .35rem; }
                  border: 1px solid var(--border); border-radius: .35rem;
                  background: var(--surface); color: var(--ink); min-width: 5rem; }
 .btn.danger { background: var(--import); }
+
+/* ---- setup page ---- */
+#setup-app { max-width: 46rem; margin: 0 auto; padding: 1rem; }
+#setup-app .map { height: 22rem; border-radius: var(--radius, 8px); margin: .75rem 0; }
+#setup-app .row { display: flex; align-items: center; gap: .6rem; margin: .5rem 0; }
+#setup-app .row label { min-width: 11rem; }
+#setup-app .hint { color: var(--muted, #888); font-size: .85rem; margin: .35rem 0 .6rem; }
+#setup-app details { margin: .75rem 0; }
+#setup-app details summary { cursor: pointer; color: var(--muted, #888); }
+#setup-app .msg { margin-left: .6rem; font-size: .9rem; }
+#setup-app .msg.ok { color: var(--good, #22c55e); }
+#setup-app .msg.err { color: var(--bad, #ef4444); }

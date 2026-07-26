@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Setup — Tesla</title>
+<link rel="stylesheet" href="/vendor/leaflet.css">
+<link rel="stylesheet" href="/styles.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>⚙️</text></svg>">
+</head>
+<body>
+  <div id="setup-app">
+    <header class="topbar">
+      <h1>Setup</h1>
+      <div class="topbar-actions">
+        <a class="ghost-btn" href="/car.html">Car</a>
+        <a class="ghost-btn" href="/index.html">Solar</a>
+      </div>
+    </header>
+
+    <section class="card">
+      <h2>Home</h2>
+      <p class="hint">Drag the pin to where the car actually parks — the driveway,
+        not the middle of the house. The circle is the geofence.</p>
+      <div id="map" class="map"></div>
+      <div class="row">
+        <label for="radius">Radius</label>
+        <input type="range" id="radius" min="25" max="500" step="5" value="100">
+        <output id="radius-out">100 m</output>
+      </div>
+      <p>Car is currently: <strong id="classification">unknown</strong></p>
+      <button id="save-home">Save home</button>
+      <span id="home-msg" class="msg"></span>
+    </section>
+
+    <section class="card">
+      <h2>Solar charging</h2>
+      <label class="row"><input type="checkbox" id="enabled"> Match charge rate to solar export</label>
+
+      <div class="row">
+        <label for="period">Loop period</label>
+        <select id="period">
+          <option value="120">120 s (recommended)</option>
+          <option value="60">60 s (tracks clouds harder, costs more)</option>
+        </select>
+      </div>
+
+      <div class="row">
+        <label for="ceiling">Charge limit ceiling</label>
+        <input type="range" id="ceiling" min="50" max="100" step="5" value="90">
+        <output id="ceiling-out">90%</output>
+      </div>
+      <p class="hint">Raised only while surplus is actually being exported, and put
+        back when the sun goes. Sitting near 100% is what ages the pack, not
+        reaching it.</p>
+      <label class="row"><input type="checkbox" id="raise-limit" checked>
+        Allow raising the limit to capture more sun</label>
+
+      <div class="row">
+        <label for="grace">Cloud grace</label>
+        <input type="number" id="grace" min="0" max="20" step="1" value="3">
+        <span>minutes</span>
+      </div>
+      <p class="hint">Below about 1.3 kW the car cannot charge at all. Grace holds at
+        the minimum through short clouds instead of stopping — which imports a little.
+        Set to 0 to never import.</p>
+
+      <details>
+        <summary>Tuning</summary>
+        <div class="row"><label for="margin">Export margin (W)</label>
+          <input type="number" id="margin" min="0" max="2000" step="10" value="100"></div>
+        <div class="row"><label for="deadband">Deadband (W)</label>
+          <input type="number" id="deadband" min="50" max="2000" step="10" value="250"></div>
+        <div class="row"><label for="ramp">Ramp limit (A/tick)</label>
+          <input type="number" id="ramp" min="1" max="48" step="1" value="8"></div>
+        <div class="row"><label for="mina">Minimum amps</label>
+          <input type="number" id="mina" min="5" max="32" step="1" value="5"></div>
+        <div class="row"><label for="cap">Daily request cap</label>
+          <input type="number" id="cap" min="0" max="20000" step="50" value="400"></div>
+      </details>
+
+      <button id="save-solar">Save</button>
+      <span id="solar-msg" class="msg"></span>
+    </section>
+
+    <section class="card">
+      <h2>Deadline warning</h2>
+      <p class="hint">Never acts — it only tells you, once the sun is done for the day,
+        that solar alone did not reach your target.</p>
+      <div class="row">
+        <label for="dsoc">Want at least</label>
+        <input type="number" id="dsoc" min="0" max="100" step="5" placeholder="off">
+        <span>% by</span>
+        <input type="number" id="dhour" min="0" max="23" step="1" placeholder="7">
+        <span>:00</span>
+      </div>
+      <button id="save-deadline">Save</button>
+      <span id="deadline-msg" class="msg"></span>
+    </section>
+  </div>
+
+  <script src="/vendor/leaflet.js"></script>
+  <script type="module" src="/setup.js"></script>
+</body>
+</html>
