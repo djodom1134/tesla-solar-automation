@@ -91,10 +91,11 @@ def simulate(buckets: list[dict], cfg: dict) -> dict:
 
     for b in buckets:
         house_grid_w = grid_watts(b)
-        car_w = amps * tun.volts if machine.state in ("charging", "grace") else 0.0
+        prev_state, prev_amps = machine.state, amps
+        car_w = prev_amps * tun.volts if prev_state in ("charging", "grace") else 0.0
         # The car's draw is added back, because the historical meter never saw it.
         grid_w = house_grid_w + car_w
-        decision = solar.control(grid_w, amps, tun)
+        decision = solar.control(grid_w, prev_amps, tun)
         tick = solar.Tick(
             surplus_w=solar.surplus_watts(car_w, grid_w), decision=decision,
             location="home", plugged=True, period_s=BUCKET_S)
@@ -104,8 +105,13 @@ def simulate(buckets: list[dict], cfg: dict) -> dict:
             stop_starts += 1
         if "set_amps" in actions:
             amps = tun.min_a if machine.state == "grace" else decision.target_a
-        if machine.state in ("charging", "grace"):
-            drawn_wh = amps * tun.volts * BUCKET_S / 3600.0
+
+        # Credit the bucket using prev_amps/prev_state -- what was actually in
+        # force WHILE it elapsed, and what car_w and grid_w above were built
+        # from. Crediting the command this tick just issued for the NEXT
+        # bucket would credit an amp value the historical meter never saw.
+        if prev_state in ("charging", "grace"):
+            drawn_wh = prev_amps * tun.volts * BUCKET_S / 3600.0
             captured_wh += drawn_wh
             if grid_w > 0:
                 imported_wh += grid_w * BUCKET_S / 3600.0
@@ -144,8 +150,12 @@ def main() -> int:
           "estimate of it.")
     for day in days:
         if day not in CLEAN_DAYS:
-            print(f"WARNING {day} is not a known car-away day; "
-                  "results include the car's own historical draw")
+            print(f"\n{'!' * 70}\n"
+                  f"WARNING: {day} is not a known car-away day.\n"
+                  f"Its buckets contain the car's OWN past charging draw, so replaying\n"
+                  f"it double-counts that energy and the result is fiction.\n"
+                  f"Known-clean days: {', '.join(CLEAN_DAYS)}\n"
+                  f"{'!' * 70}\n", file=sys.stderr)
         buckets = asyncio.run(_fetch(day))
         if not buckets:
             print(f"{day}: no data")
