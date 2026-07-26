@@ -91,3 +91,95 @@ def control(grid_w: float, current_a: int, tun: Tunables) -> Decision:
         error_w=error_w,
         raw_target=raw_target,
     )
+
+
+STATES = frozenset({"idle", "charging", "grace", "stopped"})
+
+
+@dataclass(frozen=True)
+class Policy:
+    grace_s: int = 180          # hold at min_a this long before giving up
+    restart_hold_s: int = 300   # sustained surplus before spending a wake
+    start_hold_s: int = 60      # sustained surplus before starting from idle
+    enabled: bool = True
+
+
+@dataclass(frozen=True)
+class Machine:
+    state: str = "idle"
+    breach_ticks: int = 0       # consecutive ticks below the floor
+    recover_ticks: int = 0      # consecutive ticks back above it
+    grace_s_elapsed: int = 0
+    hold_s: int = 0             # sustained-surplus timer for idle and stopped
+
+
+@dataclass(frozen=True)
+class Tick:
+    surplus_w: float
+    decision: Decision
+    location: str               # "home" | "away" | "unknown"
+    plugged: bool
+    period_s: int
+
+
+def start_watts(tun: Tunables) -> float:
+    """The absolute surplus needed to sustain the minimum charge rate."""
+    return tun.min_a * tun.volts + tun.margin_w
+
+
+def advance(m: Machine, t: Tick, pol: Policy, tun: Tunables) -> tuple[Machine, list[str]]:
+    """One state transition. Returns the next machine and an ORDERED action list.
+
+    Actions are names, not calls -- collector.py performs them. That keeps this
+    function pure and lets the backtest run the whole machine with no network.
+    """
+    # Unknown location freezes everything. Restoring is itself a command, and
+    # "we do not know where the car is" is not grounds to send one.
+    if t.location == "unknown":
+        return m, []
+
+    if not pol.enabled or not t.plugged or t.location != "home":
+        if m.state == "idle":
+            return Machine(state="idle"), []
+        return Machine(state="idle"), ["restore"]
+
+    if m.state == "idle":
+        if t.surplus_w < start_watts(tun):
+            return Machine(state="idle", hold_s=0), []
+        # Threshold is checked against the timer *as carried in*, not the
+        # value after this tick's period is folded in. A period longer than
+        # start_hold_s must still take two ticks to fire, or "sustained"
+        # would mean nothing when the tick is coarser than the hold.
+        if m.hold_s >= pol.start_hold_s:
+            return Machine(state="charging"), ["charge_start", "set_amps"]
+        return Machine(state="idle", hold_s=m.hold_s + t.period_s), []
+
+    if m.state == "charging":
+        if t.decision.floor_breach:
+            breach = m.breach_ticks + 1
+            if breach >= 2:      # dwell: one tick can be clock skew, not weather
+                return Machine(state="grace"), ["set_amps"]
+            return Machine(state="charging", breach_ticks=breach), []
+        actions = ["set_amps"] if t.decision.write else []
+        return Machine(state="charging"), actions
+
+    if m.state == "grace":
+        # Recovery needs a band above the re-entry point, or a surplus sitting
+        # exactly at the floor chatters grace<->charging every tick.
+        if t.decision.raw_target >= tun.min_a + 1:
+            recover = m.recover_ticks + 1
+            if recover >= 2:
+                return Machine(state="charging"), ["set_amps"]
+            return Machine(state="grace", grace_s_elapsed=m.grace_s_elapsed,
+                           recover_ticks=recover), []
+        elapsed = m.grace_s_elapsed + t.period_s
+        if elapsed > pol.grace_s:
+            return Machine(state="stopped"), ["charge_stop", "restore"]
+        return Machine(state="grace", grace_s_elapsed=elapsed), []
+
+    # stopped
+    if t.surplus_w < start_watts(tun):
+        return Machine(state="stopped", hold_s=0), []
+    if m.hold_s >= pol.restart_hold_s:
+        return Machine(state="charging"), ["wake", "charge_start", "set_amps"]
+    return Machine(state="stopped", hold_s=m.hold_s + t.period_s), []
