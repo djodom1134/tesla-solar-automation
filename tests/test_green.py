@@ -95,17 +95,24 @@ def test_tick_solar_w_matches_solar_kwhs_own_per_tick_formula():
     assert green.tick_solar_w(1200, 5000) == 0, "importing more than the car drew is not solar"
 
 
+# Arbitrary test threshold, deliberately NOT store.GAP_SECONDS (1800) --
+# ledger_step must not know or care what that constant is; see
+# test_ledger_threshold_is_a_parameter_not_stores_constant below, which
+# proves it rather than just asserting it by convention.
+THRESH = 900
+
+
 def test_ledger_starts_at_zero_and_first_tick_only_records():
     """No previous SoC exists yet -- the only honest move is to record the
     observation and bank nothing, never assume a rise or a drop happened
     before anything was watching."""
-    solar_soc, stale = green.ledger_step(0.0, None, 62, True, 999_999)
+    solar_soc, stale = green.ledger_step(0.0, None, 62, True, 999_999, THRESH)
     assert solar_soc == 0
     assert stale is False
 
 
 def test_ledger_rise_while_solar_charging_banks_it():
-    solar_soc, stale = green.ledger_step(0.0, 50, 70, True, 60)
+    solar_soc, stale = green.ledger_step(0.0, 50, 70, True, 60, THRESH)
     assert solar_soc == 20
     assert stale is False
 
@@ -113,43 +120,93 @@ def test_ledger_rise_while_solar_charging_banks_it():
 def test_ledger_rise_while_grid_charging_does_not_bank():
     """Total SoC rose, so the solar FRACTION falls on its own -- grid
     electrons dilute the bank, they do not remove sun already in it."""
-    solar_soc, stale = green.ledger_step(20.0, 50, 70, False, 60)
+    solar_soc, stale = green.ledger_step(20.0, 50, 70, False, 60, THRESH)
     assert solar_soc == 20
     assert stale is False
 
 
 def test_ledger_drop_drains_proportionally():
     """32 of 80 (40%) drops to 70: 40% of the 10-point drop leaves with it."""
-    solar_soc, _ = green.ledger_step(32.0, 80, 70, False, 60)
+    solar_soc, _ = green.ledger_step(32.0, 80, 70, False, 60, THRESH)
     assert solar_soc == pytest.approx(28.0)
 
 
 def test_ledger_drop_to_zero_soc_leaves_zero_banked():
-    solar_soc, _ = green.ledger_step(45.0, 90, 0, False, 60)
+    solar_soc, _ = green.ledger_step(45.0, 90, 0, False, 60, THRESH)
     assert solar_soc == 0
 
 
-def test_ledger_long_gap_sets_stale_and_clamps_to_current_soc():
-    """A gap this long means the pack may have changed unobserved -- the bank
-    can only be OVERSTATED by whatever happened in the dark, so it clamps
-    down to the current soc and reports a lower bound, not a fact."""
-    solar_soc, stale = green.ledger_step(25.0, 20, 20, False, store.GAP_SECONDS + 1)
+# --------------------------------------------------------------------------
+# Staleness: gap length ALONE is the wrong signal. A long gap with the SoC
+# unchanged means the car sat asleep and nothing was missed -- that must
+# never be flagged, or the flag fires on ordinary idle polling (this is the
+# regression a prior version of this ledger actually shipped: reusing
+# store.GAP_SECONDS as both the threshold AND the only signal, against a
+# poll_asleep/poll_idle cadence that had independently been raised to equal
+# it, meant most idle-day gaps would have tripped it for no reason).
+# Staleness requires BOTH a long gap AND a SoC change across it.
+# --------------------------------------------------------------------------
+
+def test_ledger_long_gap_with_unchanged_soc_is_not_stale():
+    """THE REGRESSION THAT MATTERS. The car slept the whole gap; nothing
+    happened, so nothing was missed -- length alone must not flag this."""
+    solar_soc, stale = green.ledger_step(12.0, 60, 60, False, THRESH + 1, THRESH)
+    assert stale is False
+    assert solar_soc == 12.0
+
+
+def test_ledger_long_gap_with_soc_risen_and_no_solar_charging_is_stale():
+    """A long gap AND a change is exactly the untrustworthy case: this
+    function cannot tell whether the rise was one continuous non-solar
+    charge or several ups and downs it never saw. Not solar-attributed here
+    (state/attribution says grid), so the value is left unchanged -- but
+    still reported stale, and still within the general clamp regardless."""
+    solar_soc, stale = green.ledger_step(20.0, 50, 70, False, THRESH + 1, THRESH)
     assert stale is True
+    assert 0 <= solar_soc <= 70
+
+
+def test_ledger_long_gap_with_soc_fallen_is_stale_and_drains_proportionally():
+    """A drop still drains proportionally regardless of staleness -- the
+    proportional-drain rule doesn't get suspended by not having watched it
+    happen continuously -- but the gap is still reported stale."""
+    solar_soc, stale = green.ledger_step(32.0, 80, 70, False, THRESH + 1, THRESH)
+    assert stale is True
+    assert solar_soc == pytest.approx(28.0)
+
+
+def test_ledger_short_gap_with_soc_movement_is_not_stale():
+    """Ordinary accounting: seen and priced in tick by tick, regardless of
+    whether the SoC moved -- only a LONG gap can ever be stale."""
+    solar_soc, stale = green.ledger_step(0.0, 50, 70, True, THRESH - 1, THRESH)
+    assert stale is False
     assert solar_soc == 20
 
 
 def test_ledger_gap_exactly_at_the_threshold_is_not_stale():
-    """Same boundary convention as store.history()'s own gap detection:
-    strictly greater than, not greater-or-equal."""
-    _, stale = green.ledger_step(10.0, 50, 55, True, store.GAP_SECONDS)
+    """Strictly greater than, not greater-or-equal."""
+    _, stale = green.ledger_step(10.0, 50, 55, True, THRESH, THRESH)
     assert stale is False
+
+
+def test_ledger_threshold_is_a_parameter_not_stores_constant(monkeypatch):
+    """gap_threshold_s must be the ONLY threshold ledger_step consults --
+    proven, not just asserted, by wrecking store.GAP_SECONDS and confirming
+    it has no effect whatsoever on the result."""
+    monkeypatch.setattr(store, "GAP_SECONDS", 1)
+    _, stale = green.ledger_step(10.0, 50, 55, True, gap_s=100,
+                                 gap_threshold_s=1800)
+    assert stale is False, "must ignore store.GAP_SECONDS entirely"
 
 
 def test_ledger_clamp_logs_a_warning(caplog):
     """A clamp that actually changes the value means a sample was missed or
     the car charged somewhere unobserved -- a silent clamp would hide it."""
     with caplog.at_level(logging.WARNING, logger="green"):
-        green.ledger_step(25.0, 20, 20, False, store.GAP_SECONDS + 1)
+        # delta == 0 leaves solar_soc unchanged pre-clamp; an already-
+        # inconsistent input (25 > soc_now of 20) is what makes the general
+        # clamp actually fire, independent of staleness.
+        green.ledger_step(25.0, 20, 20, False, THRESH + 1, THRESH)
     assert any("clamp" in r.message for r in caplog.records)
 
 
@@ -164,7 +221,8 @@ def test_ledger_solar_soc_never_exceeds_soc():
         soc = max(0, min(100, soc + rng.randint(-20, 20)))
         charging = rng.random() < 0.5
         gap = rng.randint(0, 4000)
-        solar_soc, stale = green.ledger_step(solar_soc, soc_before, soc, charging, gap)
+        solar_soc, stale = green.ledger_step(
+            solar_soc, soc_before, soc, charging, gap, THRESH)
         assert 0 <= solar_soc <= soc, (solar_soc, soc_before, soc, charging, gap, stale)
         soc_before = soc
 
@@ -173,13 +231,13 @@ def test_ledger_full_cycle_bank_drive_off_half_bank_again():
     """Hand arithmetic: bank 20 (0 -> 20 of 70); halve the pack by driving
     (70 -> 35), which -- proportional drain preserving the ratio -- halves
     the bank too (20 -> 10); bank 15 more (10 -> 25 of 50)."""
-    solar_soc, stale = green.ledger_step(0.0, 50, 70, True, 60)
+    solar_soc, stale = green.ledger_step(0.0, 50, 70, True, 60, THRESH)
     assert solar_soc == 20 and stale is False
 
-    solar_soc, _ = green.ledger_step(solar_soc, 70, 35, False, 60)
+    solar_soc, _ = green.ledger_step(solar_soc, 70, 35, False, 60, THRESH)
     assert solar_soc == pytest.approx(10.0)
 
-    solar_soc, _ = green.ledger_step(solar_soc, 35, 50, True, 60)
+    solar_soc, _ = green.ledger_step(solar_soc, 35, 50, True, 60, THRESH)
     assert solar_soc == pytest.approx(25.0)
 
 

@@ -19,8 +19,6 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-import store
-
 logger = logging.getLogger(__name__)
 
 # Below this swing, integer-percent-quantised SoC dominates the estimate: a
@@ -160,15 +158,18 @@ def free_miles(solar_kwh: float | None, mi_per_kwh: float | None) -> float | Non
 # --------------------------------------------------------------------------
 
 def ledger_step(solar_soc: float, soc_before: int | None, soc_now: int,
-                solar_charging: bool, gap_s: int) -> tuple[float, bool]:
+                solar_charging: bool, gap_s: int,
+                gap_threshold_s: int) -> tuple[float, bool]:
     """Advance the banked-solar ledger by one observation.
 
     Returns (new_solar_soc, stale). Pure: no clock, no database, no network
     -- the caller supplies the previous SoC (persisted as solar_state.
     ledger_soc, since there is no reliable way to re-derive "the previous
-    sample" inside a pure function) and the elapsed seconds since the last
-    observation (gap_s), and gets back the new ledger value plus whether
-    this observation is stale.
+    sample" inside a pure function), the elapsed seconds since the last
+    observation (gap_s), and the gap length that counts as suspicious for
+    ITS purposes (gap_threshold_s -- see below for why this must not be
+    store.GAP_SECONDS), and gets back the new ledger value plus whether this
+    observation is stale.
 
     ENTERING the pack: a rise in SoC while the controller was engaged AND
     this tick's solar attribution (tick_solar_w) was positive banks the
@@ -190,33 +191,40 @@ def ledger_step(solar_soc: float, soc_before: int | None, soc_now: int,
     move is to record the observation and bank nothing: never assume a rise
     or a drop happened before anything was watching.
 
-    A gap longer than store.GAP_SECONDS since the last observation means the
-    pack may have changed unobserved -- charged somewhere else, or simply
-    missed. stale=True tells the caller to present the figure as a lower
-    bound rather than a fact. It does not add a SEPARATE clamp of its own:
-    given the invariant 0 <= solar_soc <= soc_before held on entry, both the
-    rise and the drop branches above already keep the result at or under
-    soc_now on their own (a rise adds the same delta to both sides; a drop
-    scales both by the same soc_now/soc_before ratio) -- so "clamp to
-    min(solar_soc, soc_now)" is exactly what the general clamp below always
-    does, gap or no gap. What a long gap actually protects against is
-    something no clamp can fix: the pack could have moved up AND down
-    unobserved in between (charged away from home, then driven), which this
-    two-point diff cannot see -- stale is the caller's warning that the
-    number may be a stale overstatement even though it is not, itself, out
-    of bounds.
+    STALENESS IS ABOUT UNOBSERVED CHANGE, NOT ELAPSED TIME. A long gap with
+    an UNCHANGED SoC means the car sat asleep and nothing was missed at all
+    -- flagging that would fire on perfectly ordinary idle polling, where
+    the collector's own cadence can legitimately be as long as
+    poll_asleep/poll_idle. What actually makes the bank untrustworthy is a
+    gap that is BOTH long AND crossed by a change in SoC: the two-point diff
+    this function does can't see whether that change happened all at once,
+    or rose and fell several times in between (charged away from home, then
+    driven) -- either way, the branch above that ran for it is a guess about
+    something this function never actually watched happen. So: stale =
+    gap_s > gap_threshold_s AND soc_now != soc_before. A long, quiet gap is
+    not stale; a short, busy one is not stale either (ordinary accounting,
+    seen and accounted for tick by tick) -- only the combination is.
+
+    gap_threshold_s is a PARAMETER, not read from store.GAP_SECONDS, on
+    purpose: that constant is tuned for the SoC chart's own question (when
+    is a gap worth drawing as a dashed hole), an entirely different decision
+    from "how long can this car plausibly sleep." Coupling the two meant
+    that raising the poll-asleep interval for API budget reasons (to 1800s,
+    equal to GAP_SECONDS) made the collector's own ordinary idle cadence
+    trip this flag on nothing -- see collector.py's call site for the
+    derived value actually used.
 
     The general invariant 0 <= solar_soc <= soc_now is enforced by a final
     clamp regardless of path, and a clamp that actually changes the value is
-    logged -- by construction (see above) it should never fire from a
-    consistent soc_before/solar_soc pair, so if it does, the caller's
-    bookkeeping (or the car) did something this function was never told
-    about, and a silent clamp would hide exactly that.
+    logged -- by construction it should never fire from a consistent
+    soc_before/solar_soc pair, so if it does, the caller's bookkeeping (or
+    the car) did something this function was never told about, and a silent
+    clamp would hide exactly that.
     """
     if soc_before is None:
         return solar_soc, False
 
-    stale = gap_s > store.GAP_SECONDS
+    stale = gap_s > gap_threshold_s and soc_now != soc_before
     delta = soc_now - soc_before
     raw = solar_soc
 

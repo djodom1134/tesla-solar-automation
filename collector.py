@@ -374,15 +374,26 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
     # read as zero. Skipped entirely when soc is unknown -- nothing to
     # observe, so ledger_soc/solar_soc are left exactly as they were rather
     # than guessed.
+    #
+    # gap_threshold_s is deliberately NOT store.GAP_SECONDS (the SoC chart's
+    # own gap threshold, tuned for when a hole is worth drawing dashed) --
+    # see green.ledger_step's docstring. It is derived from this car's own
+    # poll cadence instead: poll_asleep/poll_idle can legitimately be as long
+    # as 1800s (raised there for API budget reasons), so the ledger needs
+    # real headroom above that or ordinary overnight sleep trips it on
+    # nothing. Doubled for margin against scheduler jitter, floored at 1h so
+    # a very fast poll cadence can't make the threshold silly-small.
     ledger_fields: dict = {}
     soc_now = view.get("soc")
     if soc_now is not None:
         prev_tick_ts = solar.last_tick_ts(db, vin)
         gap_s = int(time.time()) - prev_tick_ts if prev_tick_ts is not None else 0
+        gap_threshold_s = max(2 * getattr(cfg, "poll_asleep", 1800), 3600)
         solar_charging = (machine.state in green.ENGAGED_STATES
                           and green.tick_solar_w(car_w, grid_w) > 0)
         new_solar_soc, ledger_stale = green.ledger_step(
-            st["solar_soc"], st["ledger_soc"], int(soc_now), solar_charging, gap_s)
+            st["solar_soc"], st["ledger_soc"], int(soc_now), solar_charging,
+            gap_s, gap_threshold_s)
         ledger_fields = {"solar_soc": new_solar_soc, "ledger_soc": int(soc_now),
                          "ledger_stale": 1 if ledger_stale else 0}
 

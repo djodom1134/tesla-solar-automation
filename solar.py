@@ -354,8 +354,10 @@ CREATE TABLE IF NOT EXISTS solar_state (
   -- consumption figure. ledger_soc is the SoC as of the last observation,
   -- needed to diff consecutive samples; NULL until the ledger has observed
   -- its first tick, which is also how it starts at 0 rather than a guess.
-  -- ledger_stale marks a lower bound after a gap longer than
-  -- store.GAP_SECONDS -- the pack may have changed unobserved.
+  -- ledger_stale marks a lower bound: a gap long enough, AND crossed by a
+  -- SoC change, that the pack may have moved unobserved (see collector.py's
+  -- call site for the threshold -- deliberately NOT store.GAP_SECONDS,
+  -- which is tuned for the SoC chart's dashed-hole question, not this one).
   solar_soc       REAL    NOT NULL DEFAULT 0,
   ledger_soc      INTEGER,
   ledger_stale    INTEGER NOT NULL DEFAULT 0,

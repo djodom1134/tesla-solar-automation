@@ -9,7 +9,6 @@ import pytest
 import collector
 import home
 import solar
-import store
 import tesla
 from store import Store
 
@@ -1047,7 +1046,9 @@ async def test_ledger_flags_stale_after_a_gap_spanning_a_restart(tmp_path):
     """solar.last_tick_ts is read back from disk, not held in memory, so a
     gap that spans a process restart is measured correctly -- proven here by
     backdating the only logged tick so far, which is exactly what a real
-    crash-and-restart would leave behind."""
+    crash-and-restart would leave behind. Also moves the soc across that
+    gap (55 -> 60): staleness needs BOTH a long gap and a change, not
+    length alone (see green.ledger_step)."""
     store_ = Store(tmp_path / "car.db")
     db = store_._db
     solar.save_config(db, enabled=1)
@@ -1055,16 +1056,47 @@ async def test_ledger_flags_stale_after_a_gap_spanning_a_restart(tmp_path):
     solar.save_state(db, "VIN1", state="idle", hold_s=10_000)
 
     client = _ControllableGridClient(grid_w=-6000.0)
-    cfg = SimpleNamespace(timezone="America/Denver", proxy_url="https://localhost:4443")
+    # poll_asleep explicit (not just the collector's getattr fallback) so
+    # this test pins the actual gap_threshold_s formula: max(2*1800, 3600).
+    cfg = SimpleNamespace(timezone="America/Denver", proxy_url="https://localhost:4443",
+                         poll_asleep=1800)
     await collector.solar_tick(client, store_, "VIN1", _ledger_view(55), cfg, site_id=1)
     assert solar.load_state(db, "VIN1")["ledger_stale"] == 0, "premise: first tick is not stale"
 
     db.execute("UPDATE solar_ticks SET ts = ts - ? WHERE vin = 'VIN1'",
-               (store.GAP_SECONDS + 100,))
+               (2 * cfg.poll_asleep + 100,))
     db.commit()
 
     await collector.solar_tick(client, store_, "VIN1", _ledger_view(60), cfg, site_id=1)
     assert solar.load_state(db, "VIN1")["ledger_stale"] == 1
+    store_.close()
+
+
+@pytest.mark.asyncio
+async def test_ledger_long_gap_with_unchanged_soc_is_not_stale_through_the_real_tick(tmp_path):
+    """THE REGRESSION THAT MATTERS, wired through the real solar_tick: a car
+    that slept through an ordinary idle-cadence gap with no soc change must
+    not be flagged stale, even though the gap comfortably exceeds
+    store.GAP_SECONDS (1800s) -- that constant is the SoC chart's, not this
+    ledger's, and the car's own poll_asleep can legitimately be that long."""
+    store_ = Store(tmp_path / "car.db")
+    db = store_._db
+    solar.save_config(db, enabled=1)
+    home.save(db, 40.0, -105.0, 100)
+    solar.save_state(db, "VIN1", state="idle", hold_s=10_000)
+
+    client = _ControllableGridClient(grid_w=-6000.0)
+    cfg = SimpleNamespace(timezone="America/Denver", proxy_url="https://localhost:4443",
+                         poll_asleep=1800)
+    await collector.solar_tick(client, store_, "VIN1", _ledger_view(55), cfg, site_id=1)
+
+    db.execute("UPDATE solar_ticks SET ts = ts - ? WHERE vin = 'VIN1'",
+               (2 * cfg.poll_asleep + 100,))
+    db.commit()
+
+    # Same soc as before -- the car simply slept the whole gap.
+    await collector.solar_tick(client, store_, "VIN1", _ledger_view(55), cfg, site_id=1)
+    assert solar.load_state(db, "VIN1")["ledger_stale"] == 0
     store_.close()
 
 
