@@ -4276,65 +4276,22 @@ stale and clamps; `solar_soc` never exceeds `soc`; and a full cycle
 
 ---
 
-## Task 19: The free-range map
+## Task 19: The free-range map — DROPPED
 
-Draw, on a map centred on home, the area reachable on **banked solar alone** —
-not total range. The number from Task 18 becomes a shape.
+Not building this. The owner went through HERE's signup and found it requires a
+credit card. My research had recorded the Limited Plan as "no payment info on
+file, 1,000 requests/day" — that was read off their docs and never verified by
+actually signing up, so it should have carried the unverified flag the rest of
+the measured facts carry. The owner's direct observation supersedes it.
 
-### HERE Isoline Routing v8, `consumption` mode
+Every remaining option was already disqualified on its own terms: Mapbox caps at
+100 km AND forbids display on Leaflet; Google is time-only with a 1-hour driving
+cap and the same non-Google-maps prohibition; ORS hosted caps at 120 km;
+self-hosted Valhalla and GraphHopper clear the distance but have no
+elevation-energy model, so an EV cost model means forking C++.
 
-Chosen from the research already in
-`docs/superpowers/research/2026-07-26-isochrone-options-raw.json`. It is the only
-option that clears every bar at once:
-
-| | |
-|---|---|
-| Range | 650,000 Wh budget — banked solar is a fraction of that |
-| Cost | **$0** — Limited Plan, 1,000 requests/day, no card |
-| Dependencies | **none** — one `httpx` call, already a dependency |
-| Elevation | `ev[ascent]` / `ev[descent]` in Wh per metre climbed |
-
-That last row is why the Front Range asymmetry — cheap east onto the plains,
-expensive west into the passes — falls out of the physics rather than being
-faked. And it works from day one: the *shape* depends on vehicle mass, not on
-measured consumption. Only the radius sharpens as history accrues.
-
-Disqualified and why, so nobody revisits it: **Mapbox** caps at 100 km *and* its
-terms forbid displaying results on Leaflet; **Google's** Isochrones API is
-time-only with a 1-hour driving cap and the same non-Google-maps prohibition;
-**ORS** hosted caps at 120 km; self-hosted **Valhalla**/**GraphHopper** clear the
-distance but have no elevation-energy model at all, so an EV cost model means
-forking C++.
-
-### THE OWNER MUST SUPPLY A KEY — build so that is obvious
-
-There is no key yet. Do not invent one, do not commit one, and do not fail
-silently. `HERE_API_KEY` goes in `.env` (already gitignored) and the page must
-say plainly: *"Free-range map needs a HERE API key — free tier, 1,000
-requests/day, no card required. Add HERE_API_KEY to .env."* A blank map with no
-explanation is the failure mode to avoid.
-
-### Parameters, derived rather than guessed
-
-- Budget: `banked_kwh * 1000` Wh from Task 18. When banked is 0 the honest
-  output is **no polygon and a sentence saying why** — not a dot, not a default.
-- `ev[ascent]=6.7`, `ev[descent]=3.4` Wh/m — from the ~2,100 kg mass of this
-  car. Put the derivation in a comment; these are not magic numbers.
-- Cache on the rounded budget (~2 kWh buckets) so a 5-minute poll does not
-  become 288 API calls. Home never moves, so the cache key is just the budget.
-
-**Files:** create `range_map.py`, `static/range.html`, `static/range.js`,
-`tests/test_range_map.py`; modify `solar_routes.py`, `config.py` (the key),
-`static/car.html` (a link).
-
-Every network path tested against a fake transport. **Never call HERE in a
-test** — the free tier is 1,000/day and tests would burn it.
-
-### Honesty rules
-
-Both numbers underneath this map are estimates and the map must say so:
-`banked_kwh` depends on a pack size derived from charge sessions, and the
-polygon is HERE's model of a road network, not a promise about your car on that
-day. Label it *"reachable on banked solar, estimated"* and state the assumed
-consumption. This codebase draws dashed lines across gaps rather than
-interpolating; hold that standard here.
+So a road-following polygon is off the table without either a paid key or a
+multi-week self-hosted routing project. The number is what the owner wanted
+anyway — Task 18 delivers it. If a map is ever wanted, the honest cheap version
+is a plain circle at the banked radius, clearly labelled as a straight-line
+approximation and not a drive-time isochrone.
