@@ -299,6 +299,64 @@ def test_solar_state_migration_adds_the_garage_columns_to_an_existing_table(tmp_
     s.close()
 
 
+def test_solar_state_migration_adds_the_banked_solar_ledger_columns(tmp_path):
+    """Task 18's solar_soc / ledger_soc / ledger_stale, added to solar_state
+    exactly like every prior column above. This is the owner's actual live
+    car.db shape today -- a row with a real engagement already on it, from
+    before this feature existed. Without migrate_state ALTERing the three
+    new columns onto the live table, load_state() raises IndexError on the
+    very first tick after this ships -- the standing instruction's exact
+    example of an already-caught defect, and the one this test exists to
+    make sure it never comes back."""
+    import sqlite3
+    path = tmp_path / "old.db"
+    legacy = sqlite3.connect(path)
+    legacy.executescript("""
+        CREATE TABLE solar_state (
+          vin             TEXT PRIMARY KEY,
+          state           TEXT    NOT NULL DEFAULT 'idle',
+          breach_ticks    INTEGER NOT NULL DEFAULT 0,
+          recover_ticks   INTEGER NOT NULL DEFAULT 0,
+          grace_s_elapsed INTEGER NOT NULL DEFAULT 0,
+          hold_s          INTEGER NOT NULL DEFAULT 0,
+          dirty           INTEGER NOT NULL DEFAULT 0,
+          original_amps   INTEGER,
+          original_limit  INTEGER,
+          raised_to       INTEGER,
+          raise_hold_elapsed INTEGER NOT NULL DEFAULT 0,
+          requests_today  INTEGER NOT NULL DEFAULT 0,
+          requests_day    TEXT,
+          capped          INTEGER NOT NULL DEFAULT 0,
+          engaged_at      INTEGER,
+          consecutive_429s INTEGER NOT NULL DEFAULT 0,
+          backoff_s        INTEGER NOT NULL DEFAULT 0,
+          garage_armed          INTEGER NOT NULL DEFAULT 0,
+          garage_last_close_day TEXT,
+          updated_at      INTEGER NOT NULL DEFAULT 0
+        );
+    """)
+    legacy.execute(
+        "INSERT INTO solar_state (vin, state, raised_to, updated_at) "
+        "VALUES ('VIN1', 'charging', 90, 0)")
+    legacy.commit()
+    legacy.close()
+
+    from store import Store
+    import solar
+    s = Store(path)
+    cols = {r[1] for r in s._db.execute("PRAGMA table_info(solar_state)")}
+    assert "solar_soc" in cols, "missing after migration"
+    assert "ledger_soc" in cols, "missing after migration"
+    assert "ledger_stale" in cols, "missing after migration"
+
+    st = solar.load_state(s._db, "VIN1")
+    assert st["raised_to"] == 90, "pre-existing data must survive the migration"
+    assert st["solar_soc"] == 0, "new column must default cleanly, not from a guess"
+    assert st["ledger_soc"] is None, "no previous observation yet -- must not assume one"
+    assert st["ledger_stale"] == 0, "new column must default cleanly"
+    s.close()
+
+
 def test_solar_config_migration_adds_the_garage_columns_to_an_existing_table(tmp_path):
     """The owner's live car.db already has a solar_config table with rows in
     it from before task 17b -- CREATE TABLE IF NOT EXISTS is a no-op against

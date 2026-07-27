@@ -348,6 +348,17 @@ CREATE TABLE IF NOT EXISTS solar_state (
   -- for the scheduled close, same convention as requests_day above.
   garage_armed          INTEGER NOT NULL DEFAULT 0,
   garage_last_close_day TEXT,
+  -- Task 18: the banked-solar ledger. solar_soc is percentage points of the
+  -- CURRENT soc that came from the sun (see green.ledger_step) -- a stock,
+  -- not a flow, tracked in SoC space so it needs no pack size and no
+  -- consumption figure. ledger_soc is the SoC as of the last observation,
+  -- needed to diff consecutive samples; NULL until the ledger has observed
+  -- its first tick, which is also how it starts at 0 rather than a guess.
+  -- ledger_stale marks a lower bound after a gap longer than
+  -- store.GAP_SECONDS -- the pack may have changed unobserved.
+  solar_soc       REAL    NOT NULL DEFAULT 0,
+  ledger_soc      INTEGER,
+  ledger_stale    INTEGER NOT NULL DEFAULT 0,
   updated_at      INTEGER NOT NULL DEFAULT 0
 );
 
@@ -385,6 +396,7 @@ STATE_DEFAULTS = {
     "capped": 0, "engaged_at": None,
     "consecutive_429s": 0, "backoff_s": 0,
     "garage_armed": 0, "garage_last_close_day": None,
+    "solar_soc": 0.0, "ledger_soc": None, "ledger_stale": 0,
 }
 
 # The Machine fields that must survive between ticks. Anything here that is
@@ -413,6 +425,10 @@ STATE_NEW_COLUMNS = (
     ("backoff_s", "INTEGER NOT NULL DEFAULT 0"),
     ("garage_armed", "INTEGER NOT NULL DEFAULT 0"),
     ("garage_last_close_day", "TEXT"),
+    # Task 18: the banked-solar ledger -- see the SCHEMA comment above.
+    ("solar_soc", "REAL NOT NULL DEFAULT 0"),
+    ("ledger_soc", "INTEGER"),
+    ("ledger_stale", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 
@@ -644,6 +660,24 @@ def recent_grid_w(db: sqlite3.Connection, vin: str, limit: int) -> list[float]:
         (vin, limit),
     ).fetchall()
     return [row["grid_w"] for row in rows]
+
+
+def last_tick_ts(db: sqlite3.Connection, vin: str) -> int | None:
+    """The timestamp of the most recently logged tick for vin, or None
+    before the first one has ever been logged.
+
+    Feeds the banked-solar ledger's gap detection (green.ledger_step):
+    elapsed real time since the last observation, read back from disk
+    rather than held in memory, so a process restart is measured correctly
+    too -- a crash is exactly the kind of unobserved gap the ledger's
+    staleness flag exists to catch. Must be read BEFORE this tick's own
+    log_tick() call, or MAX(ts) would return this tick's own row and the
+    gap would always read as zero.
+    """
+    row = db.execute(
+        "SELECT MAX(ts) AS ts FROM solar_ticks WHERE vin = ?", (vin,)
+    ).fetchone()
+    return row["ts"] if row and row["ts"] is not None else None
 
 
 def grace_import_wh(db: sqlite3.Connection, vin: str, since_ts: int) -> float:

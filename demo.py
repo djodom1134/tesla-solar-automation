@@ -383,6 +383,15 @@ def solar_status() -> dict:
         "miles_sampled": 812.4,
         "pack_kwh": 81.1,
         "pack_sessions": 6,
+        # Task 18: the banked-solar ledger -- a stock, not a flow, so unlike
+        # solar_kwh_today above it does not reset at midnight. 9.4% of the
+        # demo car's current 72% charge is sun that never left the pack.
+        "ledger_stale": False,
+        "banked_pct": 9.4,
+        "banked_miles_rated": 31.5,
+        "banked_miles_measured": 28.2,
+        "banked_miles": 28.2,
+        "banked_miles_basis": "measured",
     }
 
 

@@ -16,7 +16,12 @@ one that is absent silently, and far more useful than one that is wrong.
 """
 from __future__ import annotations
 
+import logging
 from typing import Any
+
+import store
+
+logger = logging.getLogger(__name__)
 
 # Below this swing, integer-percent-quantised SoC dominates the estimate: a
 # session's own reporting error is comparable to the swing itself, so the
@@ -42,13 +47,9 @@ MIN_MILES = 50
 ENGAGED_STATES = {"charging", "grace"}
 
 
-def solar_kwh(ticks: list[dict[str, Any]]) -> float:
-    """Solar energy delivered to the car, from the controller's own tick log.
-
-    The controller is the only thing modulating the car's draw, so within an
-    engaged tick the attribution is exact rather than pro-rata: whatever the
-    car drew, minus whatever was being imported at that instant, came from
-    the sun::
+def tick_solar_w(car_w: float, grid_w: float) -> float:
+    """Solar attribution for ONE tick: whatever the car drew, minus whatever
+    was being imported at that instant, came from the sun::
 
         solar_w = max(0, car_w - max(grid_w, 0))
 
@@ -56,6 +57,20 @@ def solar_kwh(ticks: list[dict[str, Any]]) -> float:
     even though some of it fed the house, and importing more than the car
     drew means none of it was solar. A lower bound is the right kind of
     wrong for a number whose entire purpose is to be trustworthy.
+
+    Shared by solar_kwh (which sums this over a tick log) and the
+    banked-solar ledger (which only needs to know whether THIS tick was
+    positive) -- one formula, so the two can never quietly drift apart.
+    """
+    return max(0.0, car_w - max(grid_w, 0.0))
+
+
+def solar_kwh(ticks: list[dict[str, Any]]) -> float:
+    """Solar energy delivered to the car, from the controller's own tick log.
+
+    The controller is the only thing modulating the car's draw, so within an
+    engaged tick the attribution is exact rather than pro-rata -- see
+    tick_solar_w for the per-tick formula.
     """
     wh = 0.0
     for tick in ticks:
@@ -64,8 +79,7 @@ def solar_kwh(ticks: list[dict[str, Any]]) -> float:
         car_w = float(tick.get("car_w") or 0)
         grid_w = float(tick.get("grid_w") or 0)
         period_s = float(tick.get("period_s") or 0)
-        solar_w = max(0.0, car_w - max(grid_w, 0.0))
-        wh += solar_w * period_s / 3600
+        wh += tick_solar_w(car_w, grid_w) * period_s / 3600
     return wh / 1000
 
 
@@ -134,3 +148,121 @@ def free_miles(solar_kwh: float | None, mi_per_kwh: float | None) -> float | Non
     if solar_kwh is None or mi_per_kwh is None:
         return None
     return solar_kwh * mi_per_kwh
+
+
+# --------------------------------------------------------------------------
+# Task 18: the banked-solar ledger -- the STOCK question ("how much sun is
+# in the pack right now"), as opposed to solar_kwh's FLOW ("how much came in
+# today"). Tracked in percentage points of SoC, not kWh, so the ledger needs
+# no pack size and no consumption figure -- both unknown and both only
+# entering at *display* time (see banked_miles_rated/banked_miles_measured
+# below). See the module docstring's doctrine: never guess, say why.
+# --------------------------------------------------------------------------
+
+def ledger_step(solar_soc: float, soc_before: int | None, soc_now: int,
+                solar_charging: bool, gap_s: int) -> tuple[float, bool]:
+    """Advance the banked-solar ledger by one observation.
+
+    Returns (new_solar_soc, stale). Pure: no clock, no database, no network
+    -- the caller supplies the previous SoC (persisted as solar_state.
+    ledger_soc, since there is no reliable way to re-derive "the previous
+    sample" inside a pure function) and the elapsed seconds since the last
+    observation (gap_s), and gets back the new ledger value plus whether
+    this observation is stale.
+
+    ENTERING the pack: a rise in SoC while the controller was engaged AND
+    this tick's solar attribution (tick_solar_w) was positive banks the
+    whole rise. A rise while grid charging is left UNCHANGED -- total SoC
+    went up, so the solar fraction falls on its own; grid electrons dilute
+    the bank, they do not remove sun already in it.
+
+    LEAVING the pack: any drop removes proportionally --
+    ``solar_soc -= drop * (solar_soc / soc_before)``, equivalently
+    ``solar_soc *= soc_now / soc_before``. You cannot drive on "the solar
+    electrons" specifically: a pack that is 40% solar delivers 40% solar to
+    whatever drew the drop -- the motor, vampire drain, Sentry,
+    preconditioning, all alike, with no special case for any of them. A drop
+    all the way to 0% SoC leaves exactly 0 banked, by this same formula.
+
+    soc_before is None on the very first observation after this column
+    existed at all -- a fresh install, or the tick right after this feature
+    was deployed. There is nothing yet to diff against, and the only honest
+    move is to record the observation and bank nothing: never assume a rise
+    or a drop happened before anything was watching.
+
+    A gap longer than store.GAP_SECONDS since the last observation means the
+    pack may have changed unobserved -- charged somewhere else, or simply
+    missed. stale=True tells the caller to present the figure as a lower
+    bound rather than a fact. It does not add a SEPARATE clamp of its own:
+    given the invariant 0 <= solar_soc <= soc_before held on entry, both the
+    rise and the drop branches above already keep the result at or under
+    soc_now on their own (a rise adds the same delta to both sides; a drop
+    scales both by the same soc_now/soc_before ratio) -- so "clamp to
+    min(solar_soc, soc_now)" is exactly what the general clamp below always
+    does, gap or no gap. What a long gap actually protects against is
+    something no clamp can fix: the pack could have moved up AND down
+    unobserved in between (charged away from home, then driven), which this
+    two-point diff cannot see -- stale is the caller's warning that the
+    number may be a stale overstatement even though it is not, itself, out
+    of bounds.
+
+    The general invariant 0 <= solar_soc <= soc_now is enforced by a final
+    clamp regardless of path, and a clamp that actually changes the value is
+    logged -- by construction (see above) it should never fire from a
+    consistent soc_before/solar_soc pair, so if it does, the caller's
+    bookkeeping (or the car) did something this function was never told
+    about, and a silent clamp would hide exactly that.
+    """
+    if soc_before is None:
+        return solar_soc, False
+
+    stale = gap_s > store.GAP_SECONDS
+    delta = soc_now - soc_before
+    raw = solar_soc
+
+    if delta > 0:
+        if solar_charging:
+            raw += delta
+        # else: grid charging -- unchanged. See docstring.
+    elif delta < 0 and soc_before > 0:
+        raw -= (soc_before - soc_now) * (raw / soc_before)
+
+    clamped = max(0.0, min(raw, soc_now))
+    if clamped != raw:
+        logger.warning(
+            "solar ledger clamped %.3f -> %.3f (soc=%s): a sample was "
+            "missed or the car charged somewhere unobserved",
+            raw, clamped, soc_now)
+    assert 0 <= clamped <= soc_now
+    return clamped, stale
+
+
+def banked_miles_rated(
+    solar_soc: float, soc: int | None, range_mi: float | None
+) -> float | None:
+    """The car's own rated-range estimate applied to the banked fraction.
+
+    Available immediately -- needs only the current soc and the car's own
+    reported range, both on hand every tick, unlike pack_kwh/mi_per_kwh
+    which need real history to earn any confidence. None when soc is
+    unknown or zero (nothing to take a fraction of) or range_mi is unknown.
+    """
+    if soc is None or not soc or range_mi is None:
+        return None
+    return solar_soc / soc * range_mi
+
+
+def banked_miles_measured(
+    solar_soc: float, pack_kwh: float | None, mi_per_kwh: float | None
+) -> float | None:
+    """The owner's own measured consumption applied to the banked fraction.
+
+    None until pack_kwh() and miles_per_kwh() have cleared their own
+    thresholds -- see MIN_SESSIONS and MIN_MILES above. The more trustworthy
+    of the two banked-miles figures once it exists; callers should prefer it
+    over banked_miles_rated and say which one they are showing (spec 7.4:
+    never blend the two, never switch without labelling).
+    """
+    if pack_kwh is None or mi_per_kwh is None:
+        return None
+    return solar_soc / 100 * pack_kwh * mi_per_kwh

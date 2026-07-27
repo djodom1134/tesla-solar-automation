@@ -286,6 +286,24 @@ async function loadSolar() {
       + `at ${s.mi_per_kwh} measured mi/kWh)`;
   }
 
+  // Banked solar is the STOCK question ("how far on sun already in the
+  // pack"), separate from free_miles above (today's FLOW). Two figures
+  // exist -- the car's own rated range (available immediately) and the
+  // owner's measured consumption (needs Task 16's thresholds) -- shown one
+  // at a time, always labelled which, never averaged (spec 7.4).
+  const lower = s.ledger_stale
+    ? " (lower bound -- a sample gap means the pack may have changed unobserved)"
+    : "";
+  if (s.banked_miles === null) {
+    $("solar-banked").textContent = `Banked solar: ${s.banked_pct}% of charge${lower}.`;
+  } else {
+    const basis = s.banked_miles_basis === "measured"
+      ? "measured mi/kWh" : "the car's rated range";
+    $("solar-banked").textContent =
+      `Banked solar: ${s.banked_pct}% of charge = ${s.banked_miles} free miles `
+      + `(${basis})${lower}.`;
+  }
+
   const warn = $("solar-warn");
   if (s.capped) {
     warn.textContent = "Paused: daily API request cap reached. Resumes tomorrow.";

@@ -9,6 +9,7 @@ import pytest
 import collector
 import home
 import solar
+import store
 import tesla
 from store import Store
 
@@ -921,6 +922,150 @@ async def test_429_honours_a_supplied_retry_after_over_the_exponential_fallback(
         f"a server-supplied Retry-After must win over the exponential "
         f"formula's 240s: {sleeps}")
     assert sleeps[1] == 120, "must return to the normal cadence once it clears"
+
+
+# --------------------------------------------------------------------------
+# Task 18 -- the banked-solar ledger, wired through the REAL solar_tick
+# (green.ledger_step itself is covered exhaustively in test_green.py). These
+# tests are about the collector's own job: pulling soc/state/car_w/grid_w
+# out of a real tick and persisting the result, not the ledger arithmetic.
+# --------------------------------------------------------------------------
+
+class _ControllableGridClient:
+    """grid_power settable per call -- lets a test drive the real solar_tick
+    through a rise, a drop, and a backdated gap."""
+
+    def __init__(self, grid_w: float):
+        self.grid_w = grid_w
+        self.commands: list = []
+
+    async def _get(self, path, ttl=0):
+        return {"grid_power": self.grid_w, "solar_power": max(0.0, -self.grid_w)}
+
+    async def command(self, vin, name, params):
+        self.commands.append((name, dict(params)))
+        return 200, {"response": {"result": True}}
+
+    async def wake_up(self, vin):
+        raise AssertionError("must not need a wake in this test")
+
+
+def _ledger_view(soc, **overrides):
+    view = {
+        "charging_state": "Charging", "amps_actual": 24, "amps_max": 48,
+        "volts": 240, "charge_amps": 24, "soc": soc, "limit": 80,
+        "lat": 40.0, "lon": -105.0,
+        "fast_charger_present": False, "fast_charger": None,
+    }
+    view.update(overrides)
+    return view
+
+
+@pytest.mark.asyncio
+async def test_ledger_first_tick_after_deployment_records_but_banks_nothing(tmp_path):
+    """ledger_soc starts NULL (the migration default, see test_store.py's
+    banked-solar migration test) -- the very first tick must record the
+    observed soc and bank nothing, never assume a rise or a drop happened
+    before the ledger was watching."""
+    store_ = Store(tmp_path / "car.db")
+    db = store_._db
+    solar.save_config(db, enabled=1)
+    home.save(db, 40.0, -105.0, 100)
+    solar.save_state(db, "VIN1", state="idle", hold_s=10_000)
+
+    client = _ControllableGridClient(grid_w=-6000.0)
+    cfg = SimpleNamespace(timezone="America/Denver", proxy_url="https://localhost:4443")
+    await collector.solar_tick(client, store_, "VIN1", _ledger_view(55), cfg, site_id=1)
+
+    st = solar.load_state(db, "VIN1")
+    assert st["solar_soc"] == 0
+    assert st["ledger_soc"] == 55
+    assert st["ledger_stale"] == 0
+    store_.close()
+
+
+@pytest.mark.asyncio
+async def test_ledger_banks_a_rise_then_drains_a_drop_across_real_ticks(tmp_path):
+    """End to end through the real solar_tick: a rise while engaged and
+    exporting banks it, then a drop drains the bank proportionally --
+    green.ledger_step's contract, driven by the collector's own soc/state/
+    car_w/grid_w extraction rather than hand-fed pure-function inputs."""
+    store_ = Store(tmp_path / "car.db")
+    db = store_._db
+    solar.save_config(db, enabled=1)
+    home.save(db, 40.0, -105.0, 100)
+    solar.save_state(db, "VIN1", state="idle", hold_s=10_000)
+
+    client = _ControllableGridClient(grid_w=-6000.0)
+    cfg = SimpleNamespace(timezone="America/Denver", proxy_url="https://localhost:4443")
+
+    await collector.solar_tick(client, store_, "VIN1", _ledger_view(55), cfg, site_id=1)
+    assert solar.load_state(db, "VIN1")["state"] == "charging", "premise: engaged by tick 1"
+
+    # Rose 5 points while charging and exporting -- all 5 are solar.
+    await collector.solar_tick(client, store_, "VIN1", _ledger_view(60), cfg, site_id=1)
+    st = solar.load_state(db, "VIN1")
+    assert st["solar_soc"] == pytest.approx(5.0)
+    assert st["ledger_soc"] == 60
+
+    # Unplugged and drove off 2 of the 60 points -- drains 2/60 of the bank.
+    client.grid_w = 0.0
+    view = _ledger_view(58, charging_state="Disconnected", amps_actual=None)
+    await collector.solar_tick(client, store_, "VIN1", view, cfg, site_id=1)
+    st = solar.load_state(db, "VIN1")
+    assert st["solar_soc"] == pytest.approx(5.0 - 2 * (5.0 / 60))
+    assert st["ledger_soc"] == 58
+    store_.close()
+
+
+@pytest.mark.asyncio
+async def test_ledger_rise_while_grid_charging_does_not_bank(tmp_path):
+    """A rise while IMPORTING (grid_w > 0) must not be credited to the sun,
+    even though the controller may still be nominally 'charging' -- solar
+    attribution (green.tick_solar_w) is what gates it, not state alone."""
+    store_ = Store(tmp_path / "car.db")
+    db = store_._db
+    solar.save_config(db, enabled=1)
+    home.save(db, 40.0, -105.0, 100)
+    solar.save_state(db, "VIN1", state="idle", hold_s=10_000)
+
+    client = _ControllableGridClient(grid_w=-6000.0)
+    cfg = SimpleNamespace(timezone="America/Denver", proxy_url="https://localhost:4443")
+    await collector.solar_tick(client, store_, "VIN1", _ledger_view(55), cfg, site_id=1)
+
+    # Now importing more than the car draws -- attribution is exactly 0.
+    client.grid_w = 9000.0
+    await collector.solar_tick(client, store_, "VIN1", _ledger_view(60), cfg, site_id=1)
+    st = solar.load_state(db, "VIN1")
+    assert st["solar_soc"] == 0, "importing more than the car drew is not solar"
+    assert st["ledger_soc"] == 60
+    store_.close()
+
+
+@pytest.mark.asyncio
+async def test_ledger_flags_stale_after_a_gap_spanning_a_restart(tmp_path):
+    """solar.last_tick_ts is read back from disk, not held in memory, so a
+    gap that spans a process restart is measured correctly -- proven here by
+    backdating the only logged tick so far, which is exactly what a real
+    crash-and-restart would leave behind."""
+    store_ = Store(tmp_path / "car.db")
+    db = store_._db
+    solar.save_config(db, enabled=1)
+    home.save(db, 40.0, -105.0, 100)
+    solar.save_state(db, "VIN1", state="idle", hold_s=10_000)
+
+    client = _ControllableGridClient(grid_w=-6000.0)
+    cfg = SimpleNamespace(timezone="America/Denver", proxy_url="https://localhost:4443")
+    await collector.solar_tick(client, store_, "VIN1", _ledger_view(55), cfg, site_id=1)
+    assert solar.load_state(db, "VIN1")["ledger_stale"] == 0, "premise: first tick is not stale"
+
+    db.execute("UPDATE solar_ticks SET ts = ts - ? WHERE vin = 'VIN1'",
+               (store.GAP_SECONDS + 100,))
+    db.commit()
+
+    await collector.solar_tick(client, store_, "VIN1", _ledger_view(60), cfg, site_id=1)
+    assert solar.load_state(db, "VIN1")["ledger_stale"] == 1
+    store_.close()
 
 
 # --------------------------------------------------------------------------

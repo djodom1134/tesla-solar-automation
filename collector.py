@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 import httpx
 
 import garage
+import green
 import home
 import solar
 import tesla
@@ -367,7 +368,25 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
                  f"for solar")
     solar.save_state(db, vin, raised_to=raised, raise_hold_elapsed=raise_hold)
 
-    solar.save_state(db, vin, **solar.machine_fields(machine))
+    # --- banked-solar ledger (Task 18) --------------------------------------
+    # last_tick_ts() must be read BEFORE log_tick() below writes this tick's
+    # own row, or MAX(ts) would return this tick and the gap would always
+    # read as zero. Skipped entirely when soc is unknown -- nothing to
+    # observe, so ledger_soc/solar_soc are left exactly as they were rather
+    # than guessed.
+    ledger_fields: dict = {}
+    soc_now = view.get("soc")
+    if soc_now is not None:
+        prev_tick_ts = solar.last_tick_ts(db, vin)
+        gap_s = int(time.time()) - prev_tick_ts if prev_tick_ts is not None else 0
+        solar_charging = (machine.state in green.ENGAGED_STATES
+                          and green.tick_solar_w(car_w, grid_w) > 0)
+        new_solar_soc, ledger_stale = green.ledger_step(
+            st["solar_soc"], st["ledger_soc"], int(soc_now), solar_charging, gap_s)
+        ledger_fields = {"solar_soc": new_solar_soc, "ledger_soc": int(soc_now),
+                         "ledger_stale": 1 if ledger_stale else 0}
+
+    solar.save_state(db, vin, **solar.machine_fields(machine), **ledger_fields)
     solar.log_tick(db, vin, ts=int(time.time()), state=machine.state,
                    grid_w=grid_w, solar_w=live.get("solar_power"), car_w=car_w,
                    surplus_w=surplus_w, error_w=decision.error_w,
