@@ -8,13 +8,15 @@ PERIOD = 120
 START_W = TUN.min_a * TUN.volts + TUN.margin_w        # 1300
 
 
-def tick(surplus_w, *, grid_w=None, current_a=5, location="home", plugged=True):
+def tick(surplus_w, *, grid_w=None, current_a=5, location="home", plugged=True,
+         car_charging=False):
     if grid_w is None:
         grid_w = -surplus_w        # car off: surplus is pure export
     return solar.Tick(
         surplus_w=surplus_w,
         decision=solar.control(grid_w, current_a, TUN),
         location=location, plugged=plugged, period_s=PERIOD,
+        car_charging=car_charging,
     )
 
 
@@ -32,6 +34,37 @@ def test_idle_requires_sustained_surplus_before_charging():
     machine, actions = solar.advance(machine, tick(3000), POL, TUN)
     assert machine.state == "charging"
     assert "charge_start" in actions
+
+
+def test_idle_adopts_a_car_already_charging_with_no_sustained_hold():
+    """Task 21 -- ADOPT. A car found charging that WE did not start (it
+    auto-started on plug-in, or the owner started it from the app) must be
+    taken over on the very first tick, with no start_hold_s dwell: the hold
+    exists so one noisy meter reading cannot START a charge, but here the
+    charge is already running -- the only question is who controls it, and
+    waiting is just more ticks of import.
+
+    Surplus is deeply negative (well below start_watts) precisely because
+    that combination -- adopting is warranted regardless of surplus level --
+    is what distinguishes ADOPT from START: START would never fire here."""
+    machine = m("idle", hold_s=0)
+    machine, actions = solar.advance(
+        machine, tick(-5480, grid_w=16760, car_charging=True), POL, TUN)
+    assert machine.state == "charging"
+    assert actions == ["adopt", "set_amps"]
+    assert "charge_start" not in actions, "the car is already charging"
+
+
+def test_idle_adopts_even_with_ample_surplus():
+    """ADOPT is unconditional on surplus -- it fires purely because the car
+    is already drawing power we did not command. A car that auto-started at
+    a low rate while there is plenty of sun must still be adopted, so the
+    controller can raise it if warranted."""
+    machine = m("idle", hold_s=0)
+    machine, actions = solar.advance(
+        machine, tick(9000, grid_w=-9000, car_charging=True), POL, TUN)
+    assert machine.state == "charging"
+    assert actions == ["adopt", "set_amps"]
 
 
 def test_idle_ignores_surplus_below_the_floor():

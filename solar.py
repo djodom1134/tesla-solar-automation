@@ -57,6 +57,12 @@ class Decision:
     floor_breach: bool       # the law wanted less than min_a
     error_w: float
     raw_target: float        # unclamped; exists only to answer floor_breach
+    # Clamped to [min_a, max_a] but NOT ramp-limited -- the "where the loop
+    # would put the car right now, with no regard for ramp_a" figure. Used
+    # only by the adoption-tick bypass in collector.py: a downward move all
+    # the way there is safe (it can only reduce draw), an upward one is not,
+    # so the caller still compares it against current_a before trusting it.
+    unramped_target_a: int
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -116,6 +122,7 @@ def control(grid_w: float, current_a: int, tun: Tunables) -> Decision:
     raw_target = current_a + error_w / tun.volts
     step_a = int(round(_clamp(error_w / tun.volts, -tun.ramp_a, tun.ramp_a)))
     target_a = int(_clamp(current_a + step_a, tun.min_a, tun.max_a))
+    unramped_target_a = int(_clamp(round(raw_target), tun.min_a, tun.max_a))
     return Decision(
         target_a=target_a,
         write=abs(error_w) >= tun.deadband_w,
@@ -125,6 +132,7 @@ def control(grid_w: float, current_a: int, tun: Tunables) -> Decision:
         floor_breach=raw_target < tun.min_a,
         error_w=error_w,
         raw_target=raw_target,
+        unramped_target_a=unramped_target_a,
     )
 
 
@@ -219,6 +227,11 @@ class Tick:
     location: str               # "home" | "away" | "unknown"
     plugged: bool
     period_s: int
+    # True when the car is ALREADY drawing power we did not command -- it
+    # auto-started on plug-in, or was started from the Tesla app. Defaults
+    # False so every pre-existing call site (none of which knows about
+    # adoption) keeps behaving exactly as before.
+    car_charging: bool = False
 
 
 def start_watts(tun: Tunables) -> float:
@@ -243,6 +256,15 @@ def advance(m: Machine, t: Tick, pol: Policy, tun: Tunables) -> tuple[Machine, l
         return Machine(state="idle"), ["restore"]
 
     if m.state == "idle":
+        if t.car_charging:
+            # ADOPT: the car is already charging -- it auto-started on
+            # plug-in, or the owner started it from the app. No new
+            # `charge_start` (it would be commanding a charge that is
+            # already running) and NO sustained hold: the hold exists so one
+            # noisy meter reading cannot START a charge, but here the charge
+            # is already running and the only question is who controls it.
+            # Waiting two ticks just means two more ticks of grid import.
+            return Machine(state="charging"), ["adopt", "set_amps"]
         if t.surplus_w < start_watts(tun):
             return Machine(state="idle", hold_s=0), []
         # Threshold is checked against the timer *as carried in*, not the

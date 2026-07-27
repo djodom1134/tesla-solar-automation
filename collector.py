@@ -287,13 +287,17 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
     tick = solar.Tick(
         surplus_w=surplus_w, decision=decision, location=location,
         plugged=view.get("charging_state") not in (None, "Disconnected"),
+        car_charging=view.get("charging_state") in solar.LIVE_CHARGING_STATES,
         period_s=conf["period_s"])
     machine, actions = solar.advance(machine, tick, solar.policy_from(conf), tun)
 
     # Without a known original amps there is nothing to restore to, and both
     # restore paths would silently no-op forever. Refuse to engage rather
-    # than record a dirty=1 the controller can never make good on.
-    if "charge_start" in actions and view.get("charge_amps") is None:
+    # than record a dirty=1 the controller can never make good on. Applies to
+    # BOTH ways into "charging" -- adoption needs its own restorable original
+    # exactly as an ordinary charge_start does, or the car's remembered
+    # per-location amps setting is lost the moment we touch it.
+    if ("charge_start" in actions or "adopt" in actions) and view.get("charge_amps") is None:
         _log("charge_amps unknown; refusing to engage without a restorable original")
         machine, actions = solar.machine_from(st), []
 
@@ -329,10 +333,34 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
                                  engaged_at=int(time.time()))
                 st = solar.load_state(db, vin)
             await _command(client, vin, "charge_start")
+        elif action == "adopt":
+            # Taking over a charge the CAR started, not us -- issue no
+            # charge_start (it is already running), but record the originals
+            # BEFORE we ever touch amps, exactly as charge_start does above.
+            # Skipping this is how three earlier Critical defects on this
+            # path began: with nothing recorded, _restore() has nothing to
+            # put back and the owner's own per-location amps setting is lost
+            # the moment set_amps below writes over it.
+            if st["original_amps"] is None:
+                solar.save_state(db, vin, dirty=1,
+                                 original_amps=view.get("charge_amps"),
+                                 original_limit=view.get("limit"),
+                                 engaged_at=int(time.time()))
+                st = solar.load_state(db, vin)
         elif action == "charge_stop":
             await _command(client, vin, "charge_stop")
         elif action == "set_amps":
-            target = tun.min_a if machine.state == "grace" else decision.target_a
+            if machine.state == "grace":
+                target = tun.min_a
+            elif "adopt" in actions and decision.unramped_target_a < current_a:
+                # Down-to-floor bypass, exactly as grace entry: on the
+                # adoption tick only, a DOWNWARD correction may skip ramp_a
+                # entirely -- reducing draw is always safe. Never bypass
+                # upward; ramp_a still guards against slamming the car into
+                # a surplus that may not be there.
+                target = decision.unramped_target_a
+            else:
+                target = decision.target_a
             # Spec 3.2: never re-send a value the car already holds
             # acknowledged (charge_current_request). Without this, a target
             # pinned at a clamp while the error stays outside the deadband

@@ -68,3 +68,19 @@ def test_raw_target_is_unclamped_so_the_floor_test_can_see_below_min():
     d = solar.control(400, 5, T)            # importing 400 W at the floor
     assert d.raw_target < T.min_a
     assert d.target_a == T.min_a            # but we never COMMAND below min
+
+
+def test_unramped_target_a_skips_the_per_tick_ramp_but_stays_clamped():
+    """Task 21: unramped_target_a is what the law wants RIGHT NOW, with no
+    regard for ramp_a -- collector.py's adoption-tick bypass uses it only for
+    a DOWNWARD move. A car adopted at 48 A with a deep grid import wants far
+    below min_a; target_a is ramp-limited to one step (48 -> 40), but
+    unramped_target_a jumps straight to the clamped floor (5)."""
+    d = solar.control(16760, 48, T)         # the observed live 12:29 reading
+    assert d.target_a == 40, "ramp-limited: one step down from 48"
+    assert d.unramped_target_a == T.min_a, "unramped: straight to the floor"
+
+
+def test_unramped_target_a_is_still_clamped_to_max_a():
+    d = solar.control(-20000, 45, T)        # huge export, would want far above max
+    assert d.unramped_target_a == T.max_a

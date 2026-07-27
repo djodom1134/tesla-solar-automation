@@ -283,8 +283,16 @@ async def test_c5_steady_export_holds_a_single_engagement_across_six_ticks(
 
     client = _SteadyExportClient()
     cfg = SimpleNamespace(timezone="America/Denver", proxy_url="https://localhost:4443")
+    # charging_state is "Stopped", not "Charging": this test is specifically
+    # about the START transition (idle -> charging via a sustained-surplus
+    # hold), which the C5 regression is about. Task 21 adds a SECOND,
+    # distinct way into "charging" -- ADOPT, for a car already drawing power
+    # on its own -- and a "Charging" car here would now be adopted instead of
+    # started, which is a different transition with its own coverage
+    # (test_collector_solar.py's adoption-journey tests). Keeping this one
+    # "Stopped" preserves the original, documented intent of this test.
     view = {
-        "charging_state": "Charging", "amps_actual": 24, "amps_max": 48,
+        "charging_state": "Stopped", "amps_actual": 24, "amps_max": 48,
         "volts": 240, "charge_amps": 24, "soc": 55, "limit": 80,
         "lat": 40.0, "lon": -105.0,
         "fast_charger_present": False, "fast_charger": None,
@@ -1671,3 +1679,151 @@ async def test_run_calls_both_garage_ticks_every_iteration(tmp_path, monkeypatch
 
     assert len(close_calls) == 3, "the scheduled-close check must run every tick"
     assert len(arrival_calls) == 3, "the arrival check must run whenever a view exists"
+
+
+# --------------------------------------------------------------------------
+# Task 21 -- ADOPT: a second, distinct way into "charging", for a car found
+# ALREADY drawing power the controller did not command (it auto-started on
+# plug-in, or the owner started it from the Tesla app). Driven as a JOURNEY
+# through the REAL solar_tick, not just the pure state machine -- the gap
+# this closes was invisible to state-level tests because they check states,
+# not sequences.
+#
+# Numbers are the observed live reading (12:29, the first real solar day):
+# solar 4.26 kW, car 11.28 kW (48 A x 235 V, started by the car), grid +16.76
+# kW import, surplus -5.48 kW. Modelled here at a round 240 V for the same
+# reason every other fixture in this file uses it.
+# --------------------------------------------------------------------------
+
+class _AdoptedCarClient:
+    """A steady, deep grid import that never lets up -- the car auto-started
+    at 48 A against solar that cannot support it, unchanging tick to tick so
+    the journey below exercises the breach dwell and grace timeout on their
+    own terms rather than a moving target."""
+
+    def __init__(self):
+        self.commands: list[tuple[str, dict]] = []
+
+    async def _get(self, path, ttl=0):
+        return {"grid_power": 16760.0, "solar_power": 4260.0}
+
+    async def command(self, vin, name, params):
+        self.commands.append((name, dict(params)))
+        return 200, {"response": {"result": True}}
+
+    async def wake_up(self, vin):
+        raise AssertionError("must never wake a car that is already awake and charging")
+
+
+@pytest.mark.asyncio
+async def test_adopts_a_charge_the_car_started_and_restores_on_stop(tmp_path):
+    """The full arc: adopt (recording the owner's 48 A BEFORE ever touching
+    amps, no charge_start), bypass the ramp on the way down (reducing draw
+    is always safe), ride the two-tick breach dwell into grace, and on
+    grace's expiry stop the charge and restore exactly 48 A -- with no
+    charge_start issued anywhere in the whole sequence, because the car
+    started this charge, not the controller.
+    """
+    store_ = Store(tmp_path / "car.db")
+    db = store_._db
+    solar.save_config(db, enabled=1)      # period_s=120, ramp_a=8, min_a=5,
+    home.save(db, 40.0, -105.0, 100)       # grace_s=180 -- all defaults
+
+    # solar_state is left at ITS defaults (idle, dirty=0, original_amps=None)
+    # -- exactly what the owner's DB looks like the moment solar mode is
+    # enabled while the car is already mid-charge. No hold_s seeding: ADOPT
+    # needs none.
+
+    client = _AdoptedCarClient()
+    cfg = SimpleNamespace(timezone="America/Denver", proxy_url="https://localhost:4443")
+    view = {
+        "charging_state": "Charging", "amps_actual": 48, "amps_max": 48,
+        "volts": 240, "charge_amps": 48, "soc": 60, "limit": 90,
+        "lat": 40.0, "lon": -105.0,
+        "fast_charger_present": False, "fast_charger": None,
+    }
+
+    # --- tick 1: ADOPT, record the original, bypass the ramp on the way down
+    state, _ = await collector.solar_tick(client, store_, "VIN1", view, cfg, site_id=1)
+    assert state == "charging"
+    st = solar.load_state(db, "VIN1")
+    assert st["dirty"] == 1
+    assert st["original_amps"] == 48, "the owner's amps must be recorded BEFORE any write"
+    assert st["original_limit"] == 90
+
+    amps_commands = [c for c in client.commands if c[0] == "set_charging_amps"]
+    assert amps_commands, "the adoption tick must correct amps immediately, not wait"
+    first_write = amps_commands[0][1]["charging_amps"]
+    assert first_write != 48 - 8, "must NOT be limited to a single ramp_a=8 step"
+    assert first_write == 5, "the bypass drops straight to the floor, as grace does"
+
+    # --- tick 2: first breach tick -- dwelling, no new action yet ----------
+    state, _ = await collector.solar_tick(client, store_, "VIN1", view, cfg, site_id=1)
+    assert state == "charging"
+    assert solar.load_state(db, "VIN1")["breach_ticks"] == 1
+
+    # --- tick 3: second consecutive breach tick -> grace at min_a ----------
+    state, _ = await collector.solar_tick(client, store_, "VIN1", view, cfg, site_id=1)
+    assert state == "grace"
+
+    # --- tick 4: still dwelling in grace, timeout not yet reached ----------
+    state, _ = await collector.solar_tick(client, store_, "VIN1", view, cfg, site_id=1)
+    assert state == "grace"
+
+    # --- tick 5: grace_s elapses -> charge_stop AND restore to 48 A --------
+    state, _ = await collector.solar_tick(client, store_, "VIN1", view, cfg, site_id=1)
+    assert state == "stopped"
+
+    stops = [c for c in client.commands if c[0] == "charge_stop"]
+    assert len(stops) == 1
+    restores = [c for c in client.commands if c[0] == "set_charging_amps"
+                and c[1]["charging_amps"] == 48]
+    assert restores, f"original_amps must be restored to 48: {client.commands}"
+
+    final = solar.load_state(db, "VIN1")
+    assert final["dirty"] == 0
+    assert final["original_amps"] is None
+
+    # --- the whole point: the controller never issues its own charge_start -
+    starts = [c for c in client.commands if c[0] == "charge_start"]
+    assert starts == [], f"the car started this charge, not us: {client.commands}"
+
+
+@pytest.mark.asyncio
+async def test_without_adopt_the_controller_sits_in_idle_watching_it_import(tmp_path):
+    """Discriminating check: covers exactly the defect this task closes. With
+    no ADOPT transition, a car found already charging is invisible to a
+    machine that only ever enters "charging" from a sustained-surplus START
+    -- surplus here is deeply negative, so START never fires either, and the
+    machine sits in "idle" forever while 48 A keeps flowing from the grid.
+
+    This test drives a car that is NOT actually charging (charging_state
+    outside the live-charging set) -- exactly what the pre-Task-21 machine
+    could see, since it had no `car_charging` signal at all -- to show the
+    machine has no OTHER way into "charging" for a car it did not itself
+    start. The report for this task carries the verbatim red/green run
+    captured by reverting the ADOPT branch in solar.advance() and re-running
+    test_adopts_a_charge_the_car_started_and_restores_on_stop above, which
+    IS wired to car_charging and fails without it.
+    """
+    store_ = Store(tmp_path / "car.db")
+    db = store_._db
+    solar.save_config(db, enabled=1)
+    home.save(db, 40.0, -105.0, 100)
+
+    client = _AdoptedCarClient()
+    cfg = SimpleNamespace(timezone="America/Denver", proxy_url="https://localhost:4443")
+    view = {
+        "charging_state": "Stopped", "amps_actual": None, "amps_max": 48,
+        "volts": 240, "charge_amps": 48, "soc": 60, "limit": 90,
+        "lat": 40.0, "lon": -105.0,
+        "fast_charger_present": False, "fast_charger": None,
+    }
+
+    for _ in range(5):
+        state, _ = await collector.solar_tick(client, store_, "VIN1", view, cfg, site_id=1)
+        assert state == "idle"
+
+    assert client.commands == [], (
+        f"nothing should ever be commanded while genuinely idle: {client.commands}")
+    store_.close()
