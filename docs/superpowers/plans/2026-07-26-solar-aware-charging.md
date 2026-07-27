@@ -4197,3 +4197,144 @@ Cover: the scheduled close firing once per day and not again; aborting when
 obstruction appears during the warning window; aborting when the door is no
 longer open; the unreachable-device path; and the arrival latch across a
 simulated drive out and back.
+
+---
+
+## Task 18: The banked-solar ledger
+
+The owner asked how far they could go on *sun stored in the battery*. That is a
+**stock**, not a flow — Task 16 answered the flow (`solar_kwh_today`). This
+tracks what is actually in the pack right now.
+
+### Work in SoC space, not kWh
+
+The insight that makes this tractable: track **percentage points of SoC
+attributable to solar**, not kilowatt-hours. Then the ledger needs no pack size,
+no consumption figure, and no calibration — all of which are currently unknown
+and will stay approximate. Pack size and mi/kWh appear only at *display* time.
+
+```
+solar_soc  -- percentage points of the current SoC that came from the sun
+```
+
+**Entering the pack:**
+- solar charging → `solar_soc += ΔSoC` over ticks where the controller was
+  engaged and the tick's solar attribution (Task 16's
+  `max(0, car_w - max(grid_w, 0))`) was positive
+- grid charging → **unchanged**. Total SoC rises, so the solar *fraction* falls,
+  which is correct: grid electrons dilute the bank.
+
+**Leaving the pack:**
+- any SoC drop → remove proportionally:
+  `solar_soc -= ΔSoC_drop * (solar_soc / soc_before)`
+
+  Proportional because you cannot drive on "the solar electrons" specifically.
+  A pack that is 40% solar delivers 40% solar to the motor. This also handles
+  vampire drain, preconditioning and Sentry without special cases — anything
+  that lowers SoC drains the bank at its current fraction.
+
+**Invariants** (assert them, and test them):
+- `0 <= solar_soc <= soc` always. Clamp, and log if a clamp fires — that means
+  a sample was missed or the car was charged somewhere unobserved.
+- Start at **0**. Nothing is banked until solar charging is actually observed.
+  Never seed it from an assumption.
+- A gap in samples longer than `GAP_SECONDS` means the pack may have changed
+  unobserved: clamp `solar_soc` to `min(solar_soc, soc)` and mark the ledger
+  `stale=1` so the UI can say the number is a lower bound.
+
+### Display, two ways, both honest
+
+- `banked_pct = solar_soc` — exact, available immediately, needs nothing.
+- `banked_miles_rated = (solar_soc / soc) * range_mi` — uses the car's own
+  range estimate. Available today. Label it as the car's rated figure.
+- `banked_miles_measured = solar_soc/100 * pack_kwh * mi_per_kwh` — the owner's
+  real consumption, `None` until Task 16's thresholds are met.
+
+Show the measured one when available and the rated one otherwise, always saying
+which. Never blend them.
+
+**Files:** modify `green.py` (pure ledger step), `solar.py` (state columns
+`solar_soc REAL DEFAULT 0`, `ledger_soc INTEGER`, `ledger_stale INTEGER DEFAULT 0`
+— **via the migration helper**), `collector.py` (advance the ledger each tick),
+`solar_routes.py`, `static/car.js`, `demo.py`. Test: `tests/test_green.py`.
+
+**The pure function** — everything else is plumbing:
+
+```python
+def ledger_step(solar_soc: float, soc_before: int | None, soc_now: int,
+                solar_charging: bool, gap_s: int) -> tuple[float, bool]:
+    """Advance the banked-solar ledger by one observation.
+
+    Returns (new_solar_soc, stale). Pure: no clock, no database, no network.
+    """
+```
+
+Test: a rise while solar-charging banks it; a rise while grid-charging does not;
+a drop drains proportionally; a drop to 0% SoC leaves 0 banked; a long gap sets
+stale and clamps; `solar_soc` never exceeds `soc`; and a full cycle
+(bank 20 points, drive off half, bank again) lands where hand-arithmetic says.
+
+---
+
+## Task 19: The free-range map
+
+Draw, on a map centred on home, the area reachable on **banked solar alone** —
+not total range. The number from Task 18 becomes a shape.
+
+### HERE Isoline Routing v8, `consumption` mode
+
+Chosen from the research already in
+`docs/superpowers/research/2026-07-26-isochrone-options-raw.json`. It is the only
+option that clears every bar at once:
+
+| | |
+|---|---|
+| Range | 650,000 Wh budget — banked solar is a fraction of that |
+| Cost | **$0** — Limited Plan, 1,000 requests/day, no card |
+| Dependencies | **none** — one `httpx` call, already a dependency |
+| Elevation | `ev[ascent]` / `ev[descent]` in Wh per metre climbed |
+
+That last row is why the Front Range asymmetry — cheap east onto the plains,
+expensive west into the passes — falls out of the physics rather than being
+faked. And it works from day one: the *shape* depends on vehicle mass, not on
+measured consumption. Only the radius sharpens as history accrues.
+
+Disqualified and why, so nobody revisits it: **Mapbox** caps at 100 km *and* its
+terms forbid displaying results on Leaflet; **Google's** Isochrones API is
+time-only with a 1-hour driving cap and the same non-Google-maps prohibition;
+**ORS** hosted caps at 120 km; self-hosted **Valhalla**/**GraphHopper** clear the
+distance but have no elevation-energy model at all, so an EV cost model means
+forking C++.
+
+### THE OWNER MUST SUPPLY A KEY — build so that is obvious
+
+There is no key yet. Do not invent one, do not commit one, and do not fail
+silently. `HERE_API_KEY` goes in `.env` (already gitignored) and the page must
+say plainly: *"Free-range map needs a HERE API key — free tier, 1,000
+requests/day, no card required. Add HERE_API_KEY to .env."* A blank map with no
+explanation is the failure mode to avoid.
+
+### Parameters, derived rather than guessed
+
+- Budget: `banked_kwh * 1000` Wh from Task 18. When banked is 0 the honest
+  output is **no polygon and a sentence saying why** — not a dot, not a default.
+- `ev[ascent]=6.7`, `ev[descent]=3.4` Wh/m — from the ~2,100 kg mass of this
+  car. Put the derivation in a comment; these are not magic numbers.
+- Cache on the rounded budget (~2 kWh buckets) so a 5-minute poll does not
+  become 288 API calls. Home never moves, so the cache key is just the budget.
+
+**Files:** create `range_map.py`, `static/range.html`, `static/range.js`,
+`tests/test_range_map.py`; modify `solar_routes.py`, `config.py` (the key),
+`static/car.html` (a link).
+
+Every network path tested against a fake transport. **Never call HERE in a
+test** — the free tier is 1,000/day and tests would burn it.
+
+### Honesty rules
+
+Both numbers underneath this map are estimates and the map must say so:
+`banked_kwh` depends on a pack size derived from charge sessions, and the
+polygon is HERE's model of a road network, not a promise about your car on that
+day. Label it *"reachable on banked solar, estimated"* and state the assumed
+consumption. This codebase draws dashed lines across gaps rather than
+interpolating; hold that standard here.
