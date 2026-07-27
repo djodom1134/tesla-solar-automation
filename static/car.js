@@ -269,6 +269,22 @@ async function loadSolar() {
     `Imported while riding out clouds: ${s.grace_import_wh_today} Wh today, `
     + `${s.grace_import_wh_total} Wh total`;
 
+  // Honesty is the feature here, not a caveat on it: when either input is
+  // still unproven, say exactly what's missing rather than blanking the
+  // line or showing a confident wrong number (spec 7.4).
+  if (s.free_miles === null) {
+    const missing = [];
+    if (s.miles_sampled < 50) missing.push(`50 miles of driving (have ${s.miles_sampled})`);
+    if (s.pack_sessions < 2) missing.push(`2 charge sessions (have ${s.pack_sessions})`);
+    $("solar-free-miles").textContent = missing.length
+      ? `Free miles: collecting — need ${missing.join(" and ")}.`
+      : "Free miles: collecting more data.";
+  } else {
+    $("solar-free-miles").textContent =
+      `Free miles today: ${s.free_miles} (${s.solar_kwh_today} kWh from the sun `
+      + `at ${s.mi_per_kwh} measured mi/kWh)`;
+  }
+
   const warn = $("solar-warn");
   if (s.capped) {
     warn.textContent = "Paused: daily API request cap reached. Resumes tomorrow.";

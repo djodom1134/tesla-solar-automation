@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Body, HTTPException
 
 import demo
+import green
 import home
 import solar
 from config import settings
@@ -55,6 +56,114 @@ def _today() -> str:
 def _midnight_ts() -> int:
     now = datetime.now(ZoneInfo(settings.timezone))
     return int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+
+
+def _solar_ticks(db, vin: str, since_ts: int) -> list[dict[str, Any]]:
+    """Rows for green.solar_kwh(). Same since_ts convention as
+    solar.grace_import_wh() -- 0 for all time, _midnight_ts() for today."""
+    if not vin:
+        return []
+    rows = db.execute(
+        "SELECT state, car_w, grid_w, period_s FROM solar_ticks"
+        " WHERE vin = ? AND ts >= ?", (vin, since_ts),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _sessions_and_segments(
+    db, vin: str
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Charge sessions and driving segments, both derived from the same
+    ordered sample history and both bounded by the same charging-run edges.
+
+    A charging run's own first and last row mark the exact moment charging
+    started or stopped, so that row doubles as the boundary anchor for the
+    *adjacent* driving segment too. Anchoring a segment at the next-available
+    sample instead -- rather than at the charging run's edge -- would
+    silently drop whatever the car did in between: often hours and several
+    miles, since the collector polls slowly once it has no reason to hurry
+    (see collector.next_interval). Using the charging edges as shared anchors
+    means every mile and every percent of SoC in the whole history lands in
+    exactly one bucket: a charge session or a driving segment, never neither.
+    """
+    if not vin:
+        return [], []
+    rows = db.execute(
+        "SELECT battery_level, charging, charge_energy_added, odometer"
+        " FROM samples WHERE vin = ? ORDER BY ts", (vin,),
+    ).fetchall()
+    n = len(rows)
+    if n == 0:
+        return [], []
+
+    charging_runs: list[tuple[int, int]] = []
+    i = 0
+    while i < n:
+        if rows[i]["charging"]:
+            j = i
+            while j < n and rows[j]["charging"]:
+                j += 1
+            charging_runs.append((i, j - 1))
+            i = j
+        else:
+            i += 1
+
+    sessions = []
+    for start, end in charging_runs:
+        first, last = rows[start], rows[end]
+        added_start, added_end = first["charge_energy_added"], last["charge_energy_added"]
+        if added_start is None or added_end is None:
+            continue  # charge_energy_added missing for this run -- not usable
+        sessions.append({
+            "soc_start": first["battery_level"], "soc_end": last["battery_level"],
+            "kwh_added": added_end - added_start,
+        })
+
+    anchors = [0]
+    for start, end in charging_runs:
+        anchors += [start, end]
+    anchors.append(n - 1)
+
+    segments = []
+    for k in range(0, len(anchors) - 1, 2):
+        start_idx, end_idx = anchors[k], anchors[k + 1]
+        if start_idx == end_idx:
+            continue
+        first, last = rows[start_idx], rows[end_idx]
+        if first["odometer"] is None or last["odometer"] is None:
+            continue
+        if first["battery_level"] is None or last["battery_level"] is None:
+            continue
+        segments.append({
+            "miles": last["odometer"] - first["odometer"],
+            "soc_drop": first["battery_level"] - last["battery_level"],
+        })
+
+    return sessions, segments
+
+
+def _green_status(db, vin: str) -> dict[str, Any]:
+    """The three-number "free miles" answer, honest about what it doesn't
+    know yet. mi_per_kwh and pack_kwh are lifetime figures -- they only get
+    more trustworthy with more history, so there is no reason to reset them
+    daily. solar_kwh_today is the one number scoped to the calendar day, same
+    convention as grace_import_wh_today: it is "free miles earned today",
+    not a lifetime tally, so it goes back to zero each morning even though
+    the pack and the odometer never do.
+    """
+    solar_today = green.solar_kwh(_solar_ticks(db, vin, _midnight_ts()))
+    sessions, segments = _sessions_and_segments(db, vin)
+    pack, pack_n = green.pack_kwh(sessions)
+    mpk, miles = green.miles_per_kwh(segments, pack)
+    free = green.free_miles(solar_today, mpk)
+    return {
+        "free_miles": round(free, 1) if free is not None else None,
+        "solar_kwh_today": round(solar_today, 2),
+        "mi_per_kwh": round(mpk, 2) if mpk is not None else None,
+        "miles_sampled": round(miles, 1),
+        "pack_kwh": round(pack, 1) if pack is not None else None,
+        "pack_sessions": pack_n,
+    }
 
 
 @router.get("/home")
@@ -175,4 +284,5 @@ async def get_solar_status() -> dict[str, Any]:
         "engaged_at": state["engaged_at"],
         "last_tick_ts": last["ts"] if last else None,
         "requests_today": state["requests_today"] if state["requests_day"] == _today() else 0,
+        **_green_status(db, vin),
     }

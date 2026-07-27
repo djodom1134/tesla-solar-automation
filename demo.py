@@ -374,6 +374,15 @@ def solar_status() -> dict:
         "engaged_at": int(time.time()) - 4200,
         "last_tick_ts": int(time.time()) - 40,
         "requests_today": 173,
+        # A demo car with months of history behind it, so the card can show
+        # what the fully-resolved feature looks like -- a real, fresh
+        # install reports every one of these as None (see solar_routes.py).
+        "free_miles": 44.4,
+        "solar_kwh_today": 12.0,
+        "mi_per_kwh": 3.7,
+        "miles_sampled": 812.4,
+        "pack_kwh": 81.1,
+        "pack_sessions": 6,
     }
 
 
