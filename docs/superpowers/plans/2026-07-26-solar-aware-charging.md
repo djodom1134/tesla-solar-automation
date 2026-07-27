@@ -4088,3 +4088,112 @@ connection" button that reads `/status.json` and shows the door's current state
 — never one that commands the door.
 
 - [ ] **Step 7: Full suite and commit**
+
+---
+
+## Task 17b: Wire the garage — manual controls, auto-open on arrival, scheduled close
+
+`garage.py` exists and is tested (commit 58bb462): pure `should_open`, plus
+`status()` / `open()`. This wires it up. **The owner's design, not mine:**
+manual open/close buttons with the door's state shown, automation that only ever
+*opens*, and closing handled by a late-night schedule instead of by departure.
+
+That is better than proximity-based closing: at 22:00 the owner is home and
+awake, and an open door is an anomaly rather than a transient.
+
+**Files:**
+- Modify: `collector.py`, `solar.py` (config + state columns), `solar_routes.py`,
+  `static/setup.{html,js}`, `static/car.{html,js}`, `demo.py`
+- Test: `tests/test_garage.py` (extend), `tests/test_collector_solar.py` (extend)
+
+### THE CLOSE PATH — read before writing any of it
+
+**Verified against the firmware source: there is no API route to a warned
+close.** `/setgdo`'s `garageDoorState=0` calls `close_door()` immediately.
+`cfg_TTCseconds` / `cfg_TTClight` / `cfg_TTCsound` are settings only; TTC is
+triggered by the firmware's internal logic and is not reachable over HTTP.
+
+Unattended closing is exactly the case UL 325 / 16 CFR 1211 want a ≥5 s audible
+and visual warning for. We cannot produce the audible one. So:
+
+1. **The obstruction beam is the real protection**, and it is wired
+   (`pinBasedObst: true`). A closing door that breaks it reverses. Every other
+   measure here is about giving a person time to react, not about stopping the
+   door.
+2. **Approximate the visual warning with what the API does expose:** turn the
+   garage light on (`garageLightOn=1`), wait `close_warn_s` (default 8), then
+   **re-read status** and abort if the door is no longer `Open` or if
+   `garageObstructed` has become true. A second look after the delay is worth
+   more than the first one.
+3. **Never close when `garageObstructed` is true**, before or after the wait.
+4. **Log every scheduled close with its full reasoning**, so an unexplained
+   closed door in the morning is traceable.
+5. If the owner prefers, the ratgdo's own auto-close (configured in its web UI)
+   gives a fully compliant warned close on an open-duration timer. Say so in the
+   setup page next to this setting — it is the safer option and the owner should
+   know it exists.
+
+### Config (add to `solar_config`, via `solar.migrate_state`'s pattern)
+
+`garage_url TEXT`, `garage_auto_open INTEGER DEFAULT 0`,
+`garage_ring_m INTEGER DEFAULT 800`, `garage_close_hour INTEGER` (NULL = off),
+`garage_close_warn_s INTEGER DEFAULT 8`.
+State: `garage_armed INTEGER DEFAULT 0`, `garage_last_close_day TEXT`.
+
+**`CREATE TABLE IF NOT EXISTS` is a no-op against the existing live tables** —
+use the migration helper. A column added without it crashes `load_config()` on
+the first tick. That defect has already been caught once on this project.
+
+### The async seam — flagged by the previous implementer
+
+`garage.status()` and `garage.open()` are **synchronous** (`httpx.Client`), and
+`collector.py`'s drive path is fully async. Call them via `asyncio.to_thread`.
+A sibling module made exactly this mistake with a blocking socket and its review
+caught it; do not repeat it. Add `garage.close()` in the same synchronous style
+for consistency.
+
+- [ ] **Step 1: Manual controls and state on the car page**
+
+`GET /api/car/garage` → the door state, obstruction, and light, or
+`{"reachable": false}` when `status()` returns `None`. `POST /api/car/garage/open`
+and `/close` for the buttons. The card shows the live state and two buttons.
+**The buttons are manual and the owner is present, so they act immediately** —
+the warning discipline above applies to the *scheduled* close, not to a button
+the owner just pressed.
+
+Render an unreachable device as unreachable. Never show a stale state as current.
+
+- [ ] **Step 2: Auto-open on arrival, in the collector**
+
+On the drive path, when `garage_auto_open` and a home and URL are configured:
+compute ring membership with the existing haversine against `garage_ring_m`,
+load the persisted latch, call the already-tested `garage.should_open(...)`, and
+on true call `garage.open()` — then **re-read status and log what the door
+actually did**. Arm the latch on leaving the ring; disarm on firing.
+
+Ring radius is deliberately separate from the charging geofence: metres-tight
+for "is it parked at home", hundreds of metres for "it is arriving".
+
+- [ ] **Step 3: The scheduled close**
+
+Once per tick, when `garage_close_hour` is set: if the local hour equals it and
+`garage_last_close_day` is not today, run the close sequence in §THE CLOSE PATH
+and stamp the day. Once per day, whatever happens — a failed close must not
+retry in a loop against a door that may be obstructed.
+
+Do it whether or not the car is home: an open garage with the car gone is worse
+than one with the car in it.
+
+- [ ] **Step 4: Setup page**
+
+URL, a "Test connection" button that only ever *reads* status, auto-open toggle
+(default off), ring radius, close hour (blank = off), warn seconds. Next to the
+close hour, the note from point 5 above about the ratgdo's own compliant
+auto-close.
+
+- [ ] **Step 5: Tests, full suite, commit**
+
+Cover: the scheduled close firing once per day and not again; aborting when
+obstruction appears during the warning window; aborting when the door is no
+longer open; the unreachable-device path; and the arrival latch across a
+simulated drive out and back.
