@@ -8,6 +8,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+import garage
 import solar_routes
 
 
@@ -180,3 +181,184 @@ def test_demo_status_returns_the_fixture_not_real_data(client):
     assert body["surplus_w"] == 6240.0
     assert body["raised_to"] == 90 and body["original_limit"] == 80
     assert body["grace_import_wh_today"] == 41.3
+
+
+# --------------------------------------------------------------------------
+# Task 17b -- garage HTTP surface. garage.status()/open()/close() are always
+# monkeypatched here: nothing in this file may ever perform a real network
+# call, so there is no path by which these tests could reach the owner's
+# actual garage door.
+# --------------------------------------------------------------------------
+
+def test_garage_config_defaults(client, monkeypatch):
+    monkeypatch.setattr(solar_routes, "DEMO", False)
+    cfg = client.get("/api/car/garage/config").json()
+    assert cfg == {
+        "garage_url": None, "garage_auto_open": 0, "garage_ring_m": 800,
+        "garage_close_hour": None, "garage_close_warn_s": 8,
+    }
+
+
+def test_garage_config_round_trips_and_survives_a_later_unrelated_put(client, monkeypatch):
+    monkeypatch.setattr(solar_routes, "DEMO", False)
+    client.put("/api/car/garage/config", json={
+        "garage_url": "http://192.168.87.78", "garage_auto_open": 1,
+    })
+    client.put("/api/car/garage/config", json={"garage_ring_m": 400})
+    cfg = client.get("/api/car/garage/config").json()
+    assert cfg["garage_url"] == "http://192.168.87.78"
+    assert cfg["garage_auto_open"] == 1, "second PUT reverted the first"
+    assert cfg["garage_ring_m"] == 400
+
+
+def test_garage_config_accepts_an_explicit_null_close_hour(client, monkeypatch):
+    monkeypatch.setattr(solar_routes, "DEMO", False)
+    client.put("/api/car/garage/config", json={"garage_close_hour": 22})
+    r = client.put("/api/car/garage/config", json={"garage_close_hour": None})
+    assert r.status_code == 200
+    assert client.get("/api/car/garage/config").json()["garage_close_hour"] is None
+
+
+def test_garage_config_clearing_the_url_with_an_empty_string_stores_null(client, monkeypatch):
+    monkeypatch.setattr(solar_routes, "DEMO", False)
+    client.put("/api/car/garage/config", json={"garage_url": "http://192.168.87.78"})
+    client.put("/api/car/garage/config", json={"garage_url": ""})
+    assert client.get("/api/car/garage/config").json()["garage_url"] is None
+
+
+def test_garage_config_rejects_unknown_fields(client):
+    assert client.put("/api/car/garage/config", json={"nonsense": 1}).status_code == 400
+
+
+@pytest.mark.parametrize("field,value", [
+    ("garage_url", "ftp://not-http"),
+    ("garage_auto_open", 2),
+    ("garage_ring_m", 10),
+    ("garage_ring_m", 100_000),
+    ("garage_close_hour", 24),
+    ("garage_close_hour", -1),
+    ("garage_close_warn_s", 1),
+    ("garage_close_warn_s", 1000),
+])
+def test_garage_config_rejects_out_of_range_values(client, field, value):
+    assert client.put("/api/car/garage/config", json={field: value}).status_code == 400
+
+
+def test_get_garage_reports_unreachable_when_not_configured(client, monkeypatch):
+    monkeypatch.setattr(solar_routes, "DEMO", False)
+    body = client.get("/api/car/garage").json()
+    assert body == {"reachable": False}
+
+
+def test_get_garage_returns_the_live_reading_when_configured(client, monkeypatch):
+    monkeypatch.setattr(solar_routes, "DEMO", False)
+    client.put("/api/car/garage/config", json={"garage_url": "http://192.168.87.78"})
+
+    seen = {}
+    def fake_status(url):
+        seen["url"] = url
+        return {"garageDoorState": "Closed", "garageObstructed": False, "garageLightOn": True}
+    monkeypatch.setattr(garage, "status", fake_status)
+
+    body = client.get("/api/car/garage").json()
+    assert seen["url"] == "http://192.168.87.78"
+    assert body == {"reachable": True, "door_state": "Closed",
+                    "obstructed": False, "light_on": True}
+
+
+def test_get_garage_reports_unreachable_when_status_returns_none(client, monkeypatch):
+    monkeypatch.setattr(solar_routes, "DEMO", False)
+    client.put("/api/car/garage/config", json={"garage_url": "http://192.168.87.78"})
+    monkeypatch.setattr(garage, "status", lambda url: None)
+
+    body = client.get("/api/car/garage").json()
+    assert body == {"reachable": False}, "never show a stale state as current"
+
+
+def test_post_garage_open_requires_a_configured_url(client, monkeypatch):
+    monkeypatch.setattr(solar_routes, "DEMO", False)
+    r = client.post("/api/car/garage/open")
+    assert r.status_code == 400
+
+
+def test_post_garage_open_commands_and_returns_the_fresh_reading(client, monkeypatch):
+    monkeypatch.setattr(solar_routes, "DEMO", False)
+    client.put("/api/car/garage/config", json={"garage_url": "http://192.168.87.78"})
+
+    calls = []
+    monkeypatch.setattr(garage, "open", lambda url: calls.append(url) or True)
+    monkeypatch.setattr(garage, "status",
+                        lambda url: {"garageDoorState": "Open", "garageObstructed": False,
+                                     "garageLightOn": False})
+
+    r = client.post("/api/car/garage/open")
+    assert r.status_code == 200
+    assert calls == ["http://192.168.87.78"]
+    assert r.json() == {"ok": True, "reachable": True, "door_state": "Open",
+                        "obstructed": False, "light_on": False}
+
+
+def test_post_garage_close_requires_a_configured_url(client, monkeypatch):
+    monkeypatch.setattr(solar_routes, "DEMO", False)
+    assert client.post("/api/car/garage/close").status_code == 400
+
+
+def test_post_garage_close_commands_and_returns_the_fresh_reading(client, monkeypatch):
+    """The button is manual -- the owner is present -- so this must call
+    garage.close() directly with no warning wait, unlike the scheduled
+    close."""
+    monkeypatch.setattr(solar_routes, "DEMO", False)
+    client.put("/api/car/garage/config", json={"garage_url": "http://192.168.87.78"})
+
+    calls = []
+    monkeypatch.setattr(garage, "close", lambda url: calls.append(url) or True)
+    monkeypatch.setattr(garage, "status",
+                        lambda url: {"garageDoorState": "Closed", "garageObstructed": False,
+                                     "garageLightOn": False})
+
+    r = client.post("/api/car/garage/close")
+    assert r.status_code == 200
+    assert calls == ["http://192.168.87.78"]
+    assert r.json()["door_state"] == "Closed"
+
+
+def test_post_garage_test_requires_a_url(client):
+    assert client.post("/api/car/garage/test", json={}).status_code == 400
+
+
+def test_post_garage_test_reads_whatever_url_is_given_saved_or_not(client, monkeypatch):
+    """The setup page's Test connection button: read-only, and must work
+    against a URL that has not been saved to config yet."""
+    seen = {}
+    def fake_status(url):
+        seen["url"] = url
+        return {"garageDoorState": "Open", "garageObstructed": True, "garageLightOn": False}
+    monkeypatch.setattr(garage, "status", fake_status)
+
+    r = client.post("/api/car/garage/test", json={"url": "http://10.0.0.5"})
+    assert seen["url"] == "http://10.0.0.5"
+    assert r.json() == {"reachable": True, "door_state": "Open",
+                        "obstructed": True, "light_on": False}
+
+
+def test_post_garage_test_reports_unreachable_rather_than_raising(client, monkeypatch):
+    monkeypatch.setattr(garage, "status", lambda url: None)
+    r = client.post("/api/car/garage/test", json={"url": "http://10.0.0.5"})
+    assert r.status_code == 200
+    assert r.json() == {"reachable": False}
+
+
+def test_demo_garage_endpoints_never_touch_the_real_device(client, monkeypatch):
+    """DEMO=1 is the default in this whole suite (see conftest.py). GET
+    /garage, and the open/close buttons, must all short-circuit to the
+    fixture rather than ever calling garage.status/open/close -- a boom
+    stand-in on each proves it."""
+    def boom(*a, **k):
+        raise AssertionError("DEMO must never touch the real device")
+    monkeypatch.setattr(garage, "status", boom)
+    monkeypatch.setattr(garage, "open", boom)
+    monkeypatch.setattr(garage, "close", boom)
+
+    assert client.get("/api/car/garage").json()["reachable"] is True
+    assert client.post("/api/car/garage/open").json()["ok"] is True
+    assert client.post("/api/car/garage/close").json()["ok"] is True

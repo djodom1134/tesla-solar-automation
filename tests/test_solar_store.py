@@ -21,6 +21,37 @@ def test_config_defaults_exist_before_anything_is_written():
     assert cfg["daily_request_cap"] == 400
 
 
+def test_garage_config_defaults():
+    """Task 17b: garage_auto_open and garage_close_hour both ship OFF --
+    automation must be opt-in, and the close schedule is disabled (NULL)
+    until the owner sets an hour."""
+    cfg = solar.load_config(db())
+    assert cfg["garage_url"] is None
+    assert cfg["garage_auto_open"] == 0
+    assert cfg["garage_ring_m"] == 800
+    assert cfg["garage_close_hour"] is None
+    assert cfg["garage_close_warn_s"] == 8
+
+
+def test_garage_state_defaults():
+    st = solar.load_state(db(), "V1")
+    assert st["garage_armed"] == 0
+    assert st["garage_last_close_day"] is None
+
+
+def test_garage_config_round_trips():
+    conn = db()
+    solar.save_config(conn, garage_url="http://192.168.1.50", garage_auto_open=1,
+                      garage_ring_m=500, garage_close_hour=22, garage_close_warn_s=10)
+    cfg = solar.load_config(conn)
+    assert cfg["garage_url"] == "http://192.168.1.50"
+    assert cfg["garage_auto_open"] == 1
+    assert cfg["garage_ring_m"] == 500
+    assert cfg["garage_close_hour"] == 22
+    assert cfg["garage_close_warn_s"] == 10
+    assert cfg["soc_ceiling"] == 90, "untouched field should still be default"
+
+
 def test_config_partial_update_leaves_other_fields_alone():
     conn = db()
     solar.save_config(conn, enabled=1, soc_ceiling=100)

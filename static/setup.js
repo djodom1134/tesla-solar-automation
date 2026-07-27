@@ -114,6 +114,56 @@ $("save-solar").addEventListener("click", async () => {
   }
 });
 
+async function loadGarage() {
+  const c = await api("/api/car/garage/config");
+  $("garage-url").value = c.garage_url || "";
+  $("garage-auto-open").checked = !!c.garage_auto_open;
+  $("garage-ring").value = c.garage_ring_m;
+  $("garage-close-hour").value = c.garage_close_hour === null ? "" : c.garage_close_hour;
+  $("garage-warn").value = c.garage_close_warn_s;
+}
+
+$("garage-test").addEventListener("click", async () => {
+  const msg = $("garage-test-msg");
+  const url = $("garage-url").value.trim();
+  if (!url) { flash(msg, "Enter a URL first", false); return; }
+  try {
+    // Read-only: this only ever GETs /status.json, never a command.
+    const r = await api("/api/car/garage/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url }),
+    });
+    if (r.reachable) {
+      flash(msg, `Reachable — door is ${r.door_state}${r.obstructed ? " (obstructed)" : ""}`, true);
+    } else {
+      flash(msg, "Could not reach the device at that URL", false);
+    }
+  } catch (err) {
+    flash(msg, err.message, false);
+  }
+});
+
+$("save-garage").addEventListener("click", async () => {
+  try {
+    await api("/api/car/garage/config", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        garage_url: $("garage-url").value.trim() || null,
+        garage_auto_open: $("garage-auto-open").checked ? 1 : 0,
+        garage_ring_m: Number($("garage-ring").value),
+        garage_close_hour: $("garage-close-hour").value === ""
+          ? null : Number($("garage-close-hour").value),
+        garage_close_warn_s: Number($("garage-warn").value),
+      }),
+    });
+    flash($("garage-msg"), "Saved", true);
+  } catch (err) {
+    flash($("garage-msg"), err.message, false);
+  }
+});
+
 $("save-deadline").addEventListener("click", async () => {
   try {
     const soc = $("dsoc").value === "" ? null : Number($("dsoc").value);
@@ -138,6 +188,7 @@ $("save-deadline").addEventListener("click", async () => {
   // defaults over the owner's real settings.
   let homeOk = true;
   let solarOk = true;
+  let garageOk = true;
   try {
     await loadHome();
   } catch (err) {
@@ -150,11 +201,18 @@ $("save-deadline").addEventListener("click", async () => {
     console.error(err);
     solarOk = false;
   }
+  try {
+    await loadGarage();
+  } catch (err) {
+    console.error(err);
+    garageOk = false;
+  }
 
-  if (!homeOk || !solarOk) {
+  if (!homeOk || !solarOk || !garageOk) {
     const parts = [];
     if (!homeOk) parts.push("home");
     if (!solarOk) parts.push("solar charging");
+    if (!garageOk) parts.push("garage");
     const banner = $("setup-error");
     if (banner) {
       banner.textContent =
@@ -170,5 +228,6 @@ $("save-deadline").addEventListener("click", async () => {
       $("save-solar").disabled = true;
       $("save-deadline").disabled = true;
     }
+    if (!garageOk) $("save-garage").disabled = true;
   }
 })();

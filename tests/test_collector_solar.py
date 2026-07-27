@@ -921,3 +921,427 @@ async def test_429_honours_a_supplied_retry_after_over_the_exponential_fallback(
         f"a server-supplied Retry-After must win over the exponential "
         f"formula's 240s: {sleeps}")
     assert sleeps[1] == 120, "must return to the normal cadence once it clears"
+
+
+# --------------------------------------------------------------------------
+# Task 17b -- garage_arrival_tick: the one-shot arrival latch. should_open()
+# itself is already exhaustively covered in test_garage.py; these tests are
+# about the collector's own job -- computing ring membership, persisting the
+# latch, and never touching the device when it shouldn't.
+# --------------------------------------------------------------------------
+
+from datetime import datetime               # noqa: E402  (grouped with the section it serves)
+from zoneinfo import ZoneInfo               # noqa: E402
+
+import garage                               # noqa: E402
+
+TZ = "America/Denver"
+
+
+def _closed_status(url):
+    return {"garageDoorState": "Closed", "garageObstructed": False}
+
+
+@pytest.mark.asyncio
+async def test_garage_arrival_tick_arms_outside_and_fires_exactly_once_on_the_way_back_in(
+    tmp_path, monkeypatch,
+):
+    """The simulated drive-out-and-back the brief asks for: outside the ring
+    arms the latch, crossing back in while driving fires it once, and a
+    further tick with the latch already spent must not re-fire."""
+    store_ = Store(tmp_path / "car.db")
+    db = store_._db
+    home.save(db, 40.0, -105.0, 100)
+    solar.save_config(db, garage_url="http://fake-ratgdo", garage_auto_open=1,
+                      garage_ring_m=500)
+
+    calls = {"open": 0}
+    monkeypatch.setattr(garage, "status", _closed_status)
+    monkeypatch.setattr(garage, "open", lambda url: calls.__setitem__("open", calls["open"] + 1) or True)
+
+    cfg = solar.load_config(db)
+
+    away_view = {"lat": 41.0, "lon": -105.0, "shift": "D"}   # ~111 km out -- well outside 500 m
+    await collector.garage_arrival_tick(db, "VIN1", away_view, cfg, home.load(db))
+    assert solar.load_state(db, "VIN1")["garage_armed"] == 1, "must arm on leaving the ring"
+    assert calls["open"] == 0
+
+    home_view = {"lat": 40.0, "lon": -105.0, "shift": "D"}   # back at the home coordinate
+    await collector.garage_arrival_tick(db, "VIN1", home_view, cfg, home.load(db))
+    assert calls["open"] == 1, "must fire on the transition back in"
+    assert solar.load_state(db, "VIN1")["garage_armed"] == 0, "must disarm on firing"
+
+    await collector.garage_arrival_tick(db, "VIN1", home_view, cfg, home.load(db))
+    assert calls["open"] == 1, "must not re-fire while disarmed"
+    store_.close()
+
+
+@pytest.mark.asyncio
+async def test_garage_arrival_tick_never_fires_without_first_confirming_departure(
+    tmp_path, monkeypatch,
+):
+    """A car that has always been inside the ring (never observed leaving)
+    must never trigger an open, however many ticks pass -- mere presence is
+    not arrival."""
+    store_ = Store(tmp_path / "car.db")
+    db = store_._db
+    home.save(db, 40.0, -105.0, 100)
+    solar.save_config(db, garage_url="http://fake-ratgdo", garage_auto_open=1,
+                      garage_ring_m=500)
+
+    def boom(url):
+        raise AssertionError("must never open without first confirming departure")
+    monkeypatch.setattr(garage, "status", _closed_status)
+    monkeypatch.setattr(garage, "open", boom)
+
+    cfg = solar.load_config(db)
+    view = {"lat": 40.0, "lon": -105.0, "shift": "D"}
+    for _ in range(3):
+        await collector.garage_arrival_tick(db, "VIN1", view, cfg, home.load(db))
+    assert solar.load_state(db, "VIN1")["garage_armed"] == 0
+    store_.close()
+
+
+@pytest.mark.asyncio
+async def test_garage_arrival_tick_noop_when_auto_open_disabled(tmp_path, monkeypatch):
+    store_ = Store(tmp_path / "car.db")
+    db = store_._db
+    home.save(db, 40.0, -105.0, 100)
+    solar.save_config(db, garage_url="http://fake-ratgdo", garage_auto_open=0,
+                      garage_ring_m=500)
+
+    def boom(url):
+        raise AssertionError("must never touch the device when auto-open is off")
+    monkeypatch.setattr(garage, "status", boom)
+    monkeypatch.setattr(garage, "open", boom)
+
+    cfg = solar.load_config(db)
+    view = {"lat": 41.0, "lon": -105.0, "shift": "D"}
+    await collector.garage_arrival_tick(db, "VIN1", view, cfg, home.load(db))
+    assert solar.load_state(db, "VIN1")["garage_armed"] == 0, "must not even arm when disabled"
+    store_.close()
+
+
+@pytest.mark.asyncio
+async def test_garage_arrival_tick_freezes_on_unknown_location(tmp_path, monkeypatch):
+    store_ = Store(tmp_path / "car.db")
+    db = store_._db
+    home.save(db, 40.0, -105.0, 100)
+    solar.save_config(db, garage_url="http://fake-ratgdo", garage_auto_open=1,
+                      garage_ring_m=500)
+
+    def boom(url):
+        raise AssertionError("must never touch the device with no location")
+    monkeypatch.setattr(garage, "status", boom)
+    monkeypatch.setattr(garage, "open", boom)
+
+    cfg = solar.load_config(db)
+    view = {"lat": None, "lon": None, "shift": "D"}
+    await collector.garage_arrival_tick(db, "VIN1", view, cfg, home.load(db))
+    assert solar.load_state(db, "VIN1")["garage_armed"] == 0
+    store_.close()
+
+
+@pytest.mark.asyncio
+async def test_garage_arrival_tick_treats_an_unreachable_device_as_not_closed(
+    tmp_path, monkeypatch,
+):
+    """status() returning None must fail closed through should_open()'s own
+    None handling, not through any special case here -- and, having never
+    fired, the latch must stay armed for the next tick to retry."""
+    store_ = Store(tmp_path / "car.db")
+    db = store_._db
+    home.save(db, 40.0, -105.0, 100)
+    solar.save_config(db, garage_url="http://fake-ratgdo", garage_auto_open=1,
+                      garage_ring_m=500)
+    solar.save_state(db, "VIN1", garage_armed=1)  # already armed, as if just departed
+
+    def boom(url):
+        raise AssertionError("must never open when status is unreachable")
+    monkeypatch.setattr(garage, "status", lambda url: None)
+    monkeypatch.setattr(garage, "open", boom)
+
+    cfg = solar.load_config(db)
+    view = {"lat": 40.0, "lon": -105.0, "shift": "D"}
+    await collector.garage_arrival_tick(db, "VIN1", view, cfg, home.load(db))
+    assert solar.load_state(db, "VIN1")["garage_armed"] == 1, "must stay armed -- never fired"
+    store_.close()
+
+
+# --------------------------------------------------------------------------
+# Task 17b -- garage_scheduled_close_tick: the only path that ever closes the
+# door automatically. safe_to_close() itself is unit-tested in
+# test_garage.py; these tests are about the collector's orchestration --
+# once-per-day, the two-read warning sequence, and never closing on a stale
+# or missing read.
+# --------------------------------------------------------------------------
+
+def _this_hour() -> int:
+    return datetime.now(ZoneInfo(TZ)).hour
+
+
+def _today() -> str:
+    return datetime.now(ZoneInfo(TZ)).strftime("%Y-%m-%d")
+
+
+async def _fake_sleep(_seconds) -> None:
+    """A real coroutine standing in for asyncio.sleep -- `await` requires an
+    actual awaitable, so a plain lambda returning None will not do."""
+
+
+@pytest.mark.asyncio
+async def test_garage_scheduled_close_fires_once_and_not_again_the_same_day(
+    tmp_path, monkeypatch,
+):
+    store_ = Store(tmp_path / "car.db")
+    db = store_._db
+    solar.save_config(db, garage_url="http://fake-ratgdo",
+                      garage_close_hour=_this_hour(), garage_close_warn_s=8)
+
+    readings = iter([
+        {"garageDoorState": "Open", "garageObstructed": False},  # pre-check
+        {"garageDoorState": "Open", "garageObstructed": False},  # post-wait
+    ])
+    monkeypatch.setattr(garage, "status",
+                        lambda url: next(readings, {"garageDoorState": "Closed", "garageObstructed": False}))
+    monkeypatch.setattr(garage, "light_on", lambda url: True)
+    close_calls = []
+    monkeypatch.setattr(garage, "close", lambda url: close_calls.append(url) or True)
+
+    sleeps = []
+    async def fake_sleep(s):
+        sleeps.append(s)
+    monkeypatch.setattr(collector.asyncio, "sleep", fake_sleep)
+
+    cfg = solar.load_config(db)
+    await collector.garage_scheduled_close_tick(db, "VIN1", cfg, TZ)
+    assert close_calls == ["http://fake-ratgdo"]
+    assert sleeps == [8], "must wait garage_close_warn_s before the second read"
+
+    # Same hour, same day, ticked again -- must not close a second time.
+    await collector.garage_scheduled_close_tick(db, "VIN1", cfg, TZ)
+    assert close_calls == ["http://fake-ratgdo"], "must fire at most once per day"
+    assert solar.load_state(db, "VIN1")["garage_last_close_day"] == _today()
+    store_.close()
+
+
+@pytest.mark.asyncio
+async def test_garage_scheduled_close_aborts_when_obstruction_appears_during_the_wait(
+    tmp_path, monkeypatch,
+):
+    """The whole reason for the second read: the door was clear when the
+    light came on, then something entered the doorway during the wait."""
+    store_ = Store(tmp_path / "car.db")
+    db = store_._db
+    solar.save_config(db, garage_url="http://fake-ratgdo",
+                      garage_close_hour=_this_hour(), garage_close_warn_s=8)
+
+    readings = iter([
+        {"garageDoorState": "Open", "garageObstructed": False},
+        {"garageDoorState": "Open", "garageObstructed": True},
+    ])
+    monkeypatch.setattr(garage, "status", lambda url: next(readings))
+    monkeypatch.setattr(garage, "light_on", lambda url: True)
+
+    def boom(url):
+        raise AssertionError("must never close an obstructed door")
+    monkeypatch.setattr(garage, "close", boom)
+    monkeypatch.setattr(collector.asyncio, "sleep", _fake_sleep)
+
+    cfg = solar.load_config(db)
+    await collector.garage_scheduled_close_tick(db, "VIN1", cfg, TZ)
+    assert solar.load_state(db, "VIN1")["garage_last_close_day"] == _today(), (
+        "must still stamp the day even when it aborts")
+    store_.close()
+
+
+@pytest.mark.asyncio
+async def test_garage_scheduled_close_aborts_when_door_no_longer_open_after_the_wait(
+    tmp_path, monkeypatch,
+):
+    """Someone (or something else entirely) closed it during the wait."""
+    store_ = Store(tmp_path / "car.db")
+    db = store_._db
+    solar.save_config(db, garage_url="http://fake-ratgdo",
+                      garage_close_hour=_this_hour(), garage_close_warn_s=8)
+
+    readings = iter([
+        {"garageDoorState": "Open", "garageObstructed": False},
+        {"garageDoorState": "Closed", "garageObstructed": False},
+    ])
+    monkeypatch.setattr(garage, "status", lambda url: next(readings))
+    monkeypatch.setattr(garage, "light_on", lambda url: True)
+
+    def boom(url):
+        raise AssertionError("must never close a door that is no longer Open")
+    monkeypatch.setattr(garage, "close", boom)
+    monkeypatch.setattr(collector.asyncio, "sleep", _fake_sleep)
+
+    cfg = solar.load_config(db)
+    await collector.garage_scheduled_close_tick(db, "VIN1", cfg, TZ)
+    store_.close()
+
+
+@pytest.mark.asyncio
+async def test_garage_scheduled_close_skips_when_the_door_was_never_open(tmp_path, monkeypatch):
+    store_ = Store(tmp_path / "car.db")
+    db = store_._db
+    solar.save_config(db, garage_url="http://fake-ratgdo", garage_close_hour=_this_hour())
+
+    monkeypatch.setattr(garage, "status", _closed_status)
+
+    def boom(url):
+        raise AssertionError("must never warn or close a door that was never open")
+    monkeypatch.setattr(garage, "light_on", boom)
+    monkeypatch.setattr(garage, "close", boom)
+
+    cfg = solar.load_config(db)
+    await collector.garage_scheduled_close_tick(db, "VIN1", cfg, TZ)
+    assert solar.load_state(db, "VIN1")["garage_last_close_day"] == _today(), (
+        "must still stamp the day so a closed door does not get re-checked all hour"
+    )
+    store_.close()
+
+
+@pytest.mark.asyncio
+async def test_garage_scheduled_close_skips_when_the_device_is_unreachable_up_front(
+    tmp_path, monkeypatch,
+):
+    store_ = Store(tmp_path / "car.db")
+    db = store_._db
+    solar.save_config(db, garage_url="http://fake-ratgdo", garage_close_hour=_this_hour())
+
+    monkeypatch.setattr(garage, "status", lambda url: None)
+
+    def boom(url):
+        raise AssertionError("must never warn or close when the first read fails")
+    monkeypatch.setattr(garage, "light_on", boom)
+    monkeypatch.setattr(garage, "close", boom)
+
+    cfg = solar.load_config(db)
+    await collector.garage_scheduled_close_tick(db, "VIN1", cfg, TZ)
+    assert solar.load_state(db, "VIN1")["garage_last_close_day"] == _today()
+    store_.close()
+
+
+@pytest.mark.asyncio
+async def test_garage_scheduled_close_aborts_when_the_device_goes_unreachable_during_the_wait(
+    tmp_path, monkeypatch,
+):
+    store_ = Store(tmp_path / "car.db")
+    db = store_._db
+    solar.save_config(db, garage_url="http://fake-ratgdo",
+                      garage_close_hour=_this_hour(), garage_close_warn_s=8)
+
+    readings = iter([{"garageDoorState": "Open", "garageObstructed": False}, None])
+    monkeypatch.setattr(garage, "status", lambda url: next(readings))
+    monkeypatch.setattr(garage, "light_on", lambda url: True)
+
+    def boom(url):
+        raise AssertionError("must never close on an unreadable post-wait status")
+    monkeypatch.setattr(garage, "close", boom)
+    monkeypatch.setattr(collector.asyncio, "sleep", _fake_sleep)
+
+    cfg = solar.load_config(db)
+    await collector.garage_scheduled_close_tick(db, "VIN1", cfg, TZ)
+    store_.close()
+
+
+@pytest.mark.asyncio
+async def test_garage_scheduled_close_noop_outside_the_configured_hour(tmp_path, monkeypatch):
+    store_ = Store(tmp_path / "car.db")
+    db = store_._db
+    other_hour = (_this_hour() + 12) % 24
+    solar.save_config(db, garage_url="http://fake-ratgdo", garage_close_hour=other_hour)
+
+    def boom(*a, **k):
+        raise AssertionError("must never touch the device outside the configured hour")
+    monkeypatch.setattr(garage, "status", boom)
+
+    cfg = solar.load_config(db)
+    await collector.garage_scheduled_close_tick(db, "VIN1", cfg, TZ)
+    assert solar.load_state(db, "VIN1")["garage_last_close_day"] is None
+    store_.close()
+
+
+@pytest.mark.asyncio
+async def test_garage_scheduled_close_noop_when_hour_is_unset(tmp_path, monkeypatch):
+    """garage_close_hour defaults to NULL -- the schedule is off until the
+    owner sets one, same convention as deadline_hour."""
+    store_ = Store(tmp_path / "car.db")
+    db = store_._db
+    solar.save_config(db, garage_url="http://fake-ratgdo")
+
+    def boom(*a, **k):
+        raise AssertionError("must never touch the device with no close hour set")
+    monkeypatch.setattr(garage, "status", boom)
+
+    cfg = solar.load_config(db)
+    await collector.garage_scheduled_close_tick(db, "VIN1", cfg, TZ)
+    store_.close()
+
+
+@pytest.mark.asyncio
+async def test_garage_scheduled_close_stamps_the_day_before_attempting_anything(
+    tmp_path, monkeypatch,
+):
+    """Stamp first, act second: a crash mid-sequence must not leave the door
+    retrying against a possibly-obstructed door for the rest of the day,
+    including across a process restart."""
+    store_ = Store(tmp_path / "car.db")
+    db = store_._db
+    solar.save_config(db, garage_url="http://fake-ratgdo", garage_close_hour=_this_hour())
+
+    def boom(url):
+        raise RuntimeError("simulated crash mid-sequence")
+    monkeypatch.setattr(garage, "status", boom)
+
+    cfg = solar.load_config(db)
+    with pytest.raises(RuntimeError):
+        await collector.garage_scheduled_close_tick(db, "VIN1", cfg, TZ)
+
+    assert solar.load_state(db, "VIN1")["garage_last_close_day"] == _today()
+    store_.close()
+
+
+# --------------------------------------------------------------------------
+# Task 17b wiring proof -- both garage ticks must actually be called from
+# inside run(), every iteration, independent of solar. Mirrors the existing
+# call-count style used for recover()'s startup latch above.
+# --------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_run_calls_both_garage_ticks_every_iteration(tmp_path, monkeypatch):
+    db_path = tmp_path / "car.db"
+    seed = Store(db_path)
+    seed.close()
+
+    monkeypatch.setattr(collector.settings, "db_file", db_path)
+    monkeypatch.setattr(collector, "TeslaClient", lambda settings: _HomeChargingClient())
+
+    arrival_calls: list[int] = []
+    close_calls: list[int] = []
+
+    async def fake_arrival(db, vin, view, cfg, home_cfg):
+        arrival_calls.append(1)
+
+    async def fake_close(db, vin, cfg, tz):
+        close_calls.append(1)
+
+    monkeypatch.setattr(collector, "garage_arrival_tick", fake_arrival)
+    monkeypatch.setattr(collector, "garage_scheduled_close_tick", fake_close)
+
+    sleep_count = 0
+
+    async def fake_sleep(seconds):
+        nonlocal sleep_count
+        sleep_count += 1
+        if sleep_count >= 3:
+            raise StopTest()
+    monkeypatch.setattr(collector.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(StopTest):
+        await collector.run()
+
+    assert len(close_calls) == 3, "the scheduled-close check must run every tick"
+    assert len(arrival_calls) == 3, "the arrival check must run whenever a view exists"

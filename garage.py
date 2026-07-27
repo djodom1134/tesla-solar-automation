@@ -22,9 +22,33 @@ string, None, a malformed payload, an unreachable device -- means do
 nothing. A firmware update that renames a state must make this feature
 *stop working*, not start guessing at an enum.
 
-OPEN ONLY. There is deliberately no should_close and no close(). Closing is
-the one irreversible direction -- it can trap a person, a pet, or a bicycle
--- and the owner has confirmed open-only.
+ARRIVAL AUTOMATION STAYS OPEN ONLY. should_open() above is the only trigger
+tied to the car's motion, and it only ever opens -- closing on departure or
+proximity was rejected because it is the one irreversible direction and can
+trap a person, a pet, or a bicycle.
+
+CLOSING, ADDED IN TASK 17B, IS DIFFERENT: a manual button press (the owner is
+standing there) or a late-night schedule -- never triggered by the car's
+position. The owner's own design: automation only ever opens, and closing
+happens on a schedule instead of on departure, because at that hour the
+owner is home and awake and an open door is an anomaly rather than a
+transient.
+
+Verified against the firmware source: there is no warned-close route over
+this API. `/setgdo`'s garageDoorState=0 calls close_door() immediately, and
+cfg_TTCseconds / cfg_TTClight / cfg_TTCsound are settings only -- the
+firmware's own time-to-close warning runs from internal logic and is not
+reachable over HTTP. close() below is exactly as blunt as open(): an
+unconditional command, no warning of its own.
+
+The warning discipline that UL 325 / 16 CFR 1211 want for an unattended
+close -- turn the light on, wait, then look again before committing -- lives
+in collector.py, not here, because it needs a clock (asyncio.sleep) that
+this module deliberately does not have. safe_to_close() below is the one
+piece of that sequence pure enough to belong here: it fails closed on
+anything but door_state == "Open" and obstructed is False, the same
+philosophy as should_open()'s exact match on "Closed" -- a firmware rename
+must stop the feature, not make it guess.
 """
 from __future__ import annotations
 
@@ -129,3 +153,67 @@ def open(
         return False
 
     return resp.status_code == 200
+
+
+def close(
+    base_url: str,
+    timeout: float = 4.0,
+    transport: httpx.BaseTransport | None = None,
+) -> bool:
+    """POST garageDoorState=0, form-encoded, to {base_url}/setgdo.
+
+    Exactly as blunt as open() -- see its docstring for the return-value and
+    transport conventions, which are identical here. There is no warned close
+    reachable over this API (see the module docstring): this function closes
+    immediately, the instant it is called. Callers that need the light-on,
+    wait, re-read, abort-on-obstruction discipline must implement it
+    themselves around this call -- collector.py's scheduled close does
+    exactly that. A manual button press is the other caller, and it is
+    correct for that path to call this directly with no wait: the owner is
+    present and just pressed it.
+    """
+    url = f"{base_url.rstrip('/')}/setgdo"
+    try:
+        with httpx.Client(transport=transport, timeout=timeout) as client:
+            resp = client.post(url, data={"garageDoorState": 0})
+    except httpx.HTTPError:
+        return False
+
+    return resp.status_code == 200
+
+
+def light_on(
+    base_url: str,
+    timeout: float = 4.0,
+    transport: httpx.BaseTransport | None = None,
+) -> bool:
+    """POST garageLightOn=1, form-encoded, to {base_url}/setgdo.
+
+    This is the visual half of the warning UL 325 / 16 CFR 1211 want for an
+    unattended close -- the audible half is not producible over this API.
+    Same return-value and transport conventions as open()/close().
+    """
+    url = f"{base_url.rstrip('/')}/setgdo"
+    try:
+        with httpx.Client(transport=transport, timeout=timeout) as client:
+            resp = client.post(url, data={"garageLightOn": 1})
+    except httpx.HTTPError:
+        return False
+
+    return resp.status_code == 200
+
+
+def safe_to_close(door_state, obstructed: bool) -> bool:
+    """Whether a close may proceed (or begin) right now.
+
+    True only when door_state is exactly "Open" -- fail closed on anything
+    else, including a value never observed on the real device, exactly like
+    should_open()'s exact match on "Closed" -- and obstructed is False.
+
+    Called TWICE by collector.py's scheduled close: once before the warning
+    (no point lighting up and waiting on a door that is not open, or is
+    already obstructed) and once after it, on a fresh read. The second call
+    is the one that actually matters -- it is the whole reason the wait
+    exists at all.
+    """
+    return door_state == "Open" and not obstructed

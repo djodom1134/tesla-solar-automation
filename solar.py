@@ -306,6 +306,13 @@ CREATE TABLE IF NOT EXISTS solar_config (
   view_refresh_ticks INTEGER NOT NULL DEFAULT 5,
   deadline_soc      INTEGER,
   deadline_hour     INTEGER,
+  -- Task 17b: the ratgdo garage opener. garage_close_hour is NULL = off, the
+  -- same "absence means disabled" convention as deadline_hour above.
+  garage_url          TEXT,
+  garage_auto_open    INTEGER NOT NULL DEFAULT 0,
+  garage_ring_m       INTEGER NOT NULL DEFAULT 800,
+  garage_close_hour   INTEGER,
+  garage_close_warn_s INTEGER NOT NULL DEFAULT 8,
   updated_at        INTEGER NOT NULL DEFAULT 0
 );
 
@@ -336,6 +343,11 @@ CREATE TABLE IF NOT EXISTS solar_state (
   -- gets these two columns onto the live table.
   consecutive_429s INTEGER NOT NULL DEFAULT 0,
   backoff_s        INTEGER NOT NULL DEFAULT 0,
+  -- Task 17b: the garage arrival latch (armed on leaving the ring, fired --
+  -- and disarmed -- at most once per re-entry) and the once-per-day stamp
+  -- for the scheduled close, same convention as requests_day above.
+  garage_armed          INTEGER NOT NULL DEFAULT 0,
+  garage_last_close_day TEXT,
   updated_at      INTEGER NOT NULL DEFAULT 0
 );
 
@@ -360,6 +372,8 @@ CONFIG_DEFAULTS = {
     "start_hold_s": 60, "raise_hold_s": 600, "soc_ceiling": 90,
     "raise_limit": 1, "daily_request_cap": 400, "view_refresh_ticks": 5,
     "deadline_soc": None, "deadline_hour": None,
+    "garage_url": None, "garage_auto_open": 0, "garage_ring_m": 800,
+    "garage_close_hour": None, "garage_close_warn_s": 8,
 }
 
 STATE_DEFAULTS = {
@@ -370,6 +384,7 @@ STATE_DEFAULTS = {
     "requests_today": 0, "requests_day": None,
     "capped": 0, "engaged_at": None,
     "consecutive_429s": 0, "backoff_s": 0,
+    "garage_armed": 0, "garage_last_close_day": None,
 }
 
 # The Machine fields that must survive between ticks. Anything here that is
@@ -396,6 +411,8 @@ STATE_NEW_COLUMNS = (
     ("raise_hold_elapsed", "INTEGER NOT NULL DEFAULT 0"),
     ("consecutive_429s", "INTEGER NOT NULL DEFAULT 0"),
     ("backoff_s", "INTEGER NOT NULL DEFAULT 0"),
+    ("garage_armed", "INTEGER NOT NULL DEFAULT 0"),
+    ("garage_last_close_day", "TEXT"),
 )
 
 
@@ -405,6 +422,30 @@ def migrate_state(db: sqlite3.Connection) -> None:
     for name, decl in STATE_NEW_COLUMNS:
         if name not in existing:
             db.execute(f"ALTER TABLE solar_state ADD COLUMN {name} {decl}")
+
+
+# Columns added to solar_config AFTER it first shipped -- the first ones ever
+# needed here. Same hazard as STATE_NEW_COLUMNS above: CREATE TABLE IF NOT
+# EXISTS in SCHEMA is a no-op against the owner's live solar_config, which
+# already has rows in it, so a schema edit alone never reaches it.
+# migrate_config() must run once at startup, after SCHEMA is applied, before
+# any load_config or save_config call -- mirrored in store.py right next to
+# migrate_state().
+CONFIG_NEW_COLUMNS = (
+    ("garage_url", "TEXT"),
+    ("garage_auto_open", "INTEGER NOT NULL DEFAULT 0"),
+    ("garage_ring_m", "INTEGER NOT NULL DEFAULT 800"),
+    ("garage_close_hour", "INTEGER"),
+    ("garage_close_warn_s", "INTEGER NOT NULL DEFAULT 8"),
+)
+
+
+def migrate_config(db: sqlite3.Connection) -> None:
+    """Add columns to an EXISTING solar_config table."""
+    existing = {row[1] for row in db.execute("PRAGMA table_info(solar_config)")}
+    for name, decl in CONFIG_NEW_COLUMNS:
+        if name not in existing:
+            db.execute(f"ALTER TABLE solar_config ADD COLUMN {name} {decl}")
 
 
 def _begin_immediate(db: sqlite3.Connection) -> bool:

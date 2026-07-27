@@ -386,6 +386,13 @@ def solar_status() -> dict:
     }
 
 
+def garage_status() -> dict:
+    """A reachable door, closed and clear, so the car page's garage card can
+    be built and dogfooded without real ratgdo hardware."""
+    return {"reachable": True, "door_state": "Closed", "obstructed": False,
+            "light_on": False}
+
+
 def home_config() -> dict:
     return {
         "home": {"latitude": 40.1672, "longitude": -105.1019, "radius_m": 100},

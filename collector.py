@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
+import garage
 import home
 import solar
 import tesla
@@ -406,6 +407,131 @@ def should_refresh_view(ticks_since_view: int, refresh_every: int,
     return wrote_last_tick or ticks_since_view >= refresh_every
 
 
+# --------------------------------------------------------------------------
+# Task 17b: the ratgdo garage opener. Two independent features, both gated on
+# their own config and both no-ops when unconfigured:
+#   * garage_arrival_tick   -- open-only, triggered by the car crossing INTO
+#                              the ring while driving. Runs on the drive path,
+#                              already paid for by poll_driving (spec 1.8/17).
+#   * garage_scheduled_close_tick -- the owner's late-night schedule, the only
+#                              path that ever closes automatically. Runs every
+#                              tick regardless of the car's location -- an
+#                              open garage with the car gone is worse than one
+#                              with the car in it.
+# --------------------------------------------------------------------------
+
+async def garage_arrival_tick(db, vin: str, view: dict, cfg: dict, home_cfg) -> None:
+    """Auto-open on arrival. Pure decision lives in garage.should_open(); this
+    only computes ring membership, loads/saves the one-shot latch, and does
+    the I/O.
+
+    The latch is the ONLY thing persisted across ticks here -- there is no
+    stored "previous ring membership". should_open() is only ever called
+    from the one branch below where the latch is armed AND the car is
+    observed inside the ring, which is exactly the condition the latch
+    exists to detect: armed means "confirmed outside the ring since the last
+    time we fired", so a car found inside the ring while still armed IS the
+    transition being latched for. inside_ring_prev is passed as False for
+    that reason, not because it is tracked position-by-position.
+    """
+    if not cfg["garage_auto_open"] or not cfg["garage_url"] or home_cfg is None:
+        return
+    lat, lon = view.get("lat"), view.get("lon")
+    if lat is None or lon is None:
+        return  # unknown location -- freeze, same as every other consumer of it
+
+    inside_ring = home.distance_m(lat, lon, home_cfg.latitude,
+                                  home_cfg.longitude) <= cfg["garage_ring_m"]
+    st = solar.load_state(db, vin)
+    armed = bool(st["garage_armed"])
+
+    if not inside_ring:
+        if not armed:
+            solar.save_state(db, vin, garage_armed=1)  # arm on leaving the ring
+        return
+
+    if not armed:
+        return  # inside the ring but never confirmed leaving it -- not an arrival
+
+    data = await asyncio.to_thread(garage.status, cfg["garage_url"])
+    door_state = (data or {}).get("garageDoorState")
+    obstructed = bool((data or {}).get("garageObstructed"))
+
+    if not garage.should_open(door_state=door_state, obstructed=obstructed,
+                              armed=armed, inside_ring_now=True,
+                              inside_ring_prev=False, shift=view.get("shift")):
+        return
+
+    opened = await asyncio.to_thread(garage.open, cfg["garage_url"])
+    verify = await asyncio.to_thread(garage.status, cfg["garage_url"])
+    solar.save_state(db, vin, garage_armed=0)  # disarm on firing
+    _log(f"garage auto-open: open()={opened}, door now "
+         f"{(verify or {}).get('garageDoorState', 'unknown')!r}")
+
+
+async def garage_scheduled_close_tick(db, vin: str, cfg: dict, tz: str) -> None:
+    """The owner's late-night schedule -- the only path that ever closes the
+    door automatically. See garage.py's module docstring for why there is no
+    warned close reachable over the ratgdo's own API, and why this sequence
+    (light on, wait, re-read, abort on obstruction or on the door no longer
+    being Open) is what approximates it instead.
+
+    Stamps garage_last_close_day BEFORE attempting anything, not after: "once
+    per day, whatever happens" means a crash mid-sequence, an unreachable
+    device, or a door that was never open must not leave the door retrying
+    against a possibly-obstructed door for the rest of the day, including
+    across a process restart.
+    """
+    close_hour = cfg["garage_close_hour"]
+    url = cfg["garage_url"]
+    if close_hour is None or not url:
+        return
+
+    now = datetime.now(ZoneInfo(tz))
+    if now.hour != close_hour:
+        return
+
+    today = now.strftime("%Y-%m-%d")
+    st = solar.load_state(db, vin)
+    if st["garage_last_close_day"] == today:
+        return
+    solar.save_state(db, vin, garage_last_close_day=today)
+
+    data = await asyncio.to_thread(garage.status, url)
+    if data is None:
+        _log("garage scheduled close: device unreachable, skipping today")
+        return
+    door_state = data.get("garageDoorState")
+    obstructed = bool(data.get("garageObstructed"))
+    if not garage.safe_to_close(door_state, obstructed):
+        _log(f"garage scheduled close: skipping -- door_state={door_state!r} "
+             f"obstructed={obstructed}")
+        return
+
+    warn_s = cfg["garage_close_warn_s"]
+    _log(f"garage scheduled close: door is Open, warning {warn_s}s (light on) "
+         "before re-checking")
+    await asyncio.to_thread(garage.light_on, url)
+    await asyncio.sleep(warn_s)
+
+    data = await asyncio.to_thread(garage.status, url)
+    if data is None:
+        _log("garage scheduled close: device unreachable after the warning "
+             "wait, aborting -- the second look is the whole point")
+        return
+    door_state = data.get("garageDoorState")
+    obstructed = bool(data.get("garageObstructed"))
+    if not garage.safe_to_close(door_state, obstructed):
+        _log(f"garage scheduled close: aborting after the wait -- "
+             f"door_state={door_state!r} obstructed={obstructed}")
+        return
+
+    closed = await asyncio.to_thread(garage.close, url)
+    verify = await asyncio.to_thread(garage.status, url)
+    _log(f"garage scheduled close: close()={closed}, door now "
+         f"{(verify or {}).get('garageDoorState', 'unknown')!r}")
+
+
 async def run(once: bool = False) -> int:
     client = TeslaClient(settings)
     store = Store(settings.db_file)
@@ -465,6 +591,15 @@ async def run(once: bool = False) -> int:
                 # Nothing to retry against; launchd will restart us later.
                 _log(f"auth lost: {exc}")
                 return 1
+
+            # Task 17b: independent of solar entirely -- neither gated on
+            # solar_wanted nor on recovery, and the scheduled close runs
+            # whether or not the car is even reachable this tick (an open
+            # garage with the car gone is worse than one with the car in
+            # it).
+            if view is not None:
+                await garage_arrival_tick(store._db, vin, view, conf, home.load(store._db))
+            await garage_scheduled_close_tick(store._db, vin, conf, settings.timezone)
 
             wrote_last_tick = False
             backoff_s = 0

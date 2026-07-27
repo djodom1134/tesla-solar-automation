@@ -7,6 +7,7 @@ commands and makes the signing proxy's per-VIN mutex a non-issue.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 from datetime import datetime
@@ -16,6 +17,7 @@ from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Body, HTTPException
 
 import demo
+import garage
 import green
 import home
 import solar
@@ -286,3 +288,145 @@ async def get_solar_status() -> dict[str, Any]:
         "requests_today": state["requests_today"] if state["requests_day"] == _today() else 0,
         **_green_status(db, vin),
     }
+
+
+# ---------------------------------------------------------------- garage (Task 17b)
+#
+# Direct LAN calls to the ratgdo, never through the Tesla signing proxy --
+# the "this module never commands the car" invariant above is about the
+# vehicle, not this device. garage.status()/open()/close() are synchronous
+# (httpx.Client); every call here goes through asyncio.to_thread so a slow
+# or unreachable device cannot stall the single-threaded event loop -- the
+# exact mistake a sibling module made with a blocking socket.
+
+GARAGE_CONFIG_FIELDS = ("garage_url", "garage_auto_open", "garage_ring_m",
+                        "garage_close_hour", "garage_close_warn_s")
+
+
+async def _garage_reading(url: str) -> dict[str, Any]:
+    data = await asyncio.to_thread(garage.status, url)
+    if data is None:
+        return {"reachable": False}
+    return {
+        "reachable": True,
+        "door_state": data.get("garageDoorState"),
+        "obstructed": bool(data.get("garageObstructed")),
+        "light_on": bool(data.get("garageLightOn")),
+    }
+
+
+@router.get("/garage")
+async def get_garage() -> dict[str, Any]:
+    """Live door state for the car page's manual controls. Never a stale
+    value dressed up as current: an unconfigured or unreachable device
+    reports reachable: false rather than the last thing we happened to see."""
+    if DEMO:
+        return demo.garage_status()
+    url = solar.load_config(store()._db)["garage_url"]
+    if not url:
+        return {"reachable": False}
+    return await _garage_reading(url)
+
+
+@router.post("/garage/open")
+async def post_garage_open() -> dict[str, Any]:
+    """Manual button. The owner is present and just pressed it, so this acts
+    immediately -- the warned-close discipline in collector.py's scheduled
+    close applies only to the *unattended* automatic close, never to a
+    button the owner is standing in front of."""
+    if DEMO:
+        return {"ok": True, **demo.garage_status()}
+    url = solar.load_config(store()._db)["garage_url"]
+    if not url:
+        raise HTTPException(400, "garage URL is not configured")
+    commanded = await asyncio.to_thread(garage.open, url)
+    return {"ok": commanded, **await _garage_reading(url)}
+
+
+@router.post("/garage/close")
+async def post_garage_close() -> dict[str, Any]:
+    """Manual button -- same immediacy as open() above; see its docstring."""
+    if DEMO:
+        return {"ok": True, **demo.garage_status()}
+    url = solar.load_config(store()._db)["garage_url"]
+    if not url:
+        raise HTTPException(400, "garage URL is not configured")
+    commanded = await asyncio.to_thread(garage.close, url)
+    return {"ok": commanded, **await _garage_reading(url)}
+
+
+@router.post("/garage/test")
+async def post_garage_test(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """Setup page's "Test connection" -- reads status against whatever URL is
+    currently typed in, saved or not. Never DEMO-branched and never writes:
+    the ratgdo is real hardware on the LAN regardless of whether the rest of
+    this app is running against demo Tesla data."""
+    url = str(body.get("url") or "").strip()
+    if not url:
+        raise HTTPException(400, "url is required")
+    return await _garage_reading(url)
+
+
+@router.get("/garage/config")
+async def get_garage_config() -> dict[str, Any]:
+    cfg = solar.load_config(store()._db)
+    return {k: cfg[k] for k in GARAGE_CONFIG_FIELDS}
+
+
+@router.put("/garage/config")
+async def put_garage_config(body: dict[str, Any] = Body(...)) -> dict[str, bool]:
+    unknown = set(body) - set(GARAGE_CONFIG_FIELDS)
+    if unknown:
+        raise HTTPException(400, f"unknown fields: {sorted(unknown)}")
+    clean: dict[str, Any] = {}
+
+    if "garage_url" in body:
+        url = body["garage_url"]
+        if url is not None:
+            url = str(url).strip()
+            if url and not (url.startswith("http://") or url.startswith("https://")):
+                raise HTTPException(400, "garage_url must start with http:// or https://")
+        clean["garage_url"] = url or None
+
+    if "garage_auto_open" in body:
+        try:
+            v = int(body["garage_auto_open"])
+        except (TypeError, ValueError):
+            raise HTTPException(400, "garage_auto_open must be 0 or 1")
+        if v not in (0, 1):
+            raise HTTPException(400, "garage_auto_open must be 0 or 1")
+        clean["garage_auto_open"] = v
+
+    if "garage_ring_m" in body:
+        try:
+            v = int(body["garage_ring_m"])
+        except (TypeError, ValueError):
+            raise HTTPException(400, "garage_ring_m must be an integer")
+        if not 50 <= v <= 5000:
+            raise HTTPException(400, "garage_ring_m must be between 50 and 5000")
+        clean["garage_ring_m"] = v
+
+    if "garage_close_hour" in body:
+        raw = body["garage_close_hour"]
+        if raw is None:
+            clean["garage_close_hour"] = None
+        else:
+            try:
+                v = int(raw)
+            except (TypeError, ValueError):
+                raise HTTPException(400, "garage_close_hour must be an integer or null")
+            if not 0 <= v <= 23:
+                raise HTTPException(400, "garage_close_hour must be between 0 and 23")
+            clean["garage_close_hour"] = v
+
+    if "garage_close_warn_s" in body:
+        try:
+            v = int(body["garage_close_warn_s"])
+        except (TypeError, ValueError):
+            raise HTTPException(400, "garage_close_warn_s must be an integer")
+        if not 5 <= v <= 60:
+            raise HTTPException(400, "garage_close_warn_s must be between 5 and 60")
+        clean["garage_close_warn_s"] = v
+
+    solar.save_config(store()._db, **clean)
+    return {"ok": True}

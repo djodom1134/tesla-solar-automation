@@ -86,6 +86,49 @@
     </section>
 
     <section class="card">
+      <h2>Garage</h2>
+      <div class="row">
+        <label for="garage-url">ratgdo URL</label>
+        <input type="text" id="garage-url" placeholder="http://192.168.x.x">
+        <button id="garage-test" type="button">Test connection</button>
+      </div>
+      <p id="garage-test-msg" class="hint"></p>
+
+      <label class="row"><input type="checkbox" id="garage-auto-open">
+        Open automatically when the car arrives</label>
+
+      <div class="row">
+        <label for="garage-ring">Arrival ring radius</label>
+        <input type="number" id="garage-ring" min="50" max="5000" step="50" value="800">
+        <span>m</span>
+      </div>
+      <p class="hint">Hundreds of metres, not the tight geofence used for "is it
+        parked at home" — this is "it is arriving".</p>
+
+      <div class="row">
+        <label for="garage-close-hour">Close automatically at</label>
+        <input type="number" id="garage-close-hour" min="0" max="23" step="1" placeholder="off">
+        <span>:00</span>
+      </div>
+      <div class="row">
+        <label for="garage-warn">Warning time before closing</label>
+        <input type="number" id="garage-warn" min="5" max="60" step="1" value="8">
+        <span>seconds</span>
+      </div>
+      <p class="hint">There is no way to get a fully compliant audible warning
+        through this device's API, so this only turns the garage light on and
+        re-checks the door before closing — it never closes a door that is
+        obstructed or that is no longer open by the time the wait is up.
+        <strong>The ratgdo's own auto-close</strong>, configured in its own web
+        UI rather than here, gives a fully warned close on an open-duration
+        timer and is the safer option if you'd rather rely on that instead of
+        this schedule.</p>
+
+      <button id="save-garage">Save</button>
+      <span id="garage-msg" class="msg"></span>
+    </section>
+
+    <section class="card">
       <h2>Deadline warning</h2>
       <p class="hint">Never acts — it only tells you, once the sun is done for the day,
         that solar alone did not reach your target.</p>

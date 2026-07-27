@@ -217,6 +217,7 @@ async function refresh() {
       api("/api/car/state"),
       api("/api/car/health"),
       loadSolar(),   // never throws -- the card just stays hidden on failure
+      loadGarage(),  // same -- stays hidden on failure
     ]);
     state.health = health;
     $("error-bar").hidden = true;
@@ -302,6 +303,62 @@ async function loadSolar() {
   }
 }
 
+/* --------------------------------------------------------------- garage */
+
+async function loadGarage() {
+  let g;
+  try {
+    g = await api("/api/car/garage");
+  } catch (_) {
+    return;                       // the card simply stays hidden
+  }
+  const card = $("garage-card");
+  card.hidden = false;
+  const stateEl = $("garage-state");
+  const obEl = $("garage-obstructed");
+  const note = $("garage-note");
+  const openBtn = $("garage-open");
+  const closeBtn = $("garage-close");
+
+  // Render an unreachable device as unreachable -- never a stale state
+  // presented as current.
+  if (!g.reachable) {
+    stateEl.textContent = "unreachable";
+    stateEl.className = "pill";
+    obEl.hidden = true;
+    note.textContent = "Could not reach the garage door opener.";
+    openBtn.disabled = true;
+    closeBtn.disabled = true;
+    return;
+  }
+
+  const label = g.door_state || "unknown";
+  stateEl.textContent = label;
+  stateEl.className = "pill state-" + label.toLowerCase();
+  obEl.hidden = !g.obstructed;
+  note.textContent = g.light_on ? "Light is on." : "";
+  openBtn.disabled = false;
+  closeBtn.disabled = false;
+}
+
+async function garageCommand(action, btn) {
+  // Manual button: the owner is present and just pressed it, so this acts
+  // immediately -- no warning wait, unlike the scheduled close. Closing is
+  // still the one irreversible-feeling direction, so it gets the same
+  // confirm() the high-risk car commands use.
+  if (action === "close" && !window.confirm("Close the garage door?")) return;
+  btn.disabled = true;
+  try {
+    const result = await api(`/api/car/garage/${action}`, { method: "POST" });
+    toast(result.ok ? `Garage ${action} sent` : `Garage ${action} may not have worked`,
+          result.ok);
+  } catch (err) {
+    toast(err.message, false);
+  } finally {
+    await loadGarage();
+  }
+}
+
 function renderFooter(health) {
   const c = health.collector;
   $("foot-collector").textContent = c.running
@@ -338,6 +395,9 @@ async function main() {
       $("wake").disabled = false;
     }
   });
+
+  $("garage-open").addEventListener("click", () => garageCommand("open", $("garage-open")));
+  $("garage-close").addEventListener("click", () => garageCommand("close", $("garage-close")));
 
   initRanges();
   await loadCommands();
