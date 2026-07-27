@@ -4371,3 +4371,92 @@ Test: `tests/test_green.py`, `tests/test_solar_routes.py`.
 
 **Today's honest output is zero on every one of these**, because the controller
 has never charged from sun. A build that shows anything else is wrong.
+
+---
+
+## Task 21: Adopt a charge the car started on its own
+
+**A missing requirement, not a new feature.** The owner's original brief was to
+*"adjust the car's charge rate to match the available excess solar… the goal is
+to not import any electrons from the grid."* Adjusting implies taking over
+whatever rate the car is at. The shipped state machine only ever enters
+`charging` from `idle` when surplus appears — so when the owner plugs in and the
+car auto-starts at full rate, the controller sits in `idle` watching it import.
+
+Observed live, 12:29 on the first real solar day:
+
+```
+solar          4.26 kW
+house (no car) 9.74 kW
+car           11.28 kW   (48 A x 235 V, started by the car on plug-in)
+grid         +16.76 kW   import
+surplus       -5.48 kW
+```
+
+The controller correctly declined to *start* — there is genuinely no surplus —
+and equally correctly did nothing about 11 kW flowing from the grid into the
+car, because nothing in the design told it to.
+
+### The transition
+
+Add a second way into `charging`, distinct from the existing one:
+
+```
+idle --home ∧ plugged ∧ enabled ∧ car_already_charging--> charging   [ADOPT]
+idle --home ∧ plugged ∧ enabled ∧ surplus >= start_w sustained--> charging  [START]
+```
+
+**ADOPT issues no `charge_start`** — the car is already charging. Everything
+else is identical, and critically **it must record the originals first**: the
+existing `charge_start` branch is what sets `dirty=1` and captures
+`original_amps` / `original_limit`, so adoption needs its own equivalent or the
+restore path has nothing to put back. That omission is how three earlier
+Critical defects on this path began.
+
+Adoption needs **no sustained hold**. The hold exists so one noisy meter reading
+cannot start a charge; here the charge is already running and the question is
+only who controls it. Waiting two ticks means two more ticks of import.
+
+### After adoption, the existing machinery does the right thing
+
+No new logic. With surplus at −5.48 kW the control law computes a deeply
+negative `error_w`, `raw_target` falls below `min_a`, and after the two-tick
+dwell the machine enters `grace`, holds at 5 A, and on `grace_s` expiry issues
+`charge_stop` and restores the owner's 48 A. That is the correct outcome: the
+sun cannot support charging, so charging stops.
+
+If surplus is merely *low* rather than absent, it throttles to match and keeps
+charging — which is the whole point.
+
+### One change to the ramp
+
+Ramping down from 48 A at `ramp_a = 8` per tick takes six ticks — twelve minutes
+of importing at 120 s. **Allow the ramp bypass on a downward move on the
+adoption tick**, exactly as `grace` entry already does. The spec already
+establishes the principle: *"Down-to-floor is the one permitted violation of the
+ramp limit, and it is safe because it can only reduce draw."* Reducing draw is
+always safe; the ramp exists to stop the controller slamming the car *upward*
+into a surplus that may not be there.
+
+### Test it as a sequence, not a state
+
+The defect this replaces was invisible to unit tests because they check states,
+not journeys. Drive the real `solar_tick` across a full adoption:
+
+1. car charging at 48 A, surplus deeply negative → adopt, `dirty=1`,
+   `original_amps=48` recorded, no `charge_start` issued
+2. next tick → amps drop sharply (ramp bypass), not by 8
+3. two breach ticks → `grace` at `min_a`
+4. `grace_s` elapses → `charge_stop` **and** `original_amps` restored to 48
+5. assert no `charge_start` was ever issued in the whole sequence
+
+**Files:** `solar.py` (the transition, pure), `collector.py` (record originals on
+adopt; ramp bypass), tests in `tests/test_solar_state.py` and
+`tests/test_collector_solar.py`.
+
+### Deliberately NOT in scope
+
+Faster polling while plugged-in-but-idle. The owner asked for adoption only, and
+a charging car is already polled every 300 s (`poll_charging`), so adoption
+engages within about five minutes. The 1800 s idle cadence only delays the
+*start* case, which is a separate trade against the API budget.
