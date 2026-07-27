@@ -84,3 +84,131 @@ def test_unramped_target_a_skips_the_per_tick_ramp_but_stays_clamped():
 def test_unramped_target_a_is_still_clamped_to_max_a():
     d = solar.control(-20000, 45, T)        # huge export, would want far above max
     assert d.unramped_target_a == T.max_a
+
+
+def test_grace_rides_out_a_compressor_cycle_instead_of_stopping():
+    """T1.1. The largest software win in the whole-house spec, and it needs
+    no thermostat.
+
+    Measured on 2026-07-27: the AC pushed the site into import, the machine
+    burned its 180 s grace and issued charge_stop at 12:58. Two minutes
+    later the compressor stopped and 4.7 kW began exporting -- but
+    restart_hold_s kept the car at 0 A until 13:06. Six minutes of surplus
+    thrown at the grid because a ~6 minute compressor cycle outlasted a
+    3 minute grace.
+
+    Holding at min_a through that cycle costs ~1.2 kW of import for its
+    duration -- 0.12 kWh -- and saves ~0.42 kWh of export otherwise missed
+    during the restart lockout. Roughly 3.5:1.
+
+    Time alone cannot express that trade: it charges the same for a 100 W
+    dip and an 1100 W one. Energy alone is unbounded against a compressor
+    that runs for hours. So grace is bounded by BOTH, and the energy budget
+    is what does the work.
+    """
+    tun = solar.Tunables(volts=240, min_a=5, max_a=48, ramp_a=8,
+                         margin_w=100, deadband_w=250)
+    pol = solar.Policy(grace_s=900, grace_budget_wh=150.0)
+
+    # A compressor-sized import: the car sits at its 1.2 kW floor and every
+    # watt of it is coming from the grid.
+    grid_w = 4000.0
+    d = solar.control(grid_w, tun.min_a, tun)
+    assert d.floor_breach, "premise: this tick is below the floor"
+    tick = solar.Tick(surplus_w=tun.min_a * tun.volts - grid_w, decision=d,
+                      location="home", plugged=True, car_charging=True,
+                      period_s=120)
+
+    m = solar.Machine(state="grace")
+    held = 0
+    for _ in range(10):
+        m, actions = solar.advance(m, tick, pol, tun)
+        if m.state == "stopped":
+            break
+        assert m.state == "grace"
+        held += 1
+
+    assert m.state == "stopped", "the budget must eventually give up"
+    # 150 Wh at 1,200 W is 450 s = 3.75 ticks of 120 s.
+    assert 3 <= held <= 5, (
+        f"held {held} ticks ({held * 120} s); expected ~450 s of ride-through "
+        "from a 150 Wh budget at the 1.2 kW floor")
+    assert held * 120 > 180, (
+        "REGRESSION: gave up inside the old 180 s grace_s, which is shorter "
+        "than a compressor cycle -- the exact behaviour that exported 4.7 kW "
+        "on 2026-07-27")
+
+
+def test_grace_budget_lasts_far_longer_when_the_import_is_small():
+    """The discriminating half: a 150 W nuisance import is nearly free to
+    ride out, and a time-only grace would abandon it just as fast as a
+    4 kW one. Same policy, same floor, two very different disturbances.
+    """
+    tun = solar.Tunables(volts=240, min_a=5, max_a=48, ramp_a=8,
+                         margin_w=100, deadband_w=250)
+    pol = solar.Policy(grace_s=900, grace_budget_wh=150.0)
+
+    d = solar.control(150.0, tun.min_a, tun)
+    tick = solar.Tick(surplus_w=tun.min_a * tun.volts - 150.0, decision=d,
+                      location="home", plugged=True, car_charging=True,
+                      period_s=120)
+    m = solar.Machine(state="grace")
+    held = 0
+    while held < 20:
+        m, _ = solar.advance(m, tick, pol, tun)
+        if m.state != "grace":
+            break
+        held += 1
+
+    # Only 150 W of the car's 1,200 W is actually imported, so the budget
+    # drains 8x slower: 5 Wh per tick against a 150 Wh budget. grace_s, not
+    # the budget, is what finally ends this one -- which is the point.
+    # (Timers are compared as carried in, so the machine holds seven whole
+    # 120 s ticks and gives up on the eighth, when elapsed reaches 960.)
+    assert held == 7, (
+        f"held {held} ticks ({held * 120} s) for a 150 W import; expected the "
+        "900 s time cap to bind, not the energy budget")
+    assert m.grace_wh < pol.grace_budget_wh, (
+        f"spent {m.grace_wh:.0f} Wh of a {pol.grace_budget_wh:.0f} Wh budget -- "
+        "a cheap disturbance must be ended by time, not by energy")
+
+
+def test_a_failed_recovery_attempt_does_not_refund_the_grace_budget():
+    """A flickering surplus must not buy unlimited ride-through.
+
+    The recovery branch carries grace_s_elapsed forward but originally
+    dropped the energy accumulator, which reset it to zero. A surplus
+    oscillating either side of the floor -- precisely what a cycling
+    compressor produces -- would then refund the budget on every flicker
+    and the car could import at the floor forever without the machine ever
+    reaching its limit.
+    """
+    tun = solar.Tunables(volts=240, min_a=5, max_a=48, ramp_a=8,
+                         margin_w=100, deadband_w=250)
+    pol = solar.Policy(grace_s=100_000, grace_budget_wh=150.0)  # time can never bind
+
+    def tick_at(grid_w):
+        d = solar.control(grid_w, tun.min_a, tun)
+        return solar.Tick(surplus_w=tun.min_a * tun.volts - grid_w, decision=d,
+                          location="home", plugged=True, car_charging=True,
+                          period_s=120)
+
+    breaching = tick_at(4000.0)          # below the floor: spends budget
+    flickering = tick_at(-1500.0)        # briefly above it: one recovery tick
+    assert breaching.decision.floor_breach
+    assert flickering.decision.raw_target >= tun.min_a + 1
+
+    m = solar.Machine(state="grace")
+    for _ in range(40):
+        m, _ = solar.advance(m, breaching, pol, tun)
+        if m.state != "grace":
+            break
+        # One tick above the floor -- not two, so it never actually recovers.
+        m, _ = solar.advance(m, flickering, pol, tun)
+        if m.state != "grace":
+            break
+
+    assert m.state == "stopped", (
+        "REGRESSION: an alternating surplus refunded the energy budget every "
+        "flicker, so grace never expired and the car imported at the floor "
+        "indefinitely")

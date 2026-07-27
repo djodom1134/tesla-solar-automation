@@ -362,12 +362,19 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
         elif action == "set_amps":
             if machine.state == "grace":
                 target = tun.min_a
-            elif "adopt" in actions and decision.unramped_target_a < current_a:
-                # Down-to-floor bypass, exactly as grace entry: on the
-                # adoption tick only, a DOWNWARD correction may skip ramp_a
-                # entirely -- reducing draw is always safe. Never bypass
-                # upward; ramp_a still guards against slamming the car into
-                # a surplus that may not be there.
+            elif decision.unramped_target_a < current_a:
+                # T1.2, generalising what was once an adoption-tick-only
+                # bypass: a DOWNWARD correction skips ramp_a entirely, in
+                # every state. Reducing draw is always safe, so rationing it
+                # buys nothing -- an AC compressor is a ~6 kW step, and at
+                # 8 A per tick a car at 48 A spends four more ticks importing
+                # its way to a number the meter already reported.
+                #
+                # Upward moves stay ramp-limited: slamming into a surplus
+                # that may not still be there is a real risk. That asymmetry
+                # -- fast down, slow up -- is also what keeps the loop
+                # stable, since the aggressive direction is the one that can
+                # only reduce error.
                 target = decision.unramped_target_a
             elif "charge_start" in actions:
                 # Spec T0.2. The owner's requirement: hold the rate at zero

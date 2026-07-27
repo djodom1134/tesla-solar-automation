@@ -1766,13 +1766,22 @@ async def test_adopts_a_charge_the_car_started_and_restores_on_stop(tmp_path):
     state, _ = await collector.solar_tick(client, store_, "VIN1", view, cfg, site_id=1)
     assert state == "grace"
 
-    # --- tick 4: still dwelling in grace, timeout not yet reached ----------
-    state, _ = await collector.solar_tick(client, store_, "VIN1", view, cfg, site_id=1)
-    assert state == "grace"
+    # --- ride out the dip, then give up -> charge_stop AND restore 48 A ----
+    # Grace is now bounded by ENERGY, not by a bare 180 s timer: the car sits
+    # at its 1.2 kW floor and every watt of it is imported here, so a 150 Wh
+    # budget buys 450 s -- four 120 s ticks -- before the machine concedes.
+    # That is the ride-through working: a real compressor cycle outlasts three
+    # minutes, which is exactly how 4.7 kW came to be exported on 2026-07-27.
+    for _ in range(8):
+        state, _ = await collector.solar_tick(client, store_, "VIN1", view,
+                                              cfg, site_id=1)
+        if state == "stopped":
+            break
+        assert state == "grace", f"expected to still be riding it out, got {state}"
+    assert state == "stopped", "the energy budget must eventually give up"
 
-    # --- tick 5: grace_s elapses -> charge_stop AND restore to 48 A --------
-    state, _ = await collector.solar_tick(client, store_, "VIN1", view, cfg, site_id=1)
-    assert state == "stopped"
+    spent = solar.load_state(db, "VIN1")["grace_wh"]
+    assert spent == 0.0, "the budget must reset when grace ends, not carry over"
 
     stops = [c for c in client.commands if c[0] == "charge_stop"]
     assert len(stops) == 1
@@ -1939,4 +1948,45 @@ async def test_engaging_opens_at_the_measured_rate_not_the_owners_standing_amps(
     grid_w = client.house_w + client.car_w - client.solar_w
     assert abs(grid_w) < 700, (
         f"settled {grid_w:.0f} W off zero; the servo should null the meter")
+    store_.close()
+
+
+@pytest.mark.asyncio
+async def test_a_downward_correction_is_never_ramp_limited(tmp_path):
+    """T1.2. Reducing draw is always safe, so it should never be rationed.
+
+    An AC compressor starting is a ~6 kW step. Ramp-limited at 8 A per tick,
+    a car at 48 A takes five ticks -- ten minutes at the deployed period -- to
+    get down to where the meter already says it should be, importing the whole
+    way. Upward moves stay ramp-limited, because slamming into a surplus that
+    may not still be there is a real risk; downward moves carry no such risk.
+
+    Fast-down / slow-up is also what keeps the loop stable: the aggressive
+    direction is the one that can only reduce error.
+    """
+    store_ = Store(tmp_path / "car.db")
+    db = store_._db
+    solar.save_config(db, enabled=1)
+    home.save(db, 40.0, -105.0, 100)
+    solar.save_state(db, "VIN1", state="charging", dirty=1,
+                     original_amps=48, original_limit=90)
+
+    # Car at 48 A into 8 kW of sun and a 2 kW house: the site is importing
+    # 5.5 kW and the loop wants ~25 A. Deliberately NOT a floor breach --
+    # that path dwells two ticks before acting and would write nothing here.
+    client = _SolarSiteClient(house_w=2000.0, solar_w=8000.0)
+    client.charging = True
+    client.amps = 48
+    cfg = SimpleNamespace(timezone="America/Denver", proxy_url="https://localhost:4443")
+
+    await collector.solar_tick(client, store_, "VIN1", client.view(), cfg, site_id=1)
+
+    writes = [c[1]["charging_amps"] for c in client.commands
+              if c[0] == "set_charging_amps"]
+    assert writes, f"an import must produce a correction: {client.commands}"
+    assert writes[0] != 40, (
+        "REGRESSION: took a single ramp_a step from 48 to 40, leaving the car "
+        "importing for another two ticks while the meter already knew the answer")
+    assert 24 <= writes[0] <= 26, (
+        f"expected ~25 A in one move, got {writes[0]} A")
     store_.close()

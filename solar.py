@@ -197,7 +197,21 @@ STATES = frozenset({"idle", "charging", "grace", "stopped"})
 
 @dataclass(frozen=True)
 class Policy:
-    grace_s: int = 180          # hold at min_a this long before giving up
+    # Grace is bounded by BOTH a time cap and an energy budget, and the
+    # budget is what does the work. Time alone charges the same for a
+    # 100 W dip as for an 1,100 W one; energy alone is unbounded against
+    # a compressor that runs for hours. grace_s is deliberately generous
+    # now -- it binds only when the disturbance is small enough that
+    # riding it out is nearly free.
+    grace_s: int = 900          # absolute cap on holding at min_a
+    # Sized from the DISTURBANCE, not from a round number: a residential
+    # compressor cycle runs 6-10 minutes, and the car spends its 1.2 kW
+    # floor for the duration, so bridging one costs 120-200 Wh. 250 Wh
+    # covers a 12.5 minute cycle with margin. An earlier 150 Wh gave up
+    # one tick before the compressor stopped on 2026-07-27 and recovered
+    # nothing -- the budget must span the whole cycle or it buys nothing
+    # at all, since a partial ride-through still pays the restart lockout.
+    grace_budget_wh: float = 250.0   # grid energy the car may spend riding out a dip
     # start_hold_s and restart_hold_s are enforced as WHOLE TICKS, not raw
     # seconds: the timer is compared as carried in from the previous tick, so
     # the real wait is period_s * (ceil(threshold / period_s) + 1) and is never
@@ -218,6 +232,12 @@ class Machine:
     recover_ticks: int = 0      # consecutive ticks back above it
     grace_s_elapsed: int = 0
     hold_s: int = 0             # sustained-surplus timer for idle and stopped
+    # Grid energy the CAR itself has drawn while riding out a dip at the
+    # floor. Grace is bounded by this as well as by time -- see advance().
+    # Distinct from the module-level grace_import_wh(), which reports the
+    # same quantity from logged history; this one is the live accumulator
+    # the pure machine carries between ticks.
+    grace_wh: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -291,12 +311,33 @@ def advance(m: Machine, t: Tick, pol: Policy, tun: Tunables) -> tuple[Machine, l
             recover = m.recover_ticks + 1
             if recover >= 2:
                 return Machine(state="charging"), ["set_amps"]
+            # grace_wh must be carried, exactly as grace_s_elapsed is. A
+            # surplus oscillating either side of the floor -- which is what a
+            # cycling compressor produces -- would otherwise refund the
+            # energy budget on every flicker, and the car could sit at the
+            # floor importing forever without grace ever expiring.
             return Machine(state="grace", grace_s_elapsed=m.grace_s_elapsed,
-                           recover_ticks=recover), []
+                           grace_wh=m.grace_wh, recover_ticks=recover), []
         elapsed = m.grace_s_elapsed + t.period_s
-        if elapsed > pol.grace_s:
+        # RIDE-THROUGH. Grace is bounded by energy as well as time, and the
+        # energy budget is what does the work.
+        #
+        # Measured 2026-07-27: an AC compressor pushed the site into import,
+        # a 180 s grace expired, charge_stop fired at 12:58 -- and two
+        # minutes later the compressor stopped and 4.7 kW began exporting
+        # into a car held at 0 A by restart_hold_s until 13:06. A ~6 minute
+        # compressor cycle simply outlasted a 3 minute grace.
+        #
+        # Holding at the floor through that cycle costs the car's own draw,
+        # ~1.2 kW, for its duration. That is the quantity budgeted here --
+        # not total site import, which includes the house and would charge
+        # the car for the compressor's own consumption.
+        car_w = tun.min_a * tun.volts        # grace pins the car at the floor
+        grid_w = -(t.decision.error_w + tun.margin_w)   # exact: see control()
+        spent = m.grace_wh + min(car_w, max(0.0, grid_w)) * t.period_s / 3600.0
+        if spent >= pol.grace_budget_wh or elapsed > pol.grace_s:
             return Machine(state="stopped"), ["charge_stop", "restore"]
-        return Machine(state="grace", grace_s_elapsed=elapsed), []
+        return Machine(state="grace", grace_s_elapsed=elapsed, grace_wh=spent), []
 
     # stopped
     if t.surplus_w < start_watts(tun):
@@ -315,7 +356,10 @@ CREATE TABLE IF NOT EXISTS solar_config (
   deadband_w        INTEGER NOT NULL DEFAULT 250,
   ramp_a            INTEGER NOT NULL DEFAULT 8,
   min_a             INTEGER NOT NULL DEFAULT 5,
-  grace_s           INTEGER NOT NULL DEFAULT 180,
+  -- grace_s is an absolute cap; grace_budget_wh is the binding
+  -- constraint in practice. See Policy.
+  grace_s           INTEGER NOT NULL DEFAULT 900,
+  grace_budget_wh   REAL NOT NULL DEFAULT 250.0,
   restart_hold_s    INTEGER NOT NULL DEFAULT 300,
   start_hold_s      INTEGER NOT NULL DEFAULT 60,
   raise_hold_s      INTEGER NOT NULL DEFAULT 600,
@@ -349,6 +393,9 @@ CREATE TABLE IF NOT EXISTS solar_state (
   recover_ticks   INTEGER NOT NULL DEFAULT 0,
   grace_s_elapsed INTEGER NOT NULL DEFAULT 0,
   hold_s          INTEGER NOT NULL DEFAULT 0,
+  -- Grid energy spent riding out a dip at the floor. Bounds grace alongside
+  -- grace_s, and is the constraint that actually binds. See advance().
+  grace_wh        REAL    NOT NULL DEFAULT 0,
   dirty           INTEGER NOT NULL DEFAULT 0,
   original_amps   INTEGER,
   original_limit  INTEGER,
@@ -414,7 +461,8 @@ CREATE INDEX IF NOT EXISTS solar_ticks_state ON solar_ticks (vin, state, ts);
 
 CONFIG_DEFAULTS = {
     "enabled": 0, "period_s": 120, "margin_w": 100, "deadband_w": 250,
-    "ramp_a": 8, "min_a": 5, "grace_s": 180, "restart_hold_s": 300,
+    "ramp_a": 8, "min_a": 5, "grace_s": 900,
+    "grace_budget_wh": 250.0, "restart_hold_s": 300,
     "start_hold_s": 60, "raise_hold_s": 600, "soc_ceiling": 90,
     "raise_limit": 1, "daily_request_cap": 400, "view_refresh_ticks": 5,
     "deadline_soc": None, "deadline_hour": None,
@@ -424,7 +472,7 @@ CONFIG_DEFAULTS = {
 
 STATE_DEFAULTS = {
     "state": "idle", "breach_ticks": 0, "recover_ticks": 0,
-    "grace_s_elapsed": 0, "hold_s": 0,
+    "grace_s_elapsed": 0, "hold_s": 0, "grace_wh": 0.0,
     "dirty": 0, "original_amps": None, "original_limit": None,
     "raised_to": None, "raise_hold_elapsed": 0,
     "requests_today": 0, "requests_day": None,
@@ -439,7 +487,7 @@ STATE_DEFAULTS = {
 # The Machine fields that must survive between ticks. Anything here that is
 # not persisted silently disables the dwell and hysteresis logic.
 MACHINE_FIELDS = ("state", "breach_ticks", "recover_ticks",
-                  "grace_s_elapsed", "hold_s")
+                  "grace_s_elapsed", "hold_s", "grace_wh")
 
 
 def machine_from(st: dict) -> Machine:
@@ -471,6 +519,8 @@ STATE_NEW_COLUMNS = (
     ("tracked_miles", "REAL NOT NULL DEFAULT 0"),
     ("ledger_odo", "REAL"),
     ("free_miles_since", "INTEGER"),
+    # Ride-through: grid energy spent holding at the floor through a dip.
+    ("grace_wh", "REAL NOT NULL DEFAULT 0"),
 )
 
 
@@ -495,6 +545,10 @@ CONFIG_NEW_COLUMNS = (
     ("garage_ring_m", "INTEGER NOT NULL DEFAULT 800"),
     ("garage_close_hour", "INTEGER"),
     ("garage_close_warn_s", "INTEGER NOT NULL DEFAULT 8"),
+    # Ride-through: the energy budget that bounds grace. CREATE TABLE IF
+    # NOT EXISTS is a no-op on the owner's existing table, so this is
+    # the only path by which a live database gains the column.
+    ("grace_budget_wh", "REAL NOT NULL DEFAULT 250.0"),
 )
 
 
@@ -586,7 +640,9 @@ def tunables_from(cfg: dict, amps_max: int | None, volts: int | None) -> Tunable
 
 
 def policy_from(cfg: dict) -> Policy:
-    return Policy(grace_s=cfg["grace_s"], restart_hold_s=cfg["restart_hold_s"],
+    return Policy(grace_s=cfg["grace_s"],
+                  grace_budget_wh=cfg["grace_budget_wh"],
+                  restart_hold_s=cfg["restart_hold_s"],
                   start_hold_s=cfg["start_hold_s"], enabled=bool(cfg["enabled"]))
 
 
