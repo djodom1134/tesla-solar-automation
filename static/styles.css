@@ -384,7 +384,13 @@ th .key { vertical-align: middle; margin-right: .35rem; }
 /* Neutral chrome -- same gray the ring/gridlines use, not either energy hue. */
 #solar-card .tank-outline { fill: none; stroke: var(--grid); stroke-width: 2; }
 #solar-card .tank-fill.tank-solar { fill: var(--solar); }
-#solar-card .tank-fill.tank-grid  { fill: var(--import); }
+/* Grid energy is ordinary, not an error state -- --import is reserved for
+   alarm/danger UI (.toast.bad, .btn.danger) elsewhere in this file. A big
+   red fill with no legend beside it reads as "something is wrong" even
+   when the battery is healthy. --ink-2 stays legible as a solid fill in
+   both themes (--baseline nearly disappears against --surface in dark
+   mode, since --baseline #383835 sits right next to --surface #1a1a19). */
+#solar-card .tank-fill.tank-grid  { fill: var(--ink-2); }
 #solar-card .tank-facts { flex: 1 1 auto; min-width: 0; }
 #solar-card .tank-headline { font-size: 1.05rem; font-weight: 600; margin: 0 0 .2rem; }
 #solar-card .tank-facts .big { margin: 0 0 .15rem; }

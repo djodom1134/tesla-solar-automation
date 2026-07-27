@@ -77,6 +77,61 @@ export function xTickEvery(n, plotW) {
   return Math.max(1, Math.ceil(n / maxLabels));
 }
 
+/** Rough px width of a tick label before it's painted -- SVG text has no
+    reflow to measure against ahead of time, so this stands in for a real
+    getComputedTextLength(). Tuned against .tick-label's 11px tabular-nums
+    (styles.css): good enough to decide "would these collide", not for
+    precise typesetting. */
+export function estimateLabelWidth(text, fontSizePx = 11) {
+  return text.length * fontSizePx * 0.58;
+}
+
+/**
+ * Walk x-axis tick candidates in ascending x order and keep only the ones
+ * whose label doesn't collide with the previously *kept* label.
+ *
+ * This is the general replacement for "keep every Nth candidate": thinning
+ * by a fixed stride only avoids overlap when candidates happen to sit at
+ * evenly spaced x positions (true for index/bucket-positioned bars, where
+ * each candidate owns an equal-width band). It does not hold for anything
+ * positioned by real elapsed time -- sample gaps there can range from
+ * seconds to hours, so a fixed stride still lets labels bunch up wherever
+ * samples happen to cluster. Walking actual pixel positions and rejecting
+ * whichever candidate would overlap holds regardless of how uneven the
+ * spacing is.
+ *
+ * ticks: [{ x, width, ...rest }] ascending by x -- one candidate per label
+ *        worth considering, typically one per data point.
+ * padding: minimum required gap, in px, between two labels' edges.
+ *
+ * Always keeps the first and last candidate: an axis with neither end
+ * labeled reads as broken, even in the degenerate case where that pair
+ * alone would overlap (nothing narrower can be shown instead).
+ */
+export function pickNonOverlappingTicks(ticks, padding = 4) {
+  if (ticks.length <= 1) return ticks.slice();
+
+  const first = ticks[0];
+  const last = ticks[ticks.length - 1];
+  const lastLeftEdge = last.x - last.width / 2;
+
+  const kept = [first];
+  let rightEdge = first.x + first.width / 2;
+
+  for (let i = 1; i < ticks.length - 1; i++) {
+    const t = ticks[i];
+    const leftEdge = t.x - t.width / 2;
+    const tRightEdge = t.x + t.width / 2;
+    if (leftEdge < rightEdge + padding) continue; // collides with last kept label
+    if (tRightEdge + padding > lastLeftEdge) continue; // would crowd the mandatory last label
+    kept.push(t);
+    rightEdge = tRightEdge;
+  }
+
+  if (last !== first) kept.push(last);
+  return kept;
+}
+
 /* --------------------------------------------------------------- tooltip */
 
 /* The tooltip element is resolved per call rather than at module load, so the

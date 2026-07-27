@@ -6,8 +6,10 @@
    number. */
 
 import { $, api, COLOR, nfmt, initTheme, showGate as gate } from "./shared.js";
-import { PAD, HEIGHT, el, niceTicks, chartFrame, showTip, hideTip, attachCrosshair, barPath }
-  from "./chart.js";
+import {
+  PAD, HEIGHT, el, niceTicks, chartFrame, showTip, hideTip, attachCrosshair, barPath,
+  estimateLabelWidth, pickNonOverlappingTicks,
+} from "./chart.js";
 
 const state = {
   config: null,
@@ -643,21 +645,28 @@ function renderSoc() {
     "stroke-linejoin": "round", "stroke-linecap": "round",
   }));
 
-  // X labels: dates for multi-day ranges, clock time for a single day.
+  // X labels: dates for multi-day ranges, clock time for a single day. Real
+  // samples land anywhere from 60s to 6000+s apart, so thinning "every Nth
+  // row" still bunches labels wherever samples happen to cluster in time --
+  // walk actual pixel positions instead and drop whichever candidate would
+  // overlap the previously kept label, so no two ever collide regardless of
+  // how uneven the row spacing is.
   const multiDay = span > 36 * 3600;
-  const step = Math.max(1, Math.ceil(rows.length / Math.max(2, Math.floor(plotW / 70))));
-  rows.forEach((r, i) => {
-    if (i % step !== 0) return;
-    const d = new Date(r.ts * 1000);
-    const label = multiDay
-      ? d.toLocaleDateString(undefined, { month: "short", day: "numeric" })
-      : d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
-    const text = el("text", {
-      x: xScale(i), y: PAD.top + plotH + 20, "text-anchor": "middle", class: "tick-label",
-    });
-    text.textContent = label;
-    svg.append(text);
+  const xLabel = (r) =>
+    multiDay
+      ? new Date(r.ts * 1000).toLocaleDateString(undefined, { month: "short", day: "numeric" })
+      : new Date(r.ts * 1000).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+  const tickCandidates = rows.map((r, i) => {
+    const label = xLabel(r);
+    return { x: xScale(i), label, width: estimateLabelWidth(label) };
   });
+  for (const t of pickNonOverlappingTicks(tickCandidates)) {
+    const text = el("text", {
+      x: t.x, y: PAD.top + plotH + 20, "text-anchor": "middle", class: "tick-label",
+    });
+    text.textContent = t.label;
+    svg.append(text);
+  }
 
   attachCrosshair(
     svg, rows, xScale, plotW, plotH,
