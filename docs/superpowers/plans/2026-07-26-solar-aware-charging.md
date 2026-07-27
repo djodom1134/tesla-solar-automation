@@ -3633,3 +3633,210 @@ This is worth noting for whoever executes the plan: **passing unit tests would n
 ---
 
 Plan complete.
+
+---
+
+## Task 14: The dynamic charge-limit raise (spec §3.4)
+
+Added after the final whole-branch review confirmed §3.4 was never implemented.
+Config, storage column, setup-page slider and restore-of-a-raise all exist;
+nothing performs a raise.
+
+**Why it is most of the feature, not a refinement.** At this owner's 80% limit
+with the car at 76%, there are ~4 kWh of SoC headroom against a median
+13.8 kWh/day of export. Without the raise the controller fills the pack in
+under two hours and watches the rest go to the grid — roughly 29% of a median
+day. Raising to 90% covers a full median day.
+
+**Files:**
+- Modify: `solar.py` (pure `raise_decision()`, one new state column)
+- Modify: `collector.py` (call it in `solar_tick`; reset the timer on disengage)
+- Test: `tests/test_solar_raise.py` (create), `tests/test_collector_solar.py` (extend)
+
+**Interfaces:**
+- Produces `solar.raise_decision(**kwargs) -> tuple[int | None, int]` returning
+  `(limit_to_raise_to_or_None, new_hold_elapsed_s)`.
+- Adds `raise_hold_elapsed` to `STATE_DEFAULTS` and the `solar_state` DDL.
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `tests/test_solar_raise.py`:
+
+```python
+from __future__ import annotations
+
+import solar
+
+BASE = dict(enabled=True, state="charging", soc=79, limit=80, ceiling=90,
+            grid_w=-3000.0, raised_to=None, hold_elapsed_s=600,
+            raise_hold_s=600, period_s=120)
+
+
+def d(**over):
+    kw = dict(BASE); kw.update(over)
+    return solar.raise_decision(**kw)
+
+
+def test_raises_when_every_condition_holds():
+    target, hold = d()
+    assert target == 90
+
+
+def test_never_raises_when_the_feature_is_off():
+    assert d(enabled=False)[0] is None
+
+
+def test_never_raises_outside_charging():
+    for state in ("idle", "grace", "stopped"):
+        assert d(state=state)[0] is None, state
+
+
+def test_raises_at_most_once_per_engagement():
+    """raised_to is the guard. Re-issuing set_charge_limit every tick would
+    spend a billed command to assert a value the car already holds."""
+    assert d(raised_to=90)[0] is None
+
+
+def test_never_raises_speculatively():
+    """Only while surplus is ACTUALLY being exported. grid_w >= 0 means the
+    house is importing or balanced -- there is nothing to absorb."""
+    assert d(grid_w=0.0)[0] is None
+    assert d(grid_w=500.0)[0] is None
+
+
+def test_does_not_raise_while_headroom_remains():
+    """Below limit-2 there is still room to charge into; raising early would
+    park the pack high for longer than necessary, which is what ages it."""
+    assert d(soc=60)[0] is None
+
+
+def test_unknown_soc_or_limit_never_raises():
+    assert d(soc=None)[0] is None
+    assert d(limit=None)[0] is None
+
+
+def test_requires_the_hold_to_have_elapsed_on_a_previous_tick():
+    """Same whole-tick semantics as start_hold_s: the timer is compared as
+    carried in, so a period coarser than the hold still takes two ticks."""
+    target, hold = d(hold_elapsed_s=0)
+    assert target is None
+    assert hold == 120
+
+
+def test_the_timer_resets_when_a_condition_lapses():
+    assert d(hold_elapsed_s=480, grid_w=+200.0)[1] == 0
+
+
+def test_never_raises_below_or_equal_to_the_current_limit():
+    assert d(ceiling=80)[0] is None
+    assert d(ceiling=70)[0] is None
+
+
+def test_the_ceiling_is_capped_at_one_hundred():
+    assert d(ceiling=110, limit=95, soc=94)[0] == 100
+```
+
+- [ ] **Step 2: Run to verify they fail**
+
+Run: `.venv/bin/python -m pytest tests/test_solar_raise.py -v`
+Expected: FAIL, `AttributeError: module 'solar' has no attribute 'raise_decision'`
+
+- [ ] **Step 3: Implement the pure decision**
+
+Append to `solar.py`, beside the other pure functions:
+
+```python
+def raise_decision(*, enabled: bool, state: str, soc: int | None,
+                   limit: int | None, ceiling: int, grid_w: float,
+                   raised_to: int | None, hold_elapsed_s: int,
+                   raise_hold_s: int, period_s: int) -> tuple[int | None, int]:
+    """Whether to raise the charge limit, and the updated hold timer.
+
+    Returns (limit_to_raise_to or None, new_hold_elapsed_s).
+
+    Headroom, not surplus, is the binding constraint on this system: at an 80%
+    limit with the car at 76% there are ~4 kWh of room against a median
+    13.8 kWh/day of export, so without a raise the controller fills the pack in
+    under two hours and the rest goes to the grid anyway.
+
+    Every gate here exists for a reason:
+      * ACTUALLY EXPORTING (grid_w < 0), never speculatively -- raising the
+        limit on a forecast would park an NCA pack high for nothing.
+      * NEAR THE LIMIT (soc >= limit - 2) -- while headroom remains there is
+        somewhere to put the energy already, and time spent high is what ages
+        the pack, not reaching high.
+      * ONCE PER ENGAGEMENT (raised_to is None) -- re-issuing the command every
+        tick would spend a billed write to assert a value the car holds.
+      * UNKNOWN NEVER GUESSES -- a missing soc or limit returns None, matching
+        the three-valued discipline used for location.
+
+    The hold is compared AS CARRIED IN, like start_hold_s, so the real wait is
+    period_s * (ceil(raise_hold_s / period_s) + 1) -- never under two ticks.
+    """
+    if not enabled or state != "charging" or raised_to is not None:
+        return None, 0
+    if soc is None or limit is None:
+        return None, 0
+    if grid_w >= 0 or soc < limit - 2:
+        return None, 0
+    if hold_elapsed_s >= raise_hold_s:
+        target = min(int(ceiling), 100)
+        return (target if target > limit else None), hold_elapsed_s
+    return None, hold_elapsed_s + period_s
+```
+
+Add `"raise_hold_elapsed": 0` to `STATE_DEFAULTS`, and
+`raise_hold_elapsed INTEGER NOT NULL DEFAULT 0,` to the `solar_state` DDL.
+
+- [ ] **Step 4: Run to verify they pass**
+
+Run: `.venv/bin/python -m pytest tests/test_solar_raise.py -v`
+Expected: 11 passed
+
+- [ ] **Step 5: Wire it into the tick**
+
+In `collector.py`'s `solar_tick`, after the action loop and before the
+`save_state`/`log_tick` calls:
+
+```python
+    # --- charge-limit raise (spec 3.4) -------------------------------------
+    target_limit, raise_hold = solar.raise_decision(
+        enabled=bool(conf["raise_limit"]),
+        state=machine.state,
+        soc=view.get("soc"),
+        limit=view.get("limit"),
+        ceiling=conf["soc_ceiling"],
+        grid_w=grid_w,
+        raised_to=st["raised_to"],
+        hold_elapsed_s=st["raise_hold_elapsed"],
+        raise_hold_s=conf["raise_hold_s"],
+        period_s=conf["period_s"],
+    )
+    raised = st["raised_to"]
+    if target_limit is not None:
+        if await _command(client, vin, "set_charge_limit", percent=target_limit):
+            raised = target_limit
+            _log(f"raised charge limit {view.get('limit')} -> {target_limit} "
+                 f"for solar")
+    solar.save_state(db, vin, raised_to=raised, raise_hold_elapsed=raise_hold)
+```
+
+The revert needs no new code: `_restore` already puts `original_limit` back,
+gated on `raised_to`, and every disengage path calls it.
+
+- [ ] **Step 6: Add the integration test**
+
+Append to `tests/test_collector_solar.py` a multi-tick test driving the real
+`solar_tick` with the car near its limit and steady export, asserting
+`set_charge_limit` is issued **exactly once** across ≥ 8 ticks, and that
+`solar_state.raised_to` holds the ceiling afterwards. Prove it discriminates by
+removing the `raised_to is not None` guard and confirming the count rises.
+
+- [ ] **Step 7: Run the full suite and commit**
+
+```bash
+git add solar.py collector.py tests/test_solar_raise.py tests/test_collector_solar.py
+git commit -m "feat: dynamic charge-limit raise to absorb surplus solar
+
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
+```
