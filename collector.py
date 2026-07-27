@@ -276,7 +276,17 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
 
     # --- decide ------------------------------------------------------------
     tun = solar.tunables_from(conf, view.get("amps_max"), view.get("volts"))
-    current_a = view.get("amps_actual") or view.get("charge_amps") or tun.min_a
+    # Anchor the integral law to what the car is ACTUALLY drawing right now.
+    # amps_actual is 0 whenever the car is not charging, and 0 is falsy, so
+    # falling through to charge_amps anchored every engagement to the owner's
+    # STANDING rate (48 A here): control() returned clamp(48 + step, min, max)
+    # = 48, the already-holds-this-value guard below suppressed the write, and
+    # the car opened the solar charge at full rate into whatever surplus
+    # existed -- ~340 Wh of grid import per engagement, reproduced against
+    # this collector on 2026-07-27. Idle genuinely IS zero draw, and saying
+    # so is precisely what makes grid_w a clean measurement of the house.
+    live_now = view.get("charging_state") in solar.LIVE_CHARGING_STATES
+    current_a = int(view.get("amps_actual") or 0) if live_now else 0
     car_w = solar.car_watts(view, tun.volts)
     surplus_w = solar.surplus_watts(car_w, grid_w)
     decision = solar.control(grid_w, int(current_a), tun)
@@ -358,6 +368,18 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
                 # entirely -- reducing draw is always safe. Never bypass
                 # upward; ramp_a still guards against slamming the car into
                 # a surplus that may not be there.
+                target = decision.unramped_target_a
+            elif "charge_start" in actions:
+                # Spec T0.2. The owner's requirement: hold the rate at zero
+                # until the excess is well measured, then converge fast.
+                # Both halves are already satisfied here for free -- idle IS
+                # zero draw (no command, no contactor cycle, no wake), so
+                # with current_a anchored at 0 above, grid_w measured the
+                # house EXACTLY and unramped_target_a is the established
+                # rate. Ramping toward it 8 A per tick would only import for
+                # the eight minutes it took to arrive somewhere already
+                # known. Upward bypass is safe on this tick alone, because
+                # this is the one tick whose measurement contained no car.
                 target = decision.unramped_target_a
             else:
                 target = decision.target_a

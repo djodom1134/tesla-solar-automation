@@ -1827,3 +1827,116 @@ async def test_without_adopt_the_controller_sits_in_idle_watching_it_import(tmp_
     assert client.commands == [], (
         f"nothing should ever be commanded while genuinely idle: {client.commands}")
     store_.close()
+
+
+class _SolarSiteClient:
+    """A site whose grid meter actually responds to the car, unlike the fixed
+    fixtures above.
+
+    The car IS behind the grid CT on this installation -- proven live on
+    2026-07-27, when the meter read +11,783 W while the car drew 11,328 W. So
+    grid = house + car - solar, and any amps the controller commands feed
+    straight back into the next tick's measurement. Without that coupling a
+    test cannot tell a controller that converges from one that overshoots.
+    """
+
+    def __init__(self, house_w: float, solar_w: float, volts: int = 240):
+        self.commands: list[tuple[str, dict]] = []
+        self.house_w = house_w
+        self.solar_w = solar_w
+        self.volts = volts
+        self.amps = 0          # what the car is actually drawing
+        self.charging = False
+
+    @property
+    def car_w(self) -> float:
+        return self.amps * self.volts if self.charging else 0.0
+
+    async def _get(self, path, ttl=0):
+        return {"grid_power": self.house_w + self.car_w - self.solar_w,
+                "solar_power": self.solar_w}
+
+    async def command(self, vin, name, params):
+        self.commands.append((name, dict(params)))
+        if name == "set_charging_amps":
+            self.amps = params["charging_amps"]
+        elif name == "charge_start":
+            self.charging = True
+            if self.amps == 0:
+                self.amps = 48        # the car resumes at its standing rate
+        elif name == "charge_stop":
+            self.charging = False
+            self.amps = 0
+        return 200, {"response": {"result": True}}
+
+    async def wake_up(self, vin):
+        return {"state": "online"}
+
+    def view(self) -> dict:
+        return {"charging_state": "Charging" if self.charging else "Stopped",
+                "amps_actual": self.amps if self.charging else 0,
+                "amps_max": 48, "volts": self.volts, "charge_amps": 48,
+                "soc": 60, "limit": 90, "lat": 40.0, "lon": -105.0,
+                "fast_charger_present": False, "fast_charger": None}
+
+
+@pytest.mark.asyncio
+async def test_engaging_opens_at_the_measured_rate_not_the_owners_standing_amps(tmp_path):
+    """T0.1 + T0.2. Covers the ANCHOR defect, reproduced against the shipped
+    collector on 2026-07-27 (340 Wh imported per engagement).
+
+    collector.py anchored the integral law to `charge_amps` -- the owner's
+    standing 48 A -- whenever the car was not already charging, because
+    `amps_actual` is 0 and 0 is falsy. control() then returned
+    clamp(48 + step, 5, 48) = 48, the already-holds-this-value guard
+    suppressed the write, and the car opened the solar charge at FULL RATE
+    into whatever surplus existed, ramping down 8 A per tick while importing
+    the whole way.
+
+    The fix is the owner's stated requirement: hold the rate at zero until
+    the excess is measured, then go straight to it. `idle` already IS zero
+    draw -- no command, no contactor cycle, no wake -- so with current_a
+    correctly anchored at 0, grid_w already measures the house exactly and
+    the very tick that engages can jump open-loop to the right answer.
+
+    6 kW of surplus at 240 V is 25 A. The engagement must land there, not at
+    48 A, and not at the 5 A a ramp-limited step from zero would give.
+    """
+    store_ = Store(tmp_path / "car.db")
+    db = store_._db
+    solar.save_config(db, enabled=1)
+    home.save(db, 40.0, -105.0, 100)
+    # Seed the sustained-surplus dwell so tick 1 is the engagement itself.
+    solar.save_state(db, "VIN1", state="idle", hold_s=solar.CONFIG_DEFAULTS["start_hold_s"])
+
+    client = _SolarSiteClient(house_w=1700.0, solar_w=7700.0)
+    cfg = SimpleNamespace(timezone="America/Denver", proxy_url="https://localhost:4443")
+
+    state, _ = await collector.solar_tick(client, store_, "VIN1", client.view(),
+                                          cfg, site_id=1)
+    assert state == "charging"
+
+    writes = [c[1]["charging_amps"] for c in client.commands
+              if c[0] == "set_charging_amps"]
+    assert writes, f"the engagement must command a rate: {client.commands}"
+
+    first = writes[0]
+    assert first != 48, (
+        "REGRESSION: the controller opened at the owner's standing 48 A. "
+        "That is 11.3 kW into 6 kW of surplus -- ~340 Wh of grid import per "
+        f"engagement on the feature meant to import nothing. commands={client.commands}")
+    assert 24 <= first <= 26, (
+        f"6 kW / 240 V = 25 A; a clean measurement should land there, got {first} A. "
+        "A value of 5-8 A means the jump was ramp-limited from zero, which is "
+        "safe but wastes the surplus it just measured.")
+
+    # And it must SETTLE there rather than oscillate: replay two more ticks
+    # against a meter that now sees the car.
+    for _ in range(2):
+        state, _ = await collector.solar_tick(client, store_, "VIN1",
+                                              client.view(), cfg, site_id=1)
+    assert state == "charging", "must hold the engagement, not breach straight back out"
+    grid_w = client.house_w + client.car_w - client.solar_w
+    assert abs(grid_w) < 700, (
+        f"settled {grid_w:.0f} W off zero; the servo should null the meter")
+    store_.close()
