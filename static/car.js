@@ -277,6 +277,10 @@ async function loadSolar() {
     warn.textContent = "Your original charge settings have not been restored yet — "
                      + "waiting for the car to be home and reachable.";
     warn.hidden = false;
+  } else if (s.rate_limited) {
+    warn.textContent = "Tesla is rate-limiting this account — polling every "
+                     + `${s.backoff_s}s until it clears, not the usual cadence.`;
+    warn.hidden = false;
   } else {
     warn.hidden = true;
   }

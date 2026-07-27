@@ -369,6 +369,8 @@ def solar_status() -> dict:
         "grace_import_wh_total": 512.8,
         "capped": False,
         "dirty": False,
+        "rate_limited": False,
+        "backoff_s": 0,
         "engaged_at": int(time.time()) - 4200,
         "last_tick_ts": int(time.time()) - 40,
         "requests_today": 173,

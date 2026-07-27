@@ -787,3 +787,137 @@ async def test_recovery_latches_once_when_dirty_is_clear(tmp_path, monkeypatch):
     st = solar.load_state(conn, "VIN1")
     conn.close()
     assert st["state"] == "charging", "the latch must not have blocked normal engagement"
+
+
+# --------------------------------------------------------------------------
+# Invariant 4 (spec 3.7) -- honour 429/Retry-After by lengthening the next
+# interval rather than retrying at the normal cadence. Drives the REAL
+# run() loop, not just solar_tick in isolation, because the sleep duration
+# is something run() computes AFTER solar_tick returns.
+# --------------------------------------------------------------------------
+
+class _RateLimitedThenHealthyClient:
+    """live_status 429s for the first `fail_ticks` calls, then clears to a
+    steady 6 kW export -- the ordinary already-engaged fixture used
+    throughout this file, reused here as the "healthy" side of the event."""
+
+    def __init__(self, fail_ticks=2, retry_after=None):
+        self.fail_ticks = fail_ticks
+        self.retry_after = retry_after
+        self.live_status_calls = 0
+        self.commands: list[tuple[str, dict]] = []
+
+    async def resolve_vin(self):
+        return "VIN1"
+
+    async def energy_sites(self):
+        return [{"energy_site_id": 1}]
+
+    async def vehicle(self, vin):
+        return {"state": "online"}
+
+    async def vehicle_data(self, vin, *a, **k):
+        return {
+            "charge_state": {"charging_state": "Charging",
+                              "charger_actual_current": 24,
+                              "charge_current_request_max": 48,
+                              "charger_voltage": 240,
+                              "charge_current_request": 24,
+                              "battery_level": 55, "charge_limit_soc": 80,
+                              "conn_charge_cable": "IEC",
+                              "fast_charger_present": False,
+                              "fast_charger_type": None},
+            "drive_state": {"latitude": 40.0, "longitude": -105.0},
+            "vehicle_state": {},
+        }
+
+    async def _get(self, path, ttl=0):
+        self.live_status_calls += 1
+        if self.live_status_calls <= self.fail_ticks:
+            raise tesla.TeslaAPIError(429, "rate limited", retry_after=self.retry_after)
+        return {"grid_power": -6000.0, "solar_power": 6000.0}
+
+    async def command(self, vin, name, params):
+        self.commands.append((name, dict(params)))
+        return 200, {"response": {"result": True}}
+
+    async def wake_up(self, vin):
+        raise AssertionError("must never wake an already-charging car")
+
+    async def aclose(self):
+        pass
+
+
+async def _drive_run_capturing_sleeps(monkeypatch, tmp_path, client, ticks):
+    """Shared harness: seeds an already-charging, clean (dirty=0) machine so
+    recover() latches immediately without issuing a restore -- same pattern
+    as test_recovery_latches_once_when_dirty_is_clear above -- then drives
+    the real run() loop for `ticks` iterations, returning the captured sleep
+    durations in order plus the final persisted solar_state row."""
+    db_path = tmp_path / "car.db"
+    seed = Store(db_path)
+    solar.save_config(seed._db, enabled=1, period_s=120)
+    home.save(seed._db, 40.0, -105.0, 100)
+    solar.save_state(seed._db, "VIN1", state="charging")
+    seed.close()
+
+    monkeypatch.setattr(collector.settings, "db_file", db_path)
+    monkeypatch.setattr(collector, "TeslaClient", lambda settings: client)
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) >= ticks:
+            raise StopTest()
+    monkeypatch.setattr(collector.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(StopTest):
+        await collector.run()
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    final_state = solar.load_state(conn, "VIN1")
+    conn.close()
+    return sleeps, final_state
+
+
+@pytest.mark.asyncio
+async def test_429_lengthens_the_interval_and_resets_after_success(tmp_path, monkeypatch):
+    """Two consecutive 429s on live_status, then it clears. The interval
+    must lengthen exponentially from period_s (120) while they persist --
+    240, then 480 -- and drop back to period_s, with the counter cleared,
+    the tick after it recovers.
+
+    This is the discriminating test: with collector.py's backoff override
+    removed, all four sleeps stay at 120 because solar_tick's early return
+    on a caught 429 preserves state="charging", which next_interval alone
+    always maps to period_s regardless of how many 429s just happened. See
+    the fix-wave report for the verbatim red/green run.
+    """
+    client = _RateLimitedThenHealthyClient(fail_ticks=2, retry_after=None)
+    sleeps, final = await _drive_run_capturing_sleeps(monkeypatch, tmp_path, client, ticks=4)
+
+    assert sleeps[0] == 240, f"first 429 (count=1) must double from period_s: {sleeps}"
+    assert sleeps[1] == 480, f"second consecutive 429 (count=2) must double again: {sleeps}"
+    assert sleeps[2] == 120, f"the tick that recovers must fall back to period_s: {sleeps}"
+    assert sleeps[3] == 120, f"and stay there: {sleeps}"
+
+    assert final["consecutive_429s"] == 0, "a successful request must reset the counter"
+    assert final["backoff_s"] == 0
+    assert all(name != "charge_start" for name, _ in client.commands), (
+        "must not have re-started a charge that was already running")
+
+
+@pytest.mark.asyncio
+async def test_429_honours_a_supplied_retry_after_over_the_exponential_fallback(tmp_path, monkeypatch):
+    """A server-supplied Retry-After (45s) must win over what the exponential
+    formula alone would ask for (240s) -- the server knows better than any
+    heuristic."""
+    client = _RateLimitedThenHealthyClient(fail_ticks=1, retry_after=45)
+    sleeps, _ = await _drive_run_capturing_sleeps(monkeypatch, tmp_path, client, ticks=2)
+
+    assert sleeps[0] == 45, (
+        f"a server-supplied Retry-After must win over the exponential "
+        f"formula's 240s: {sleeps}")
+    assert sleeps[1] == 120, "must return to the normal cadence once it clears"

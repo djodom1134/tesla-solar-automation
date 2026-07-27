@@ -128,6 +128,23 @@ def control(grid_w: float, current_a: int, tun: Tunables) -> Decision:
     )
 
 
+def backoff_seconds(consecutive_429s: int, period_s: int,
+                    retry_after: float | None, cap_s: int = 1800) -> int:
+    """How long to wait after a 429 before the next request.
+
+    Rate limits are shared with every other app on the owner's Tesla account,
+    and exceeding Tesla's limit disables the whole application rather than
+    merely throttling it -- so backing off is protecting access, not politeness.
+
+    Honours a server-supplied Retry-After when there is one; the server knows
+    better than any heuristic. Otherwise doubles from the configured period and
+    caps, so a sustained outage settles at a slow poll rather than compounding.
+    """
+    if retry_after is not None:
+        return min(int(round(retry_after)), cap_s)
+    return min(period_s * 2 ** max(consecutive_429s, 0), cap_s)
+
+
 def raise_decision(*, enabled: bool, state: str, soc: int | None,
                    limit: int | None, ceiling: int, grid_w: float,
                    raised_to: int | None, hold_elapsed_s: int,
@@ -312,6 +329,13 @@ CREATE TABLE IF NOT EXISTS solar_state (
   requests_day    TEXT,
   capped          INTEGER NOT NULL DEFAULT 0,
   engaged_at      INTEGER,
+  -- Invariant 4 (spec 3.7): consecutive 429s from live_status, and the
+  -- backoff currently in force because of them. Persisted, not just held in
+  -- memory, so a restart mid-rate-limit-event does not resume hammering at
+  -- the normal cadence -- see migrate_state() below, which is what actually
+  -- gets these two columns onto the live table.
+  consecutive_429s INTEGER NOT NULL DEFAULT 0,
+  backoff_s        INTEGER NOT NULL DEFAULT 0,
   updated_at      INTEGER NOT NULL DEFAULT 0
 );
 
@@ -345,6 +369,7 @@ STATE_DEFAULTS = {
     "raised_to": None, "raise_hold_elapsed": 0,
     "requests_today": 0, "requests_day": None,
     "capped": 0, "engaged_at": None,
+    "consecutive_429s": 0, "backoff_s": 0,
 }
 
 # The Machine fields that must survive between ticks. Anything here that is
@@ -369,6 +394,8 @@ def machine_fields(m: Machine) -> dict:
 # save_state call.
 STATE_NEW_COLUMNS = (
     ("raise_hold_elapsed", "INTEGER NOT NULL DEFAULT 0"),
+    ("consecutive_429s", "INTEGER NOT NULL DEFAULT 0"),
+    ("backoff_s", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 

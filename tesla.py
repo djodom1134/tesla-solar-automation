@@ -25,15 +25,38 @@ class TeslaAuthError(RuntimeError):
 
 
 class TeslaAPIError(RuntimeError):
-    def __init__(self, status: int, body: str):
+    def __init__(self, status: int, body: str, retry_after: float | None = None):
         super().__init__(f"Fleet API returned {status}: {body[:400]}")
         self.status = status
         self.body = body
+        # Seconds the server asked us to wait, when it told us. None means it
+        # didn't -- callers must not invent a value in that case (see
+        # _retry_after_seconds).
+        self.retry_after = retry_after
 
 
 class VehicleAsleep(RuntimeError):
     """HTTP 408 — the car is asleep or offline. Not an error path; the normal
     resting state. The response has no body at all."""
+
+
+def _retry_after_seconds(resp: httpx.Response) -> float | None:
+    """Parse a Retry-After header, or None when it is absent or unparseable.
+
+    Per RFC 9110 the header is either an integer number of seconds or an
+    HTTP-date. Only the integer/seconds form is handled -- a date needs a
+    format we have never measured this account emit, and guessing at one is
+    worse than admitting we don't know. Falls back to None rather than
+    inventing a value, matching the rule that an absent header must never be
+    guessed at either.
+    """
+    value = resp.headers.get("Retry-After")
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
 
 
 # Every group the car page reads. `location_data` is what actually yields
@@ -347,7 +370,8 @@ class TeslaClient:
                     await self._locked_refresh(stale=token)
                 continue
             if resp.status_code != 200:
-                raise TeslaAPIError(resp.status_code, resp.text)
+                raise TeslaAPIError(resp.status_code, resp.text,
+                                    retry_after=_retry_after_seconds(resp))
             payload = resp.json().get("response")
             if ttl:
                 self.cache.set(key, payload, ttl)
@@ -368,7 +392,8 @@ class TeslaClient:
                     await self._locked_refresh(stale=token)
                 continue
             if resp.status_code != 200:
-                raise TeslaAPIError(resp.status_code, resp.text)
+                raise TeslaAPIError(resp.status_code, resp.text,
+                                    retry_after=_retry_after_seconds(resp))
             return resp.json().get("response")
         raise TeslaAuthError("Could not authenticate to Fleet API.")
 

@@ -167,6 +167,11 @@ async def get_solar_status() -> dict[str, Any]:
             solar.grace_import_wh(db, vin, 0), 1) if vin else 0,
         "capped": bool(state["capped"]),
         "dirty": bool(state["dirty"]),
+        # Invariant 4 (spec 3.7): a sustained 429 means the controller is
+        # polling slower than the owner's configured period thinks -- surface
+        # it the same way capped/dirty are, not just in the collector's log.
+        "rate_limited": bool(state["consecutive_429s"]),
+        "backoff_s": state["backoff_s"],
         "engaged_at": state["engaged_at"],
         "last_tick_ts": last["ts"] if last else None,
         "requests_today": state["requests_today"] if state["requests_day"] == _today() else 0,

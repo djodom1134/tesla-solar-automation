@@ -224,9 +224,31 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
     try:
         live = await client._get(
             f"/api/1/energy_sites/{site_id}/live_status", ttl=0)
-    except (TeslaAPIError, TeslaAuthError, httpx.HTTPError, OSError) as exc:
+    except TeslaAPIError as exc:
+        if exc.status == 429:
+            # Invariant 4 (spec 3.7): lengthen the next interval instead of
+            # retrying at period_s. Rate limits are shared with every other
+            # app on the account, and Tesla's own limit doesn't throttle --
+            # it disables the whole application. count/backoff are persisted
+            # (not just held here) so a restart mid-event does not resume
+            # hammering; run() reads them back to set the actual sleep.
+            count = st["consecutive_429s"] + 1
+            backoff = solar.backoff_seconds(count, conf["period_s"], exc.retry_after)
+            solar.save_state(db, vin, consecutive_429s=count, backoff_s=backoff)
+            _log(f"live_status rate-limited (429); backing off {backoff}s "
+                 f"(consecutive={count}, retry_after={exc.retry_after})")
+            return st["state"], False
         _log(f"live_status failed: {exc}; holding")
         return st["state"], False
+    except (TeslaAuthError, httpx.HTTPError, OSError) as exc:
+        _log(f"live_status failed: {exc}; holding")
+        return st["state"], False
+
+    if st["consecutive_429s"]:
+        # Reset on any successful request (spec 3.7 invariant 4). A live
+        # read just succeeded, so whatever rate-limit event was in force has
+        # cleared.
+        solar.save_state(db, vin, consecutive_429s=0, backoff_s=0)
 
     grid_w = live.get("grid_power")
     if grid_w is None:
@@ -445,6 +467,7 @@ async def run(once: bool = False) -> int:
                 return 1
 
             wrote_last_tick = False
+            backoff_s = 0
             if view is not None and solar_wanted:
                 if not recovery_done:
                     db = store._db
@@ -467,6 +490,14 @@ async def run(once: bool = False) -> int:
                 state, wrote_last_tick = await solar_tick(
                     client, store, vin, view, settings, site_id)
                 engaged = conf["period_s"] if state in ENGAGED_STATES else 0
+                # Invariant 4 (spec 3.7): a 429 caught during this tick's
+                # live_status call lengthens the NEXT sleep instead of
+                # retrying at the normal cadence. solar_tick persists the
+                # computed backoff into solar_state (so a restart mid-event
+                # does not resume hammering) rather than returning it here --
+                # every other caller of solar_tick unpacks a plain (state,
+                # wrote) pair, and changing that would break them all.
+                backoff_s = solar.load_state(store._db, vin)["backoff_s"]
             else:
                 engaged = 0
 
@@ -474,7 +505,8 @@ async def run(once: bool = False) -> int:
             _log(f"{car_state}" + (f" soc={soc}%" if soc is not None else ""))
             if once:
                 return 0
-            await asyncio.sleep(next_interval(car_state, view, settings, engaged))
+            await asyncio.sleep(
+                backoff_s or next_interval(car_state, view, settings, engaged))
     finally:
         await client.aclose()
         store.close()
