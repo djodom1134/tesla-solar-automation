@@ -372,4 +372,21 @@ th .key { vertical-align: middle; margin-right: .35rem; }
 #garage-card .pill.state-open    { background: var(--warn, #f59e0b); color: #fff; }
 #solar-card .warn, #garage-card .warn { color: var(--bad, #ef4444); }
 #solar-card .hint, #garage-card .hint { color: var(--muted, #888); font-size: .85rem; margin: .35rem 0 .6rem; }
+
+/* ---- solar tank (Task 20) --------------------------------------------
+   Vertical battery fill, split into the solar and grid share of the
+   CURRENT charge -- placed first in the card, where the eye lands, with
+   the banked-miles and lifetime-free-miles figures promoted beside it as
+   headlines rather than the grey hint text they shipped as. */
+#solar-card .tank-row { display: flex; align-items: center; gap: 1.25rem; margin-bottom: .4rem; }
+#solar-card .tank { width: 4.25rem; flex: none; }
+#solar-card .tank svg { width: 100%; height: auto; display: block; }
+/* Neutral chrome -- same gray the ring/gridlines use, not either energy hue. */
+#solar-card .tank-outline { fill: none; stroke: var(--grid); stroke-width: 2; }
+#solar-card .tank-fill.tank-solar { fill: var(--solar); }
+#solar-card .tank-fill.tank-grid  { fill: var(--import); }
+#solar-card .tank-facts { flex: 1 1 auto; min-width: 0; }
+#solar-card .tank-headline { font-size: 1.05rem; font-weight: 600; margin: 0 0 .2rem; }
+#solar-card .tank-facts .big { margin: 0 0 .15rem; }
+#solar-card .tank-sub { font-size: .95rem; font-weight: 600; color: var(--ink-2); margin: .2rem 0 0; }
 #garage-card .row { display: flex; align-items: center; gap: .6rem; margin: .5rem 0; }

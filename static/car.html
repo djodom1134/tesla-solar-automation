@@ -78,6 +78,21 @@
 
   <section class="card" id="solar-card" hidden>
     <h2>Solar charging</h2>
+
+    <!-- The tank is what the eye lands on first: a vertical fill split into
+         the solar and grid share of the CURRENT charge, with the banked-
+         miles figure and the lifetime free-miles figure promoted beside it
+         as headlines rather than buried as footnote hints (Task 20). -->
+    <div class="tank-row">
+      <div id="solar-tank" class="tank" role="img" aria-label="Charge, split by source"></div>
+      <div class="tank-facts">
+        <p id="solar-tank-label" class="tank-headline">—</p>
+        <p id="solar-banked" class="big"></p>
+        <p id="solar-lifetime-free" class="tank-sub"></p>
+      </div>
+    </div>
+    <p id="solar-tank-hint" class="hint"></p>
+
     <div class="solar-head">
       <span id="solar-state" class="pill">idle</span>
       <span id="solar-surplus" class="big">—</span>
@@ -86,7 +101,6 @@
     <p id="solar-limit-note" class="hint" hidden></p>
     <p id="solar-grace" class="hint"></p>
     <p id="solar-free-miles" class="hint"></p>
-    <p id="solar-banked" class="hint"></p>
     <p id="solar-warn" class="warn" hidden></p>
   </section>
 

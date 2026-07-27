@@ -361,6 +361,17 @@ CREATE TABLE IF NOT EXISTS solar_state (
   solar_soc       REAL    NOT NULL DEFAULT 0,
   ledger_soc      INTEGER,
   ledger_stale    INTEGER NOT NULL DEFAULT 0,
+  -- Task 20: lifetime free miles driven (see green.free_miles_step). A
+  -- running total, never reset -- ledger_odo is the odometer as of the last
+  -- observation (NULL until this ledger has watched its own first tick,
+  -- same "absence means never assume a past" convention as ledger_soc
+  -- above). free_miles_since is the timestamp collector.py stamped the
+  -- first time ledger_odo was recorded, purely for display ("since 27
+  -- Jul") -- never recomputed, never backfilled.
+  free_miles_driven REAL    NOT NULL DEFAULT 0,
+  tracked_miles     REAL    NOT NULL DEFAULT 0,
+  ledger_odo        REAL,
+  free_miles_since  INTEGER,
   updated_at      INTEGER NOT NULL DEFAULT 0
 );
 
@@ -399,6 +410,8 @@ STATE_DEFAULTS = {
     "consecutive_429s": 0, "backoff_s": 0,
     "garage_armed": 0, "garage_last_close_day": None,
     "solar_soc": 0.0, "ledger_soc": None, "ledger_stale": 0,
+    "free_miles_driven": 0.0, "tracked_miles": 0.0, "ledger_odo": None,
+    "free_miles_since": None,
 }
 
 # The Machine fields that must survive between ticks. Anything here that is
@@ -431,6 +444,11 @@ STATE_NEW_COLUMNS = (
     ("solar_soc", "REAL NOT NULL DEFAULT 0"),
     ("ledger_soc", "INTEGER"),
     ("ledger_stale", "INTEGER NOT NULL DEFAULT 0"),
+    # Task 20: lifetime free miles driven -- see the SCHEMA comment above.
+    ("free_miles_driven", "REAL NOT NULL DEFAULT 0"),
+    ("tracked_miles", "REAL NOT NULL DEFAULT 0"),
+    ("ledger_odo", "REAL"),
+    ("free_miles_since", "INTEGER"),
 )
 
 

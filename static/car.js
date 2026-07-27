@@ -6,7 +6,7 @@
    number. */
 
 import { $, api, COLOR, nfmt, initTheme, showGate as gate } from "./shared.js";
-import { PAD, HEIGHT, el, niceTicks, chartFrame, showTip, hideTip, attachCrosshair }
+import { PAD, HEIGHT, el, niceTicks, chartFrame, showTip, hideTip, attachCrosshair, barPath }
   from "./chart.js";
 
 const state = {
@@ -41,6 +41,18 @@ function ago(seconds) {
   if (m < 60) return `${m} min ago`;
   const h = Math.round(m / 60);
   return h < 48 ? `${h} h ago` : `${Math.round(h / 24)} days ago`;
+}
+
+/* "27 Jul" -- written out manually rather than via toLocaleDateString so the
+   day/month order and the month's spelling can't flip with the viewer's
+   locale (en-US renders "Jul 27"); this project's own copy always reads
+   "since 27 Jul". */
+const SHORT_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                      "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+function shortDate(epochSeconds) {
+  if (epochSeconds == null) return null;
+  const d = new Date(epochSeconds * 1000);
+  return `${d.getDate()} ${SHORT_MONTHS[d.getMonth()]}`;
 }
 
 function toast(message, ok = true) {
@@ -234,6 +246,71 @@ async function refresh() {
 
 /* --------------------------------------------------------------- solar */
 
+/* Corner radius for the fill bands -- matches the outline's own rx so a
+   full-height fill (soc near 100%) sits flush inside it. */
+const TANK_R = 6;
+
+/* Inline SVG battery, no charting library -- reuses chart.js's own
+   hand-rolled idiom (el()/barPath()), the same one app.js's bar charts use.
+   Fill height is soc%, split into two vertically stacked bands: solarPct
+   (from the sun) and the remainder (from the grid). This is a PROPORTION of
+   the pack, not physical stratification -- electrons mix, and the car has
+   no idea which is which; see the hint text set in loadSolar().
+
+   barPath rounds only the edge passed as the "tip" (roundTop), leaving the
+   other edge square (see chart.js) -- so the internal seam between the two
+   bands must never be the one told to round. The solar band is always the
+   tip when present (roundTop=true, radius TANK_R; its bottom, the seam or
+   the baseline if grid is empty, comes out square for free). The grid band
+   is only ever rounded at its own top (roundTop=true, radius TANK_R) when
+   there is no solar band above it to hand the tip off to; otherwise it is
+   drawn with radius 0 -- a plain rect, so its top (an internal seam, not
+   the true baseline) is not rounded either. */
+function renderTank(soc, solarPct) {
+  const host = $("solar-tank");
+  if (!host) return;
+  host.replaceChildren();
+
+  const W = 64, H = 132;
+  const bodyTop = 16, bodyBottom = H - 4, bodyLeft = 6, bodyRight = W - 6;
+  const bodyW = bodyRight - bodyLeft, bodyH = bodyBottom - bodyTop;
+
+  const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "presentation" });
+
+  const socPct = Math.max(0, Math.min(100, soc ?? 0));
+  const solar = Math.max(0, Math.min(socPct, solarPct ?? 0));
+  const grid = socPct - solar;
+  const gridH = (grid / 100) * bodyH;
+  const solarH = (solar / 100) * bodyH;
+
+  if (gridH > 0) {
+    const roundTop = solarH <= 0;   // the tip only when no solar band sits above it
+    svg.append(el("path", {
+      d: barPath(bodyLeft, bodyBottom - gridH, bodyW, gridH, roundTop ? TANK_R : 0, roundTop),
+      class: "tank-fill tank-grid",
+    }));
+  }
+  if (solarH > 0) {
+    svg.append(el("path", {
+      d: barPath(bodyLeft, bodyBottom - gridH - solarH, bodyW, solarH, TANK_R, true),
+      class: "tank-fill tank-solar",
+    }));
+  }
+
+  // Outline (and the nub -- the universal battery cue) drawn last, over the
+  // fill, so the edge reads crisply.
+  svg.append(el("rect", {
+    x: bodyLeft, y: bodyTop, width: bodyW, height: bodyH, rx: TANK_R,
+    class: "tank-outline",
+  }));
+  svg.append(el("rect", {
+    x: W / 2 - 9, y: 3, width: 18, height: bodyTop - 5, rx: 3,
+    class: "tank-outline",
+  }));
+
+  host.append(svg);
+}
+
 async function loadSolar() {
   let s;
   try {
@@ -243,6 +320,20 @@ async function loadSolar() {
   }
   const card = $("solar-card");
   card.hidden = false;
+
+  // The tank -- what the eye lands on first (Task 20). solar_soc (banked_pct)
+  // is always <= soc by the ledger's own invariant (green.ledger_step), so
+  // the grid share is simply the remainder; no new backend field needed.
+  const soc = s.soc;
+  const solarPct = s.banked_pct;
+  renderTank(soc, solarPct);
+  $("solar-tank-label").textContent = soc == null
+    ? "Charge unknown"
+    : `${soc}% charged — ${nfmt(solarPct, 0)}% from sun, `
+      + `${nfmt(Math.max(0, soc - solarPct), 0)}% from grid.`;
+  $("solar-tank-hint").textContent =
+    "The sun/grid split above is a proportion of the pack, not a physical "
+    + "layer — electrons mix, and the car has no idea which is which.";
 
   // A disabled controller that has never run also reports state:"idle" --
   // identical to an enabled-but-quiet one. Showing "off" here is the only
@@ -290,7 +381,10 @@ async function loadSolar() {
   // pack"), separate from free_miles above (today's FLOW). Two figures
   // exist -- the car's own rated range (available immediately) and the
   // owner's measured consumption (needs Task 16's thresholds) -- shown one
-  // at a time, always labelled which, never averaged (spec 7.4).
+  // at a time, always labelled which, never averaged (spec 7.4). Promoted to
+  // a headline beside the tank (Task 20); the basis label survives the
+  // promotion unchanged, since it is the difference between a number the
+  // owner can trust and one they cannot.
   const lower = s.ledger_stale
     ? " (lower bound -- a sample gap means the pack may have changed unobserved)"
     : "";
@@ -302,6 +396,21 @@ async function loadSolar() {
     $("solar-banked").textContent =
       `Banked solar: ${s.banked_pct}% of charge = ${s.banked_miles} free miles `
       + `(${basis})${lower}.`;
+  }
+
+  // Lifetime free miles driven (Task 20) -- the ledger's own running total
+  // (green.free_miles_step), never reset, promoted to its own headline
+  // line rather than a hint. tracked_miles === 0 means the ledger has not
+  // observed a single window yet (fresh install, or the tick right after
+  // deployment recorded its odometer baseline and nothing more) -- say so
+  // rather than showing a misleading "0 of 0 miles (0%)".
+  if (s.tracked_miles === 0 || s.free_miles_since == null) {
+    $("solar-lifetime-free").textContent = "Driven free: no miles tracked yet.";
+  } else {
+    const since = shortDate(s.free_miles_since);
+    $("solar-lifetime-free").textContent =
+      `Driven free: ${nfmt(s.free_miles_driven, 1)} of ${nfmt(s.tracked_miles, 1)} miles `
+      + `(${nfmt(s.free_miles_share, 1)}%) since ${since}.`;
   }
 
   const warn = $("solar-warn");

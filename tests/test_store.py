@@ -357,6 +357,70 @@ def test_solar_state_migration_adds_the_banked_solar_ledger_columns(tmp_path):
     s.close()
 
 
+def test_solar_state_migration_adds_the_free_miles_ledger_columns(tmp_path):
+    """Task 20's free_miles_driven / tracked_miles / ledger_odo /
+    free_miles_since, added to solar_state exactly like every prior column
+    above. The legacy shape here is the owner's ACTUAL live car.db today --
+    solar_soc/ledger_soc/ledger_stale (Task 18) already present, the four
+    Task 20 columns not yet. Without migrate_state ALTERing them onto the
+    live table, load_state() raises IndexError on the very first tick after
+    this ships -- the same defect class the standing instruction calls out,
+    and the one this test exists to make sure never comes back."""
+    import sqlite3
+    path = tmp_path / "old.db"
+    legacy = sqlite3.connect(path)
+    legacy.executescript("""
+        CREATE TABLE solar_state (
+          vin             TEXT PRIMARY KEY,
+          state           TEXT    NOT NULL DEFAULT 'idle',
+          breach_ticks    INTEGER NOT NULL DEFAULT 0,
+          recover_ticks   INTEGER NOT NULL DEFAULT 0,
+          grace_s_elapsed INTEGER NOT NULL DEFAULT 0,
+          hold_s          INTEGER NOT NULL DEFAULT 0,
+          dirty           INTEGER NOT NULL DEFAULT 0,
+          original_amps   INTEGER,
+          original_limit  INTEGER,
+          raised_to       INTEGER,
+          raise_hold_elapsed INTEGER NOT NULL DEFAULT 0,
+          requests_today  INTEGER NOT NULL DEFAULT 0,
+          requests_day    TEXT,
+          capped          INTEGER NOT NULL DEFAULT 0,
+          engaged_at      INTEGER,
+          consecutive_429s INTEGER NOT NULL DEFAULT 0,
+          backoff_s        INTEGER NOT NULL DEFAULT 0,
+          garage_armed          INTEGER NOT NULL DEFAULT 0,
+          garage_last_close_day TEXT,
+          solar_soc       REAL    NOT NULL DEFAULT 0,
+          ledger_soc      INTEGER,
+          ledger_stale    INTEGER NOT NULL DEFAULT 0,
+          updated_at      INTEGER NOT NULL DEFAULT 0
+        );
+    """)
+    legacy.execute(
+        "INSERT INTO solar_state (vin, state, raised_to, solar_soc, ledger_soc, updated_at) "
+        "VALUES ('VIN1', 'idle', NULL, 0.0, 78, 0)")
+    legacy.commit()
+    legacy.close()
+
+    from store import Store
+    import solar
+    s = Store(path)
+    cols = {r[1] for r in s._db.execute("PRAGMA table_info(solar_state)")}
+    assert "free_miles_driven" in cols, "missing after migration"
+    assert "tracked_miles" in cols, "missing after migration"
+    assert "ledger_odo" in cols, "missing after migration"
+    assert "free_miles_since" in cols, "missing after migration"
+
+    st = solar.load_state(s._db, "VIN1")
+    assert st["solar_soc"] == 0.0, "pre-existing Task 18 data must survive the migration"
+    assert st["ledger_soc"] == 78, "pre-existing Task 18 data must survive the migration"
+    assert st["free_miles_driven"] == 0, "new column must default cleanly, not from a guess"
+    assert st["tracked_miles"] == 0, "new column must default cleanly"
+    assert st["ledger_odo"] is None, "no previous odometer yet -- must not assume one"
+    assert st["free_miles_since"] is None, "never tracked yet -- must not invent a start date"
+    s.close()
+
+
 def test_solar_config_migration_adds_the_garage_columns_to_an_existing_table(tmp_path):
     """The owner's live car.db already has a solar_config table with rows in
     it from before task 17b -- CREATE TABLE IF NOT EXISTS is a no-op against

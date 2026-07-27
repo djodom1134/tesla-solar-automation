@@ -368,7 +368,7 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
                  f"for solar")
     solar.save_state(db, vin, raised_to=raised, raise_hold_elapsed=raise_hold)
 
-    # --- banked-solar ledger (Task 18) --------------------------------------
+    # --- banked-solar ledger (Task 18) and lifetime free miles (Task 20) ----
     # last_tick_ts() must be read BEFORE log_tick() below writes this tick's
     # own row, or MAX(ts) would return this tick and the gap would always
     # read as zero. Skipped entirely when soc is unknown -- nothing to
@@ -396,6 +396,26 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
             gap_s, gap_threshold_s)
         ledger_fields = {"solar_soc": new_solar_soc, "ledger_soc": int(soc_now),
                          "ledger_stale": 1 if ledger_stale else 0}
+
+        # Task 20: lifetime free miles driven -- green.free_miles_step's own
+        # "before" arguments are st["solar_soc"]/st["ledger_soc"], the SAME
+        # pre-tick values ledger_step was just called with above, not the
+        # new_solar_soc this tick just produced (see that function's
+        # docstring for why). Independently gated on the odometer being
+        # known, same "nothing to observe, don't guess" treatment as soc
+        # above -- a view missing odometer_mi leaves free_miles_driven/
+        # tracked_miles/ledger_odo exactly as they were.
+        odo_now = view.get("odometer_mi")
+        if odo_now is not None:
+            first_observation = st["ledger_odo"] is None
+            new_free_miles, new_tracked_miles, new_ledger_odo = green.free_miles_step(
+                st["free_miles_driven"], st["tracked_miles"], st["ledger_odo"],
+                float(odo_now), st["solar_soc"], st["ledger_soc"])
+            ledger_fields["free_miles_driven"] = new_free_miles
+            ledger_fields["tracked_miles"] = new_tracked_miles
+            ledger_fields["ledger_odo"] = new_ledger_odo
+            if first_observation:
+                ledger_fields["free_miles_since"] = int(time.time())
 
     solar.save_state(db, vin, **solar.machine_fields(machine), **ledger_fields)
     solar.log_tick(db, vin, ts=int(time.time()), state=machine.state,

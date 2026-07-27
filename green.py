@@ -274,3 +274,83 @@ def banked_miles_measured(
     if pack_kwh is None or mi_per_kwh is None:
         return None
     return solar_soc / 100 * pack_kwh * mi_per_kwh
+
+
+# --------------------------------------------------------------------------
+# Task 20: lifetime free miles driven. The banked-solar ledger above already
+# knows, every tick, what FRACTION of the pack came from the sun -- this is
+# not new physics, only accumulation: multiply that fraction by the miles
+# actually driven since the last observation and keep a running lifetime
+# total.
+# --------------------------------------------------------------------------
+
+def free_miles_step(
+    free_miles_driven: float, tracked_miles: float, ledger_odo: float | None,
+    odo_now: float, solar_soc_before: float, soc_before: int | None,
+) -> tuple[float, float, float]:
+    """Advance the lifetime free-miles ledger by one observation.
+
+    Returns (new_free_miles_driven, new_tracked_miles, new_ledger_odo). Pure:
+    no clock, no database -- the caller supplies the previous odometer
+    reading (persisted as solar_state.ledger_odo, since there is no reliable
+    way to re-derive "the previous sample" inside a pure function) and gets
+    back the updated lifetime totals plus the new odometer baseline.
+
+    THE ARITHMETIC (the brief's own formula, unchanged)::
+
+        solar_share    = solar_soc_before / soc_before
+        free_miles    += miles_in_window * solar_share
+        tracked_miles += miles_in_window
+
+    solar_soc_before and soc_before are deliberately the SAME "before" values
+    ledger_step (above) is called with this same tick -- the banked ledger's
+    own state prior to folding in this observation, not the value it
+    produces after. The fraction is only valid for the pack as it stood
+    across the window just driven; reading the post-update fraction here
+    would credit this window with a solar share the pack could not actually
+    have delivered across it.
+
+    ledger_odo is None on the very first tick after this column existed --
+    a fresh install, or the tick right after this feature was deployed.
+    There is no previous odometer to diff against, so the only honest move
+    is to record it and accumulate nothing: never assume driving happened
+    before anything was watching (same doctrine as ledger_step's
+    soc_before is None branch above). NEVER backfill this from history --
+    the ledger starts at zero for a reason, and inventing a past would make
+    every number after it unauditable.
+
+    A negative delta cannot physically happen -- the odometer only counts
+    up -- so one means a corrupt or reordered sample, not a car that
+    reversed its own lifetime mileage. Silently subtracting it would make
+    the total wrong in a way nobody could audit; the honest move is to
+    ignore the WHOLE observation (log it, change nothing, including the
+    baseline) and let the next good sample re-establish it -- exactly like
+    a skipped tick, the miles are merged into whichever later window
+    finally reads a consistent odometer again, never lost and never
+    invented.
+
+    soc_before of 0 or None means the fraction itself cannot be computed --
+    0 as a literal (nothing left to take a share of) and None because the
+    banked-solar ledger has not observed its own first tick yet (see
+    ledger_step). Either way the odometer reading itself is still
+    trustworthy (unlike the negative-delta case above), so the baseline
+    still advances to odo_now -- only the window's contribution to both
+    totals is skipped, rather than dividing by a number that means nothing.
+    """
+    if ledger_odo is None:
+        return free_miles_driven, tracked_miles, odo_now
+
+    miles_in_window = odo_now - ledger_odo
+    if miles_in_window < 0:
+        logger.warning(
+            "odometer went backward %.3f -> %.3f: ignoring this window, "
+            "not advancing the ledger baseline", ledger_odo, odo_now)
+        return free_miles_driven, tracked_miles, ledger_odo
+
+    if not soc_before:
+        return free_miles_driven, tracked_miles, odo_now
+
+    solar_share = solar_soc_before / soc_before
+    return (free_miles_driven + miles_in_window * solar_share,
+            tracked_miles + miles_in_window,
+            odo_now)

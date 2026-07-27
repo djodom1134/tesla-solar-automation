@@ -145,22 +145,31 @@ def _sessions_and_segments(
 
 
 def _green_status(
-    db, vin: str, solar_soc: float, soc: int | None, range_mi: float | None
+    db, vin: str, solar_soc: float, soc: int | None, range_mi: float | None,
+    free_miles_driven: float, tracked_miles: float, free_miles_since: int | None,
 ) -> dict[str, Any]:
-    """The free-miles answer, both the daily FLOW (Task 16) and the banked
-    STOCK (Task 18), honest about what each doesn't know yet.
+    """The free-miles answer, the daily FLOW (Task 16), the banked STOCK
+    (Task 18) and the lifetime free miles actually driven (Task 20), honest
+    about what each doesn't know yet.
 
     mi_per_kwh and pack_kwh are lifetime figures -- they only get more
     trustworthy with more history, so there is no reason to reset them
     daily. solar_kwh_today is scoped to the calendar day, same convention as
     grace_import_wh_today. banked_pct/banked_miles are NOT scoped to the
     day -- the bank is a running balance, not a daily tally, so it persists
-    across midnight exactly like the pack itself.
+    across midnight exactly like the pack itself. Neither are
+    free_miles_driven/tracked_miles -- same running-balance treatment,
+    accumulated tick by tick in collector.py (green.free_miles_step), never
+    recomputed here from history.
 
     banked_miles is the measured figure when pack_kwh/mi_per_kwh have
     cleared their thresholds, else the car's own rated-range figure, never
     both blended together -- banked_miles_basis says which so the UI can
     label it rather than switch silently (spec 7.4).
+
+    free_miles_share is None (not 0) while tracked_miles is still 0 -- 0/0
+    is undefined, not a real zero, and the UI must say "not tracked yet"
+    rather than a misleading 0%.
     """
     solar_today = green.solar_kwh(_solar_ticks(db, vin, _midnight_ts()))
     sessions, segments = _sessions_and_segments(db, vin)
@@ -177,6 +186,9 @@ def _green_status(
     else:
         banked_miles, banked_basis = None, None
 
+    free_share = (round(100 * free_miles_driven / tracked_miles, 1)
+                 if tracked_miles > 0 else None)
+
     return {
         "free_miles": round(free, 1) if free is not None else None,
         "solar_kwh_today": round(solar_today, 2),
@@ -189,6 +201,10 @@ def _green_status(
         "banked_miles_measured": round(measured, 1) if measured is not None else None,
         "banked_miles": round(banked_miles, 1) if banked_miles is not None else None,
         "banked_miles_basis": banked_basis,
+        "free_miles_driven": round(free_miles_driven, 1),
+        "tracked_miles": round(tracked_miles, 1),
+        "free_miles_share": free_share,
+        "free_miles_since": free_miles_since,
     }
 
 
@@ -314,7 +330,9 @@ async def get_solar_status() -> dict[str, Any]:
         # store.GAP_SECONDS since the ledger last observed the car means the
         # pack may have changed unobserved.
         "ledger_stale": bool(state["ledger_stale"]),
-        **_green_status(db, vin, state["solar_soc"], view.get("soc"), view.get("range_mi")),
+        **_green_status(db, vin, state["solar_soc"], view.get("soc"), view.get("range_mi"),
+                        state["free_miles_driven"], state["tracked_miles"],
+                        state["free_miles_since"]),
     }
 
 

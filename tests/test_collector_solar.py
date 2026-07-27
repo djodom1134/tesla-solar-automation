@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from types import SimpleNamespace
 
 import httpx
@@ -1097,6 +1098,154 @@ async def test_ledger_long_gap_with_unchanged_soc_is_not_stale_through_the_real_
     # Same soc as before -- the car simply slept the whole gap.
     await collector.solar_tick(client, store_, "VIN1", _ledger_view(55), cfg, site_id=1)
     assert solar.load_state(db, "VIN1")["ledger_stale"] == 0
+    store_.close()
+
+
+# --------------------------------------------------------------------------
+# Task 20 -- lifetime free miles driven, wired through the REAL solar_tick
+# (green.free_miles_step itself is covered exhaustively in test_green.py).
+# These tests are about the collector's own job: pulling odometer_mi out of
+# a real tick and persisting the result alongside the banked-solar ledger,
+# not the free-miles arithmetic.
+# --------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_free_miles_first_tick_after_deployment_records_the_odometer_only(tmp_path):
+    """ledger_odo starts NULL (the migration default) -- the very first
+    tick must record the observed odometer and stamp free_miles_since, but
+    accumulate nothing -- never assume driving happened before the ledger
+    was watching."""
+    store_ = Store(tmp_path / "car.db")
+    db = store_._db
+    solar.save_config(db, enabled=1)
+    home.save(db, 40.0, -105.0, 100)
+    solar.save_state(db, "VIN1", state="idle", hold_s=10_000)
+
+    client = _ControllableGridClient(grid_w=-6000.0)
+    cfg = SimpleNamespace(timezone="America/Denver", proxy_url="https://localhost:4443")
+    before = int(time.time())
+    await collector.solar_tick(
+        client, store_, "VIN1", _ledger_view(55, odometer_mi=55_000.0), cfg, site_id=1)
+
+    st = solar.load_state(db, "VIN1")
+    assert st["ledger_odo"] == 55_000.0
+    assert st["free_miles_driven"] == 0
+    assert st["tracked_miles"] == 0
+    assert st["free_miles_since"] is not None and st["free_miles_since"] >= before
+    store_.close()
+
+
+@pytest.mark.asyncio
+async def test_free_miles_uses_the_ledgers_pre_tick_share_not_the_post_tick_one(tmp_path):
+    """The tick that banks a rise must NOT credit that same window's miles
+    with the share it just produced -- the solar fraction is only valid for
+    the pack as it stood ACROSS the window just driven, not as it stands
+    after this tick folds the rise in. Traced by hand: tick 1 records
+    solar_soc=0/ledger_soc=55/ledger_odo=1000; tick 2 banks a 5-point rise
+    (solar_soc 0 -> 5) while ALSO advancing the odometer 10 miles -- since
+    the pre-tick share was 0/55 = 0%, free_miles_driven must stay exactly 0,
+    not 10 * 5/55."""
+    store_ = Store(tmp_path / "car.db")
+    db = store_._db
+    solar.save_config(db, enabled=1)
+    home.save(db, 40.0, -105.0, 100)
+    solar.save_state(db, "VIN1", state="idle", hold_s=10_000)
+
+    client = _ControllableGridClient(grid_w=-6000.0)
+    cfg = SimpleNamespace(timezone="America/Denver", proxy_url="https://localhost:4443")
+
+    await collector.solar_tick(
+        client, store_, "VIN1", _ledger_view(55, odometer_mi=1000.0), cfg, site_id=1)
+    assert solar.load_state(db, "VIN1")["state"] == "charging", "premise: engaged by tick 1"
+
+    await collector.solar_tick(
+        client, store_, "VIN1", _ledger_view(60, odometer_mi=1010.0), cfg, site_id=1)
+    st = solar.load_state(db, "VIN1")
+    assert st["solar_soc"] == pytest.approx(5.0), "premise: tick 2 banked the rise"
+    assert st["tracked_miles"] == pytest.approx(10.0)
+    assert st["free_miles_driven"] == 0, "pre-tick share was 0/55, not the post-tick 5/55"
+    store_.close()
+
+
+@pytest.mark.asyncio
+async def test_free_miles_credits_the_share_once_the_ledger_is_no_longer_empty(tmp_path):
+    """A third tick, now WITH a nonzero pre-tick bank, actually credits free
+    miles -- 6 miles driven at a pre-tick share of 5/60 (~8.33%)."""
+    store_ = Store(tmp_path / "car.db")
+    db = store_._db
+    solar.save_config(db, enabled=1)
+    home.save(db, 40.0, -105.0, 100)
+    solar.save_state(db, "VIN1", state="idle", hold_s=10_000)
+
+    client = _ControllableGridClient(grid_w=-6000.0)
+    cfg = SimpleNamespace(timezone="America/Denver", proxy_url="https://localhost:4443")
+
+    await collector.solar_tick(
+        client, store_, "VIN1", _ledger_view(55, odometer_mi=1000.0), cfg, site_id=1)
+    await collector.solar_tick(
+        client, store_, "VIN1", _ledger_view(60, odometer_mi=1010.0), cfg, site_id=1)
+    st = solar.load_state(db, "VIN1")
+    assert (st["solar_soc"], st["ledger_soc"]) == (pytest.approx(5.0), 60), "premise from the prior test"
+
+    # A third tick, still exporting, soc unchanged (no further bank/drain),
+    # 6 more miles on the odometer.
+    await collector.solar_tick(
+        client, store_, "VIN1", _ledger_view(60, odometer_mi=1016.0), cfg, site_id=1)
+    st = solar.load_state(db, "VIN1")
+    assert st["tracked_miles"] == pytest.approx(16.0)
+    assert st["free_miles_driven"] == pytest.approx(6.0 * (5.0 / 60.0))
+    store_.close()
+
+
+@pytest.mark.asyncio
+async def test_free_miles_since_is_stamped_once_and_never_rewritten(tmp_path):
+    store_ = Store(tmp_path / "car.db")
+    db = store_._db
+    solar.save_config(db, enabled=1)
+    home.save(db, 40.0, -105.0, 100)
+    solar.save_state(db, "VIN1", state="idle", hold_s=10_000)
+
+    client = _ControllableGridClient(grid_w=-6000.0)
+    cfg = SimpleNamespace(timezone="America/Denver", proxy_url="https://localhost:4443")
+
+    await collector.solar_tick(
+        client, store_, "VIN1", _ledger_view(55, odometer_mi=1000.0), cfg, site_id=1)
+    first_stamp = solar.load_state(db, "VIN1")["free_miles_since"]
+    assert first_stamp is not None
+
+    await collector.solar_tick(
+        client, store_, "VIN1", _ledger_view(60, odometer_mi=1010.0), cfg, site_id=1)
+    await collector.solar_tick(
+        client, store_, "VIN1", _ledger_view(60, odometer_mi=1016.0), cfg, site_id=1)
+    assert solar.load_state(db, "VIN1")["free_miles_since"] == first_stamp
+    store_.close()
+
+
+@pytest.mark.asyncio
+async def test_free_miles_ignores_a_view_missing_the_odometer(tmp_path):
+    """A view without odometer_mi (Tesla omits keys rather than nulling
+    them, per vehicle.py's own docstring) must leave free_miles_driven/
+    tracked_miles/ledger_odo exactly as they were, same treatment as an
+    unknown soc gets for the banked-solar ledger."""
+    store_ = Store(tmp_path / "car.db")
+    db = store_._db
+    solar.save_config(db, enabled=1)
+    home.save(db, 40.0, -105.0, 100)
+    solar.save_state(db, "VIN1", state="idle", hold_s=10_000)
+
+    client = _ControllableGridClient(grid_w=-6000.0)
+    cfg = SimpleNamespace(timezone="America/Denver", proxy_url="https://localhost:4443")
+
+    view = _ledger_view(55)
+    view.pop("odometer_mi", None)
+    assert "odometer_mi" not in view
+    await collector.solar_tick(client, store_, "VIN1", view, cfg, site_id=1)
+
+    st = solar.load_state(db, "VIN1")
+    assert st["ledger_odo"] is None
+    assert st["free_miles_driven"] == 0
+    assert st["tracked_miles"] == 0
+    assert st["free_miles_since"] is None
     store_.close()
 
 

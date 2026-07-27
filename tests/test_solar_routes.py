@@ -125,6 +125,19 @@ def test_status_reports_idle_before_anything_runs(client, monkeypatch):
     assert body["grace_import_wh_total"] == 0
 
 
+def test_status_reports_zero_free_miles_before_anything_runs(client, monkeypatch):
+    """Task 20's honest today: the controller has never charged from
+    surplus, so lifetime free miles must be a real, definite zero -- and
+    the share must be None (not 0), since 0 of 0 tracked miles is
+    undefined, not a real 0%."""
+    monkeypatch.setattr(solar_routes, "DEMO", False)
+    body = client.get("/api/car/solar/status").json()
+    assert body["free_miles_driven"] == 0
+    assert body["tracked_miles"] == 0
+    assert body["free_miles_share"] is None
+    assert body["free_miles_since"] is None
+
+
 def test_status_pins_enabled_false_on_the_shipped_default(client, monkeypatch):
     """I12: the branch ships with solar_config.enabled = 0 and no tick has
     ever run. A disabled controller must render distinguishably from an
@@ -181,6 +194,52 @@ def test_demo_status_returns_the_fixture_not_real_data(client):
     assert body["surplus_w"] == 6240.0
     assert body["raised_to"] == 90 and body["original_limit"] == 80
     assert body["grace_import_wh_today"] == 41.3
+
+
+def test_demo_status_pins_the_lifetime_free_miles_fixture(client):
+    """Task 20's promoted headline: 128.4 of 431.7 miles is the brief's own
+    worked example (29.7%), pinned here the same way the rest of the demo
+    fixture is pinned above."""
+    body = client.get("/api/car/solar/status").json()
+    assert body["free_miles_driven"] == 128.4
+    assert body["tracked_miles"] == 431.7
+    assert body["free_miles_share"] == 29.7
+
+
+def test_status_free_miles_share_divides_the_lifetime_totals(client, monkeypatch, tmp_path):
+    """Not just passed through -- computed from whatever the ledger has
+    actually accumulated, real store-backed path.
+
+    Written through a SEPARATE Store connection onto the same on-disk file
+    (WAL mode), mirroring how the real collector process and this web app
+    process share car.db as two different connections -- sqlite3
+    connections are thread-bound (check_same_thread), so writing through
+    solar_routes' own connection directly from the test thread and then
+    reading it back through TestClient's portal thread raises
+    "SQLite objects created in a thread can only be used in that same
+    thread"; two independent connections to the same file have no such
+    restriction and is exactly how the real system works anyway.
+
+    _vin() prefers settings.vin (empty in this test environment, see
+    test_status_reports_idle_before_anything_runs's neighbours) and falls
+    back to the most recent samples.vin -- so a sample row is inserted
+    first, purely to give the route a vin to key solar_state on.
+    """
+    monkeypatch.setattr(solar_routes, "DEMO", False)
+    from store import Store
+    import solar as solar_module
+    writer = Store(tmp_path / "t.db")
+    writer._db.execute("INSERT INTO samples (ts, vin) VALUES (1000, 'VINX')")
+    writer._db.commit()
+    solar_module.save_state(writer._db, "VINX", free_miles_driven=25.0,
+                            tracked_miles=100.0, free_miles_since=1785000000)
+    writer.close()
+
+    body = client.get("/api/car/solar/status").json()
+    assert body["free_miles_driven"] == 25.0
+    assert body["tracked_miles"] == 100.0
+    assert body["free_miles_share"] == 25.0
+    assert body["free_miles_since"] == 1785000000
 
 
 # --------------------------------------------------------------------------

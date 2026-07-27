@@ -264,3 +264,96 @@ def test_banked_miles_measured_is_none_until_thresholds_met():
 
 def test_banked_miles_measured_multiplies_the_bank_by_real_consumption():
     assert green.banked_miles_measured(20.0, 80.0, 3.5) == pytest.approx(56.0)
+
+
+# --------------------------------------------------------------------------
+# Task 20: lifetime free miles driven. No new physics -- the banked-solar
+# ledger above already knows, every tick, what fraction of the pack came
+# from the sun; this only multiplies that fraction by the miles driven
+# since the last observation and keeps a running lifetime total.
+# --------------------------------------------------------------------------
+
+def test_free_miles_first_tick_after_deployment_records_but_tracks_nothing():
+    """No previous odometer exists yet -- the only honest move is to record
+    it and accumulate nothing, never assume driving happened before
+    anything was watching. Never backfilled from history."""
+    free, tracked, odo = green.free_miles_step(0.0, 0.0, None, 55_000.0, 20.0, 80)
+    assert (free, tracked, odo) == (0.0, 0.0, 55_000.0)
+
+
+def test_free_miles_accumulates_the_solar_share_of_the_window():
+    """20 of 80 SoC points (25%) are solar; 20 miles driven since the last
+    observation credits 5 of them as free."""
+    free, tracked, odo = green.free_miles_step(0.0, 0.0, 500.0, 520.0, 20.0, 80)
+    assert free == pytest.approx(5.0)
+    assert tracked == 20.0
+    assert odo == 520.0
+
+
+def test_free_miles_is_a_running_lifetime_total_across_many_windows():
+    """Lifetime totals, not reset per call -- two windows with different
+    solar shares must sum, not overwrite."""
+    free, tracked, odo = green.free_miles_step(0.0, 0.0, 500.0, 520.0, 20.0, 80)  # +5 of 20
+    free, tracked, odo = green.free_miles_step(free, tracked, odo, 540.0, 10.0, 60)  # +10*10/60
+    assert free == pytest.approx(5.0 + 20.0 * (10.0 / 60.0))
+    assert tracked == pytest.approx(40.0)
+    assert odo == 540.0
+
+
+def test_free_miles_ignores_negative_odometer_delta_and_holds_the_baseline(caplog):
+    """The odometer only counts up -- a drop is a corrupt or reordered
+    sample, not a car that reversed its own lifetime mileage. Silently
+    subtracting it would make the total wrong in a way nobody could audit,
+    so the whole observation (including the baseline) is ignored."""
+    with caplog.at_level(logging.WARNING, logger="green"):
+        free, tracked, odo = green.free_miles_step(10.0, 300.0, 500.0, 480.0, 20.0, 80)
+    assert (free, tracked, odo) == (10.0, 300.0, 500.0)
+    assert any("backward" in r.message for r in caplog.records)
+
+
+def test_free_miles_recovers_after_a_corrupt_sample_without_double_counting():
+    """The baseline held back by the corrupt sample above means the NEXT
+    good sample's window naturally merges whatever was skipped -- no miles
+    invented, none lost."""
+    free, tracked, odo = green.free_miles_step(10.0, 300.0, 500.0, 480.0, 20.0, 80)
+    free, tracked, odo = green.free_miles_step(free, tracked, odo, 510.0, 20.0, 80)
+    assert tracked == pytest.approx(300.0 + 10.0), "500 -> 510 is a 10-mile window"
+    assert free == pytest.approx(10.0 + 10.0 * (20.0 / 80.0))
+
+
+def test_free_miles_skips_the_window_when_soc_before_is_zero_but_still_advances_odo():
+    """Nothing to take a fraction of -- but the odometer reading itself is
+    still trustworthy, so the baseline still advances rather than merging
+    this window into the next one (unlike the corrupt-sample case above)."""
+    free, tracked, odo = green.free_miles_step(10.0, 300.0, 500.0, 520.0, 20.0, 0)
+    assert (free, tracked, odo) == (10.0, 300.0, 520.0)
+
+
+def test_free_miles_skips_the_window_when_soc_before_is_none_but_still_advances_odo():
+    """Defensive: the banked-solar ledger hasn't observed its own first
+    tick yet. Cannot happen via the real collector wiring today (ledger_odo
+    and ledger_soc are always set together), but the pure function must not
+    divide by an unknown regardless."""
+    free, tracked, odo = green.free_miles_step(10.0, 300.0, 500.0, 520.0, 20.0, None)
+    assert (free, tracked, odo) == (10.0, 300.0, 520.0)
+
+
+def test_free_miles_zero_delta_window_changes_nothing():
+    free, tracked, odo = green.free_miles_step(10.0, 300.0, 500.0, 500.0, 20.0, 80)
+    assert (free, tracked, odo) == (10.0, 300.0, 500.0)
+
+
+def test_free_miles_never_exceeds_tracked_miles():
+    """Property check across a long random walk -- solar_share is always a
+    fraction (solar_soc <= soc by the banked ledger's own invariant), so the
+    lifetime free total can never outrun the lifetime tracked total."""
+    rng = random.Random(20260727)
+    free, tracked = 0.0, 0.0
+    odo: float | None = None
+    for _ in range(2000):
+        odo_now = (odo or 50_000.0) + rng.uniform(0, 5)
+        soc_before = rng.randint(1, 100)
+        solar_soc_before = rng.uniform(0, soc_before)
+        free, tracked, odo = green.free_miles_step(
+            free, tracked, odo, odo_now, solar_soc_before, soc_before)
+        assert free <= tracked + 1e-9, (free, tracked, odo_now, soc_before, solar_soc_before)

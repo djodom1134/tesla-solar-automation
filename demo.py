@@ -392,6 +392,13 @@ def solar_status() -> dict:
         "banked_miles_measured": 28.2,
         "banked_miles": 28.2,
         "banked_miles_basis": "measured",
+        # Task 20: lifetime free miles driven -- a demo car with months of
+        # history behind it, so the promoted headline has something to
+        # show. 128.4 / 431.7 = 29.7%, the brief's own worked example.
+        "free_miles_driven": 128.4,
+        "tracked_miles": 431.7,
+        "free_miles_share": 29.7,
+        "free_miles_since": int(time.time()) - 86400 * 21,
     }
 
 
