@@ -37,19 +37,32 @@ Deferring the air conditioner **does not create solar energy**. The array
 produced what it produced; the house still needs the cooling later. Total daily
 import is `load − solar` and shifting load within the day does not move it.
 
-Under this site's **flat-rate import with no TOU and no storage**, which load
-consumes the solar is economically irrelevant. Every "free solar mile" this
-project creates is worth approximately **$0**.
+**[CORRECTED 2026-07-27.]** An earlier draft of this section concluded that
+every "free solar mile" was worth approximately **$0**. That was correct only
+under full-retail net metering, where a kWh exported at noon and imported at
+8 pm cancel exactly and the grid already *is* the battery.
 
-This is not a reason not to build it — the owner's goal is explicitly a ledger
-goal ("as many free solar miles as possible"), and `green.py` already keeps that
-ledger. It is a reason to **build the cheap items first and the expensive item
-last**. The owner has reviewed this finding and elected to proceed with the full
-scope including setpoint writes.
+The owner's actual tariff is **$0.12/kWh imported, $0.04/kWh credited for
+export** — net *billing*, not net metering. At a 3:1 spread those do not
+cancel, and **every kWh self-consumed instead of exported is worth $0.08.**
 
-**Open, unanswered, and worth one bill:** the **export credit**. If full-retail
-net metering applies, the dollar value of the entire project is zero and only
-the ledger remains. `IMPORT_RATE_PER_KWH` and `EXPORT_RATE_PER_KWH` are unset.
+| | in-window export | value at $0.08 |
+|---|---|---|
+| Home days | 8.9 kWh/day | **$0.71/day** (~$171/yr over 240 days) |
+| Away days | 32 kWh/day | **$2.56/day** (~$307/yr over 120 days) |
+
+So **capturing export pays for itself**, which makes the anchor fix and the
+ride-through economic rather than merely tidy.
+
+**What does not change:** deferring the air conditioner is still worth ~$0,
+because energy is conserved. Deferral only pays when it *prevents export*, and
+export only occurs when load is already below production — at which point a
+plugged-in, hungry car should be absorbing it anyway. The owner has reviewed
+this and elected the full scope including setpoint writes, on ledger grounds.
+
+Rates live in `solar_config` (editable from the setup page, no restart), with
+`.env` as a fallback. NULL means "not configured" and suppresses money figures
+rather than showing a confident zero.
 
 ---
 
@@ -313,17 +326,16 @@ Answered 2026-07-27. None of these are readable from any API.
 | Setting | Value | Consequence |
 |---|---|---|
 | Thermostat | **Google Nest**, via Device Access | Cloud-only; owner is registering |
-| Import tariff | **flat rate, no TOU** | No cost inversion from deferring cooling |
+| Import tariff | **flat rate, no TOU, $0.12/kWh** | No cost inversion from deferring cooling |
+| Export credit | **$0.04/kWh** | Net billing, not net metering — self-consumption is worth $0.08/kWh (see §1.1) |
 | `T_BASE_F` | **75 °F** | Ceiling = `min(75+3, 78)` = **78 °F**, exactly the DOE summer recommendation |
 | `OCCUPANT_CLASS` | **normal** (nobody heat-sensitive) | Write authority enabled within the §5 envelope |
 
 ## 8. Open questions
 
-1. **Export credit.** Decides whether any of this is worth money or only ledger
-   points. One bill. Still unanswered, and it is the one that matters.
-2. **Single-stage vs multi-stage compressor.** Verify from the step distribution
+1. **Single-stage vs multi-stage compressor.** Verify from the step distribution
    before assuming the ~6 kW step is one unit.
-3. **Nest ambient resolution.** Unknown; measure in the first hour of Tier 2.
+2. **Nest ambient resolution.** Unknown; measure in the first hour of Tier 2.
 
 ## 9. Deployment note
 
