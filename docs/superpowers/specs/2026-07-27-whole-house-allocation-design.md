@@ -306,12 +306,30 @@ and is recommended to the owner directly.
 
 ---
 
-## 7. Open questions
+## 7. Owner-supplied configuration
+
+Answered 2026-07-27. None of these are readable from any API.
+
+| Setting | Value | Consequence |
+|---|---|---|
+| Thermostat | **Google Nest**, via Device Access | Cloud-only; owner is registering |
+| Import tariff | **flat rate, no TOU** | No cost inversion from deferring cooling |
+| `T_BASE_F` | **75 °F** | Ceiling = `min(75+3, 78)` = **78 °F**, exactly the DOE summer recommendation |
+| `OCCUPANT_CLASS` | **normal** (nobody heat-sensitive) | Write authority enabled within the §5 envelope |
+
+## 8. Open questions
 
 1. **Export credit.** Decides whether any of this is worth money or only ledger
-   points. One bill.
-2. **`T_BASE_F` and `OCCUPANT_CLASS`.** Both blocking for Tier 3; neither is
-   readable from any API.
-3. **Single-stage vs multi-stage compressor.** Verify from the step distribution
+   points. One bill. Still unanswered, and it is the one that matters.
+2. **Single-stage vs multi-stage compressor.** Verify from the step distribution
    before assuming the ~6 kW step is one unit.
-4. **Nest ambient resolution.** Unknown; measure in the first hour of Tier 2.
+3. **Nest ambient resolution.** Unknown; measure in the first hour of Tier 2.
+
+## 9. Deployment note
+
+Schema migration adds columns but **cannot change values in an existing row**.
+`grace_s` was left at the old shipped default of 180 s on the live database
+after the ride-through landed, which would have let the time cap bind before
+the energy budget and silently disable the feature. Bumped to 900 s on
+2026-07-27. Any future change to a CONFIG_DEFAULTS value that already has a
+column needs the same explicit data migration.
