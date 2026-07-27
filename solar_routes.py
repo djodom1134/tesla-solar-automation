@@ -260,7 +260,21 @@ CONFIG_BOUNDS = {
     "daily_request_cap": (0, 20000), "view_refresh_ticks": (1, 60),
     "deadline_soc": (0, 100),
     "deadline_hour": (0, 23),
+    "grace_budget_wh": (0, 5000),
+    # Tariff, in currency units per kWh. The upper bounds are sanity
+    # rails, not economics -- they exist so a fat-fingered 12 (dollars)
+    # instead of 0.12 is rejected rather than silently reported as a
+    # hundred-fold cost.
+    "import_rate": (0, 5), "export_rate": (0, 5),
 }
+
+# Fields carrying real values rather than counts. int() would silently
+# floor an $0.12 tariff to $0.
+FLOAT_CONFIG_FIELDS = ("import_rate", "export_rate", "grace_budget_wh")
+
+# Fields where absence is meaningful and must round-trip as NULL.
+NULLABLE_CONFIG_FIELDS = ("deadline_soc", "deadline_hour",
+                          "import_rate", "export_rate")
 
 
 @router.get("/solar/config")
@@ -275,13 +289,15 @@ async def put_solar_config(body: dict[str, Any] = Body(...)) -> dict[str, bool]:
         raise HTTPException(400, f"unknown fields: {sorted(unknown)}")
     clean: dict[str, Any] = {}
     for key, value in body.items():
-        if value is None and key in ("deadline_soc", "deadline_hour"):
+        if value is None and key in NULLABLE_CONFIG_FIELDS:
             clean[key] = None
             continue
+        want_float = key in FLOAT_CONFIG_FIELDS
         try:
-            number = int(value)
+            number = float(value) if want_float else int(value)
         except (TypeError, ValueError):
-            raise HTTPException(400, f"{key} must be an integer")
+            raise HTTPException(
+                400, f"{key} must be a {'number' if want_float else 'integer'}")
         low, high = CONFIG_BOUNDS[key]
         if not low <= number <= high:
             raise HTTPException(400, f"{key} must be between {low} and {high}")

@@ -21,6 +21,7 @@ from fastapi.staticfiles import StaticFiles
 import car_routes
 import demo
 import energy
+import solar
 import solar_routes
 from config import BASE_DIR, settings
 from tesla import TeslaAPIError, TeslaAuthError, TeslaClient, day_bounds, period_end
@@ -141,10 +142,29 @@ async def api_config() -> dict[str, Any]:
         "demo": DEMO,
         "timezone": settings.timezone,
         "currency": settings.currency,
-        "has_rates": settings.import_rate is not None or settings.export_rate is not None,
+        "has_rates": any(r is not None for r in _rates()),
         "periods": [{"key": k, "label": v["label"]} for k, v in PERIODS.items()],
         "manual_callback": not _is_local(settings.redirect_uri),
     }
+
+
+def _rates() -> tuple[float | None, float | None]:
+    """The tariff, preferring the database over .env.
+
+    Rates moved into solar_config so they are editable from the setup page
+    without a restart or a file edit; the .env values remain as a fallback so
+    an existing deployment keeps working. A configured 0 is a real answer
+    (some tariffs credit nothing for export) and must not fall through to the
+    environment, so the test is "is not None", never truthiness.
+    """
+    try:
+        cfg = solar.load_config(solar_routes.store()._db)
+    except Exception:               # DB not ready; .env is all we have
+        return settings.import_rate, settings.export_rate
+    imp = cfg.get("import_rate")
+    exp = cfg.get("export_rate")
+    return (imp if imp is not None else settings.import_rate,
+            exp if exp is not None else settings.export_rate)
 
 
 def _is_local(uri: str) -> bool:
@@ -228,7 +248,7 @@ async def api_dashboard(
         "has_solar": bool(components.get("solar", True)),
         "rows": rows,
         "total": total,
-        "money": energy.money(total, settings.import_rate, settings.export_rate),
+        "money": energy.money(total, *_rates()),
         "live": live,
         "intraday": intraday,
     }

@@ -360,6 +360,11 @@ CREATE TABLE IF NOT EXISTS solar_config (
   -- constraint in practice. See Policy.
   grace_s           INTEGER NOT NULL DEFAULT 900,
   grace_budget_wh   REAL NOT NULL DEFAULT 250.0,
+  -- Tariff. NULL means "not configured" and suppresses every money
+  -- figure rather than showing a confident zero. These live here rather
+  -- than in .env so they are editable without a restart or a file edit.
+  import_rate       REAL,
+  export_rate       REAL,
   restart_hold_s    INTEGER NOT NULL DEFAULT 300,
   start_hold_s      INTEGER NOT NULL DEFAULT 60,
   raise_hold_s      INTEGER NOT NULL DEFAULT 600,
@@ -462,7 +467,8 @@ CREATE INDEX IF NOT EXISTS solar_ticks_state ON solar_ticks (vin, state, ts);
 CONFIG_DEFAULTS = {
     "enabled": 0, "period_s": 120, "margin_w": 100, "deadband_w": 250,
     "ramp_a": 8, "min_a": 5, "grace_s": 900,
-    "grace_budget_wh": 250.0, "restart_hold_s": 300,
+    "grace_budget_wh": 250.0,
+    "import_rate": None, "export_rate": None, "restart_hold_s": 300,
     "start_hold_s": 60, "raise_hold_s": 600, "soc_ceiling": 90,
     "raise_limit": 1, "daily_request_cap": 400, "view_refresh_ticks": 5,
     "deadline_soc": None, "deadline_hour": None,
@@ -549,6 +555,8 @@ CONFIG_NEW_COLUMNS = (
     # NOT EXISTS is a no-op on the owner's existing table, so this is
     # the only path by which a live database gains the column.
     ("grace_budget_wh", "REAL NOT NULL DEFAULT 250.0"),
+    ("import_rate", "REAL"),
+    ("export_rate", "REAL"),
 )
 
 

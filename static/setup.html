@@ -67,6 +67,35 @@
         the minimum through short clouds instead of stopping — which imports a little.
         Set to 0 to never import.</p>
 
+      <div class="row">
+        <label for="gracewh">Grace budget</label>
+        <input type="number" id="gracewh" min="0" max="5000" step="10" value="250">
+        <span>Wh</span>
+      </div>
+      <p class="hint">The real limit on riding out a dip: how much grid energy the car
+        may spend holding at the minimum before it gives up. An air-conditioner cycle
+        runs 6–10 minutes and costs 120–200 Wh to bridge, so too small a budget pays
+        most of the cost and still stops.</p>
+
+      <h3>Electricity rates</h3>
+      <div class="row">
+        <label for="imp-rate">Imported</label>
+        <input type="number" id="imp-rate" min="0" max="5" step="0.001"
+               placeholder="0.12">
+        <span>per kWh</span>
+      </div>
+      <div class="row">
+        <label for="exp-rate">Exported</label>
+        <input type="number" id="exp-rate" min="0" max="5" step="0.001"
+               placeholder="0.04">
+        <span>per kWh</span>
+      </div>
+      <p class="hint">The gap between these two is the whole reason self-consumption
+        pays. Credited the same as you are charged (full net metering) and using your
+        own solar saves nothing — the grid is already your battery. Credited less, and
+        every kWh you keep is worth the difference. Leave blank to hide all money
+        figures rather than show a misleading zero.</p>
+
       <details>
         <summary>Tuning</summary>
         <div class="row"><label for="margin">Export margin (W)</label>

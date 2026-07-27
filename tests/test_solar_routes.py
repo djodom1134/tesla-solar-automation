@@ -421,3 +421,38 @@ def test_demo_garage_endpoints_never_touch_the_real_device(client, monkeypatch):
     assert client.get("/api/car/garage").json()["reachable"] is True
     assert client.post("/api/car/garage/open").json()["ok"] is True
     assert client.post("/api/car/garage/close").json()["ok"] is True
+
+
+def test_tariff_round_trips_as_a_real_number_not_a_floored_integer(client):
+    """The tariff is cents per kWh, so int() coercion would floor $0.12 to $0
+    and every money figure in the app would silently read zero.
+
+    The owner's actual rates: $0.12/kWh imported, $0.04/kWh credited for
+    export. The 3:1 spread is the whole economic case for self-consumption --
+    at full-retail net metering it would be zero.
+    """
+    r = client.put("/api/car/solar/config",
+                   json={"import_rate": 0.12, "export_rate": 0.04})
+    assert r.status_code == 200, r.text
+
+    cfg = client.get("/api/car/solar/config").json()
+    assert cfg["import_rate"] == pytest.approx(0.12), (
+        f"got {cfg['import_rate']!r} -- int() coercion floors a cent rate to zero")
+    assert cfg["export_rate"] == pytest.approx(0.04)
+
+
+def test_tariff_can_be_cleared_back_to_unconfigured(client):
+    """NULL means "not configured" and must suppress money figures rather
+    than showing a confident $0.00."""
+    client.put("/api/car/solar/config", json={"import_rate": 0.12})
+    r = client.put("/api/car/solar/config", json={"import_rate": None})
+    assert r.status_code == 200, r.text
+    assert client.get("/api/car/solar/config").json()["import_rate"] is None
+
+
+def test_an_implausible_tariff_is_rejected(client):
+    """A fat-fingered 12 (dollars) instead of 0.12 must not be accepted and
+    then reported as a hundred-fold cost."""
+    r = client.put("/api/car/solar/config", json={"import_rate": 12})
+    assert r.status_code == 400
+    assert "import_rate" in r.text

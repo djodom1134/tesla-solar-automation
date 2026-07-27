@@ -69,6 +69,14 @@ $("save-home").addEventListener("click", async () => {
   }
 });
 
+// An empty field clears the rate back to unconfigured; anything else is a
+// number. Number("") is 0, which would silently turn "I have not said"
+// into "export earns nothing".
+function rateOf(id) {
+  const raw = $(id).value.trim();
+  return raw === "" ? null : Number(raw);
+}
+
 async function loadSolar() {
   const c = await api("/api/car/solar/config");
   $("enabled").checked = !!c.enabled;
@@ -84,6 +92,11 @@ async function loadSolar() {
   $("cap").value = c.daily_request_cap;
   $("dsoc").value = c.deadline_soc === null ? "" : c.deadline_soc;
   $("dhour").value = c.deadline_hour === null ? "" : c.deadline_hour;
+  $("gracewh").value = c.grace_budget_wh;
+  // Blank means "not configured", which suppresses money figures. A
+  // configured 0 is a real rate and must still render as 0, not blank.
+  $("imp-rate").value = c.import_rate === null ? "" : c.import_rate;
+  $("exp-rate").value = c.export_rate === null ? "" : c.export_rate;
 }
 
 $("ceiling").addEventListener("input", (e) => {
@@ -106,6 +119,9 @@ $("save-solar").addEventListener("click", async () => {
         ramp_a: Number($("ramp").value),
         min_a: Number($("mina").value),
         daily_request_cap: Number($("cap").value),
+        grace_budget_wh: Number($("gracewh").value),
+        import_rate: rateOf("imp-rate"),
+        export_rate: rateOf("exp-rate"),
       }),
     });
     flash($("solar-msg"), "Saved", true);
