@@ -4295,3 +4295,79 @@ multi-week self-hosted routing project. The number is what the owner wanted
 anyway — Task 18 delivers it. If a map is ever wanted, the honest cheap version
 is a plain circle at the banked radius, clearly labelled as a straight-line
 approximation and not a drive-time isochrone.
+
+---
+
+## Task 20: The tank — stratified charge, and lifetime free miles driven
+
+The banked figure exists but ships as a grey `class="hint"` one-liner at the
+bottom of the solar card. The owner could not find it, which is the correct
+verdict on that decision. This makes it the centrepiece and adds the number they
+actually want to watch accumulate: **miles they have driven for free.**
+
+### A. Lifetime free miles driven
+
+The ledger already drains proportionally on every SoC drop. That same event tells
+us how many of those miles were solar — no new physics, just accumulate what is
+already computed:
+
+```
+solar_share      = solar_soc_before / soc_before
+free_miles      += miles_in_window * solar_share
+tracked_miles   += miles_in_window
+```
+
+New state columns (via the migration helper — `CREATE TABLE IF NOT EXISTS` is a
+no-op against the live table): `free_miles_driven REAL DEFAULT 0`,
+`tracked_miles REAL DEFAULT 0`, `ledger_odo REAL`.
+
+`ledger_odo` is the odometer at the previous observation; `miles_in_window` is
+the delta. On the first tick after deployment there is no previous odometer —
+**record it and accumulate nothing.** Never backfill from history: the ledger
+started at zero for a reason, and inventing a past would make every number after
+it unauditable.
+
+Guard the same way the ledger already does: ignore a negative odometer delta
+(cannot happen, but a corrupt sample should not silently subtract), and skip
+windows where `soc_before` is 0 or unknown rather than dividing by it.
+
+### B. The tank
+
+An inline SVG battery, **no dependencies**, at the top of the solar card where
+the eye lands first. Vertical fill to `soc`%, split into two bands:
+
+- **solar** — `solar_soc` percentage points
+- **grid** — `soc - solar_soc` percentage points
+
+Label it plainly: *"78% charged — 12% from sun, 66% from grid."*
+
+**One honesty note, in a `hint` beneath it:** the bands are a *proportion*, not
+physical stratification — electrons mix, and the car does not know which is
+which. This codebase draws dashed lines across data gaps rather than
+interpolating and recomputes ratios from totals rather than averaging
+percentages; a graphic that implies the pack is physically layered would fall
+below that standard. One sentence is enough.
+
+Use the existing theme variables so it works in light and dark. Follow
+`static/chart.js` for the hand-rolled-SVG idiom already in this project — do not
+introduce a charting library.
+
+### C. Move the numbers out of the footnotes
+
+Banked miles becomes a headline figure beside the tank, not a hint. Lifetime free
+miles gets its own line with the share:
+
+> *Driven free: 128.4 of 431.7 miles (29.7%) since 27 Jul.*
+
+Keep the basis label — measured versus the car's rated estimate — because that
+distinction is the difference between a number the owner can trust and one they
+cannot. Today it reads `rated`, and it will keep reading `rated` until 50 miles
+and two charge sessions are on the board.
+
+**Files:** modify `green.py` (accumulate in the ledger step), `solar.py`
+(columns, via migration), `collector.py` (pass the odometer through),
+`solar_routes.py`, `static/car.{html,js}`, `static/styles.css`, `demo.py`.
+Test: `tests/test_green.py`, `tests/test_solar_routes.py`.
+
+**Today's honest output is zero on every one of these**, because the controller
+has never charged from sun. A build that shows anything else is wrong.
