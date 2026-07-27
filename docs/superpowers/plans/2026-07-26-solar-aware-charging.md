@@ -3971,3 +3971,120 @@ more useful than one that is absent silently, and far more useful than one that
 is wrong.
 
 - [ ] **Step 5: Full suite and commit**
+
+---
+
+## Task 17: Garage opens itself when the car comes home
+
+Possible only because the owner has a ratgdo. Spec §1.8 recorded garage state
+as unreadable — true of the Tesla path and now irrelevant: the ratgdo reads the
+opener's own sensors on the LAN, outside Tesla entirely.
+
+**Verified live against the owner's device** at `http://192.168.87.78/`:
+
+```
+garageDoorState : "Closed"     <- a STRING, not an enum int
+garageObstructed: false        <- obstruction sensor wired (pinBasedObst: true)
+garageMotion    : false
+garageLockState : "Enabled"
+paired          : true         firmware 2.1.6, passwordRequired: false
+```
+
+**Approach detection is already paid for.** `collector.py` polls every 120 s
+whenever `shift` is D/R/N — that is `poll_driving`, configured on day one for
+SoC history. At road speed that is a fix every 1-2 miles, ample to catch a ring
+crossing. A 30-minute drive costs about six cents. No new polling, no wake.
+
+**Files:**
+- Create: `garage.py`, `tests/test_garage.py`
+- Modify: `collector.py` (call it on the drive path), `solar.py` (schema:
+  `garage_armed`), `solar_routes.py`, `static/setup.js` + `setup.html`
+  (address + enable), `demo.py`
+
+**THE SAFETY RULES, none of which are negotiable:**
+
+1. **OPEN ONLY. Never close.** Closing is the one irreversible direction — it
+   can trap a person, a pet, or a bicycle. The owner has confirmed open-only.
+2. **Act only when `garageDoorState == "Closed"`, exactly.** Do not enumerate
+   the other values; "Closed" is the only one observed and the only one that is
+   safe. Anything else — `Open`, `Opening`, `Closing`, `Stopped`, a value not
+   seen before, a malformed payload, an unreachable device — means do nothing.
+   Fail closed on the unknown rather than guessing at an enum.
+3. **Refuse when `garageObstructed` is true.** Something is in the doorway.
+4. **One-shot latch.** Arm on leaving the outer ring, fire at most once on
+   re-entry, disarm immediately. Without it, GPS jitter across the boundary
+   reopens the door repeatedly. Persist the latch — a daemon restart must not
+   re-arm it.
+5. **Require motion, not mere presence.** Fire on a TRANSITION into the ring
+   while `shift` is in D/R/N. "The car is near home" is true all night while it
+   sleeps in the driveway; "the car just drove into the ring" is not.
+6. **Verify, do not assume.** After commanding, re-read `/status.json` and
+   report what the door actually did. This is the whole reason the ratgdo beats
+   HomeLink, where `result: true` only meant the car keyed its transmitter.
+
+**Interfaces:**
+- `garage.should_open(door_state, obstructed, armed, inside_ring_now, inside_ring_prev, shift) -> bool` — pure
+- `garage.status(base_url, timeout=4.0) -> dict | None` — `None` on any failure
+- `garage.open(base_url) -> bool` — POSTs `garageDoorState=1`, form-encoded
+
+- [ ] **Step 1: Write the failing tests**
+
+`tests/test_garage.py`, table-driven on `should_open`. The cases that matter:
+
+```python
+BASE = dict(door_state="Closed", obstructed=False, armed=True,
+            inside_ring_now=True, inside_ring_prev=False, shift="D")
+
+def test_opens_on_arrival_when_everything_is_right():
+    assert garage.should_open(**BASE) is True
+
+def test_never_opens_a_door_that_is_not_closed():
+    """Only "Closed" is safe, and only "Closed" has been observed on the real
+    device. Every other value -- including one we have never seen -- means do
+    nothing."""
+    for state in ("Open", "Opening", "Closing", "Stopped", "Obstructed", "", None, "closed"):
+        assert garage.should_open(**{**BASE, "door_state": state}) is False, state
+
+def test_never_opens_when_obstructed():
+    assert garage.should_open(**{**BASE, "obstructed": True}) is False
+
+def test_requires_the_latch_to_be_armed():
+    assert garage.should_open(**{**BASE, "armed": False}) is False
+
+def test_requires_a_transition_into_the_ring_not_mere_presence():
+    """True all night while the car sleeps in the driveway; the transition is
+    what means 'just arrived'."""
+    assert garage.should_open(**{**BASE, "inside_ring_prev": True}) is False
+
+def test_requires_the_car_to_be_moving():
+    for shift in ("P", None, ""):
+        assert garage.should_open(**{**BASE, "shift": shift}) is False
+```
+
+Plus `status()` returning `None` on connection error, timeout, non-200, and
+malformed JSON — each proven with a fake transport, never the real device.
+
+- [ ] **Step 2-4: Implement, verify red then green**
+
+`garage.py` holds one pure decision function and two thin HTTP calls. No
+retries: a retry on an open is harmless but pointless, and the verification
+read tells us the truth anyway.
+
+- [ ] **Step 5: Wire into the collector**
+
+On the drive path, when a home is configured and garage automation is enabled:
+compute ring membership from the existing haversine, load the persisted latch,
+call `should_open`, and on true — `garage.open()`, then re-read status and log
+what actually happened. Arm the latch on leaving the ring.
+
+Ring radius is its own setting (default 800 m), **not** the charging geofence.
+The charging geofence is metres-tight for "is it parked at home"; the approach
+ring is hundreds of metres for "it is arriving".
+
+- [ ] **Step 6: Setup page**
+
+Address field, an enable toggle defaulting OFF, ring radius, and a "Test
+connection" button that reads `/status.json` and shows the door's current state
+— never one that commands the door.
+
+- [ ] **Step 7: Full suite and commit**
