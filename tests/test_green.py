@@ -357,3 +357,97 @@ def test_free_miles_never_exceeds_tracked_miles():
         free, tracked, odo = green.free_miles_step(
             free, tracked, odo, odo_now, solar_soc_before, soc_before)
         assert free <= tracked + 1e-9, (free, tracked, odo_now, soc_before, solar_soc_before)
+
+
+def test_accrual_is_zero_without_solar_draw():
+    assert green.accrual_mi_per_s(0.0, 3.5, 38, 107.8, 100.0) == (0.0, "none")
+    assert green.accrual_mi_per_s(-500.0, 3.5, 38, 107.8, 100.0) == (0.0, "none")
+
+
+def test_accrual_prefers_the_owners_measured_consumption():
+    rate, basis = green.accrual_mi_per_s(2430.0, 3.5, 38, 107.8, 100.0)
+    assert basis == "measured"
+    # 2.43 kW x 3.5 mi/kWh = 8.505 mi/h = 0.002363 mi/s
+    assert rate == pytest.approx(2.43 * 3.5 / 3600, rel=1e-6)
+
+
+def test_accrual_falls_back_to_the_cars_own_rated_range():
+    """Before two charge sessions exist there is no measured mi/kWh, so the
+    rate comes from the car's rated range over a nominal pack -- and must say
+    so, because the ledger itself never depends on pack size."""
+    rate, basis = green.accrual_mi_per_s(2430.0, None, 38, 107.8, None)
+    assert basis == "rated"
+    full_rated = 107.8 / 38 * 100          # ~283.7 mi
+    expect = 2.43 * (full_rated / green.NOMINAL_PACK_KWH) / 3600
+    assert rate == pytest.approx(expect, rel=1e-6)
+
+
+def test_accrual_gives_up_rather_than_guessing():
+    assert green.accrual_mi_per_s(2430.0, None, None, 107.8, None) == (0.0, "none")
+    assert green.accrual_mi_per_s(2430.0, None, 0, 107.8, None) == (0.0, "none")
+    assert green.accrual_mi_per_s(2430.0, None, 38, None, None) == (0.0, "none")
+
+
+def test_a_hundredth_of_a_mile_is_seconds_not_milliseconds():
+    """Grounds the UI decision: the owner asked for 0.01 mi steps 10-20x a
+    second, which the physics does not allow. At a real charge rate a
+    hundredth of a mile takes seconds, so the display shows thousandths."""
+    rate, _ = green.accrual_mi_per_s(2430.0, 3.5, 38, 107.8, 100.0)
+    assert 0.01 / rate > 3.0, "0.01 mi must take multiple seconds at 2.4 kW"
+    full, _ = green.accrual_mi_per_s(11300.0, 3.5, 38, 107.8, 100.0)
+    assert 0.01 / full > 0.5, "even at full rate it is not 10-20 per second"
+    assert 0.001 / full < 0.15, "thousandths, though, move fast enough to animate"
+
+
+def test_the_grid_half_is_the_complement_of_the_solar_half():
+    """Defined as a complement so solar + grid is exactly the draw, and the
+    two can never disagree about the same tick."""
+    for car_w, grid_w in ((2000, 100), (2000, -500), (2000, 0),
+                          (2000, 5000), (0, 100), (1205, 900)):
+        s = green.tick_solar_w(car_w, grid_w)
+        g = green.tick_grid_w(car_w, grid_w)
+        assert s + g == pytest.approx(max(0.0, car_w)), (car_w, grid_w)
+        assert s >= 0 and g >= 0
+
+
+def test_the_owners_case_two_kilowatts_against_nineteen_hundred():
+    """The exact example that prompted this: 2 kW drawn, 1.9 kW of surplus,
+    so 100 W is utility. The ledger used to call all 2,000 W solar."""
+    car_w, grid_w = 2000.0, 100.0        # importing 100 W
+    assert green.tick_solar_w(car_w, grid_w) == 1900.0
+    assert green.tick_grid_w(car_w, grid_w) == 100.0
+    assert green.tick_solar_fraction(car_w, grid_w) == pytest.approx(0.95)
+
+
+def test_solar_fraction_is_bounded_and_safe_on_a_dead_car():
+    assert green.tick_solar_fraction(0.0, -5000.0) == 0.0
+    assert green.tick_solar_fraction(2000.0, -5000.0) == 1.0    # exporting
+    assert green.tick_solar_fraction(2000.0, 9000.0) == 0.0     # deep import
+    assert 0.0 <= green.tick_solar_fraction(1205.0, 600.0) <= 1.0
+
+
+def test_ledger_banks_only_the_solar_proportion_of_a_rise():
+    """The correction itself. A 10-point rise that was 95% solar banks 9.5
+    points, not 10 -- and the old boolean call banked all 10."""
+    banked, _ = green.ledger_step(0.0, 30, 40, 0.95, 0, 3600)
+    assert banked == pytest.approx(9.5)
+
+    banked, _ = green.ledger_step(0.0, 30, 40, 0.05, 0, 3600)
+    assert banked == pytest.approx(0.5)
+
+
+def test_the_fraction_reproduces_both_old_boolean_branches_exactly():
+    """1.0 must behave as the old solar_charging=True branch and 0.0 as
+    False, or this change silently rewrites every ordinary tick."""
+    all_sun, _ = green.ledger_step(5.0, 30, 40, 1.0, 0, 3600)
+    assert all_sun == pytest.approx(15.0), "the whole rise, as before"
+    all_grid, _ = green.ledger_step(5.0, 30, 40, 0.0, 0, 3600)
+    assert all_grid == pytest.approx(5.0), "unchanged; the rise dilutes it"
+
+
+def test_a_partial_rise_still_respects_the_clamp():
+    """The invariant 0 <= solar_soc <= soc_now must survive the new path."""
+    banked, _ = green.ledger_step(0.0, 0, 5, 1.0, 0, 3600)
+    assert 0 <= banked <= 5
+    banked, _ = green.ledger_step(4.0, 5, 4, 0.9, 0, 3600)
+    assert 0 <= banked <= 4

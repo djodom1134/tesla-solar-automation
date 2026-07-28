@@ -360,6 +360,11 @@ def solar_status() -> dict:
         "state": "charging",
         "enabled": True,
         "surplus_w": 6240.0,
+        # 6.24 kW of sun at ~3.4 mi/kWh -- fast enough that the
+        # thousandths digit visibly moves, which is the point.
+        "accrual_mi_per_s": round(6.24 * 3.4 / 3600, 8),
+        "accrual_basis": "measured",
+        "as_of": 1785250000,
         "amps": 26,
         "soc": 72,
         "limit": 90,
@@ -392,6 +397,17 @@ def solar_status() -> dict:
         "banked_miles_measured": 28.2,
         "banked_miles": 28.2,
         "banked_miles_basis": "measured",
+        # Lifetime energy INTO the car, split by where it came from. The
+        # demo car is mostly-but-not-entirely solar, which is the honest
+        # shape: a controller that holds the floor through clouds imports a
+        # little on purpose, and pretending otherwise is what this split
+        # exists to stop.
+        "charged_solar_kwh": 214.6,
+        "charged_grid_kwh": 38.9,
+        "charged_solar_miles": 794.0,
+        "charged_grid_miles": 143.9,
+        "charged_solar_share": 84.7,
+        "charged_miles_basis": "measured",
         # Task 20: lifetime free miles driven -- a demo car with months of
         # history behind it, so the promoted headline has something to
         # show. 128.4 / 431.7 = 29.7%, the brief's own worked example.
@@ -414,4 +430,24 @@ def home_config() -> dict:
         "home": {"latitude": 40.1672, "longitude": -105.1019, "radius_m": 100},
         "classification": "home",
         "car": {"lat": 40.1673, "lon": -105.1018},
+    }
+
+
+def landmarks() -> dict:
+    """Enough places either side of the threshold that the reveal is visible."""
+    return {
+        "banked_miles": 24.0,
+        "round_trip": True,
+        "places": [
+            {"name": "Roosevelt Park", "miles": 4.2, "needed": 8.4,
+             "mountain": False, "reachable": True},
+            {"name": "Union Reservoir", "miles": 7.6, "needed": 15.2,
+             "mountain": False, "reachable": True},
+            {"name": "Lyons", "miles": 11.0, "needed": 22.0,
+             "mountain": False, "reachable": True},
+            {"name": "Boulder (Pearl St)", "miles": 17.4, "needed": 34.8,
+             "mountain": False, "reachable": False},
+            {"name": "Estes Park", "miles": 43.8, "needed": 87.6,
+             "mountain": True, "reachable": False},
+        ],
     }

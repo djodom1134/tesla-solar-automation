@@ -231,6 +231,7 @@ async function refresh() {
       api("/api/car/state"),
       api("/api/car/health"),
       loadSolar(),   // never throws -- the card just stays hidden on failure
+      loadReach(),   // same: no landmarks simply means no list
       loadGarage(),  // same -- stays hidden on failure
     ]);
     state.health = health;
@@ -311,6 +312,116 @@ function renderTank(soc, solarPct) {
   }));
 
   host.append(svg);
+}
+
+/* ------------------------------------------------- live banked-miles ticker
+
+The owner asked for the number to climb in hundredths of a mile, 10-20 times a
+second. The physics does not allow it: at 2.4 kW a hundredth of a mile takes
+about four seconds, and even at the car's full 11.3 kW it takes nearly one. So
+the display shows THOUSANDTHS, which at real charge rates moves 2-10 times a
+second -- the same idea, one digit finer, and honest about it.
+
+The server sends a rate in miles per second and the moment it was measured;
+everything between polls is projected here. Two rules keep that honest:
+
+  - the projection is only ever forward from a server anchor, so a stale tab
+    cannot invent miles that the ledger never recorded;
+  - when a poll lands the display EASES to the new truth instead of snapping,
+    because the ledger updates in SoC steps and a jump backwards reads as a
+    bug even when it is a correction.
+*/
+const ENGAGED = new Set(["charging", "grace"]);
+
+const ticker = {
+  anchor: null,      // miles reported by the server
+  anchorAt: 0,       // performance.now() when it arrived
+  rate: 0,           // miles per second
+  shown: null,       // what the eye currently sees
+  raf: 0,
+};
+
+function tickerStop() {
+  if (ticker.raf) cancelAnimationFrame(ticker.raf);
+  ticker.raf = 0;
+}
+
+function tickerFrame() {
+  ticker.raf = requestAnimationFrame(tickerFrame);
+  if (ticker.anchor === null) return;
+  const elapsed = (performance.now() - ticker.anchorAt) / 1000;
+  const target = ticker.anchor + ticker.rate * elapsed;
+  // Ease toward the projection rather than assigning it: on the frame after a
+  // poll this absorbs the correction over ~half a second instead of jumping.
+  ticker.shown = ticker.shown === null
+    ? target
+    : ticker.shown + (target - ticker.shown) * 0.12;
+  const el = $("solar-banked-live");
+  if (el) el.textContent = ticker.shown.toFixed(3);
+  reachPaint(ticker.shown);
+}
+
+function tickerSync(miles, ratePerSec) {
+  ticker.anchor = miles;
+  ticker.anchorAt = performance.now();
+  ticker.rate = ratePerSec || 0;
+  if (ticker.shown === null) ticker.shown = miles;
+  if (!ticker.raf && ratePerSec > 0) tickerFrame();
+  if (!(ratePerSec > 0)) {
+    tickerStop();
+    ticker.shown = miles;
+    const el = $("solar-banked-live");
+    if (el) el.textContent = miles.toFixed(3);
+    reachPaint(miles);
+  }
+}
+
+/* ------------------------------------------------------------ where to go */
+
+let reachPlaces = null;
+
+async function loadReach() {
+  try {
+    const r = await api("/api/car/solar/landmarks");
+    reachPlaces = r.places || [];
+    $("solar-reach-head").textContent = r.round_trip
+      ? "Round trips you could make on banked sun:"
+      : "Places within banked range:";
+  } catch (_) {
+    reachPlaces = null;
+  }
+}
+
+function reachPaint(miles) {
+  const box = $("solar-reach");
+  if (!box) return;
+  if (!reachPlaces || !reachPlaces.length || !(miles > 0)) {
+    box.hidden = true;
+    return;
+  }
+  box.hidden = false;
+  const list = $("solar-reach-list");
+  // Show what is already reachable plus the next three, so there is always
+  // something visibly approaching rather than a list that only ever grows.
+  const lit = reachPlaces.filter((p) => miles >= p.needed);
+  const next = reachPlaces.filter((p) => miles < p.needed).slice(0, 3);
+  const rows = lit.slice(-6).concat(next);
+  list.innerHTML = "";
+  for (const p of rows) {
+    const reachable = miles >= p.needed;
+    const li = document.createElement("li");
+    li.className = reachable ? "reach-on" : "reach-off";
+    const name = document.createElement("span");
+    name.className = "reach-name";
+    name.textContent = p.name + (p.mountain ? " \u26f0" : "");
+    const dist = document.createElement("span");
+    dist.className = "reach-dist";
+    dist.textContent = reachable
+      ? `${p.miles} mi each way`
+      : `${(p.needed - miles).toFixed(1)} mi to go`;
+    li.append(name, dist);
+    list.append(li);
+  }
 }
 
 async function loadSolar() {
@@ -395,9 +506,20 @@ async function loadSolar() {
   } else {
     const basis = s.banked_miles_basis === "measured"
       ? "measured mi/kWh" : "the car's rated range";
-    $("solar-banked").textContent =
-      `Banked solar: ${s.banked_pct}% of charge = ${s.banked_miles} free miles `
-      + `(${basis})${lower}.`;
+    // The number lives in its own span so the ticker can rewrite it 60x a
+    // second without touching the sentence around it.
+    $("solar-banked").innerHTML = "";
+    $("solar-banked").append(
+      document.createTextNode(`Banked solar: ${s.banked_pct}% of charge = `));
+    const live = document.createElement("span");
+    live.id = "solar-banked-live";
+    live.className = "live-miles";
+    live.textContent = Number(s.banked_miles).toFixed(3);
+    $("solar-banked").append(live);
+    $("solar-banked").append(
+      document.createTextNode(` free miles (${basis})${lower}.`));
+    tickerSync(Number(s.banked_miles),
+               ENGAGED.has(s.state) ? (s.accrual_mi_per_s || 0) : 0);
   }
 
   // Lifetime free miles driven (Task 20) -- the ledger's own running total
@@ -415,11 +537,38 @@ async function loadSolar() {
       + `(${nfmt(s.free_miles_share, 1)}%) since ${since}.`;
   }
 
+  // Lifetime energy INTO the car, split by where it actually came from.
+  // Shown as a pair on purpose: the solar figure alone is the flattering
+  // half, and a controller that holds the floor through clouds imports a
+  // little deliberately. Naming that is what makes the solar number
+  // believable.
+  const split = $("solar-charged-split");
+  if (s.charged_solar_kwh === 0 && s.charged_grid_kwh === 0) {
+    split.textContent = "Charged so far: nothing recorded yet.";
+  } else if (s.charged_solar_miles === null) {
+    split.textContent =
+      `Charged so far: ${nfmt(s.charged_solar_kwh, 1)} kWh from sun, `
+      + `${nfmt(s.charged_grid_kwh, 1)} kWh from grid `
+      + `(${nfmt(s.charged_solar_share, 0)}% solar).`;
+  } else {
+    const basis = s.charged_miles_basis === "measured"
+      ? "measured mi/kWh" : "the car's rated range";
+    split.textContent =
+      `Charged so far: ${nfmt(s.charged_solar_miles, 1)} mi from sun, `
+      + `${nfmt(s.charged_grid_miles, 1)} mi from grid `
+      + `(${nfmt(s.charged_solar_share, 0)}% solar, ${basis}).`;
+  }
+
   const warn = $("solar-warn");
   if (s.capped) {
     warn.textContent = "Paused: daily API request cap reached. Resumes tomorrow.";
     warn.hidden = false;
-  } else if (s.dirty) {
+  } else if (s.dirty && !ENGAGED.has(s.state)) {
+    // dirty is the NORMAL, healthy condition for the whole duration of an
+    // engagement -- it is set on charge_start and cleared only on restore, so
+    // showing this while the controller is actively charging alarmed the
+    // owner during correct operation. It is only news once the engagement has
+    // ended and the restore has still not happened.
     warn.textContent = "Your original charge settings have not been restored yet — "
                      + "waiting for the car to be home and reachable.";
     warn.hidden = false;

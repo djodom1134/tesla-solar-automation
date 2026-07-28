@@ -20,6 +20,7 @@ import demo
 import garage
 import green
 import home
+import landmarks
 import solar
 from config import settings
 from store import Store
@@ -147,6 +148,7 @@ def _sessions_and_segments(
 def _green_status(
     db, vin: str, solar_soc: float, soc: int | None, range_mi: float | None,
     free_miles_driven: float, tracked_miles: float, free_miles_since: int | None,
+    charged_solar_wh: float = 0.0, charged_grid_wh: float = 0.0,
 ) -> dict[str, Any]:
     """The free-miles answer, the daily FLOW (Task 16), the banked STOCK
     (Task 18) and the lifetime free miles actually driven (Task 20), honest
@@ -176,6 +178,8 @@ def _green_status(
     pack, pack_n = green.pack_kwh(sessions)
     mpk, miles = green.miles_per_kwh(segments, pack)
     free = green.free_miles(solar_today, mpk)
+    # One resolver for every energy-to-miles conversion on this card.
+    _mpk, _mpk_basis = green.effective_mi_per_kwh(mpk, soc, range_mi, pack)
 
     rated = green.banked_miles_rated(solar_soc, soc, range_mi)
     measured = green.banked_miles_measured(solar_soc, pack, mpk)
@@ -205,6 +209,20 @@ def _green_status(
         "tracked_miles": round(tracked_miles, 1),
         "free_miles_share": free_share,
         "free_miles_since": free_miles_since,
+        # Lifetime energy INTO the car, split by where it actually came from,
+        # and the same figures as miles. Both use one resolver
+        # (green.effective_mi_per_kwh) so they cannot disagree with the live
+        # ticker about how far a kilowatt-hour goes.
+        "charged_solar_kwh": round(charged_solar_wh / 1000.0, 2),
+        "charged_grid_kwh": round(charged_grid_wh / 1000.0, 2),
+        "charged_solar_miles": (
+            round(charged_solar_wh / 1000.0 * _mpk, 1) if _mpk else None),
+        "charged_grid_miles": (
+            round(charged_grid_wh / 1000.0 * _mpk, 1) if _mpk else None),
+        "charged_solar_share": (
+            round(100.0 * charged_solar_wh / (charged_solar_wh + charged_grid_wh), 1)
+            if (charged_solar_wh + charged_grid_wh) > 0 else None),
+        "charged_miles_basis": _mpk_basis,
     }
 
 
@@ -323,12 +341,33 @@ async def get_solar_status() -> dict[str, Any]:
     snap = store().snapshot(vin) if vin else None
     view = (snap or {}).get("view") or {}
     last = db.execute(
-        "SELECT ts, surplus_w, amps_written, amps_before FROM solar_ticks"
+        "SELECT ts, surplus_w, amps_written, amps_before, car_w, grid_w"
+        " FROM solar_ticks"
         " WHERE vin = ? ORDER BY ts DESC LIMIT 1", (vin,)).fetchone() if vin else None
+
+    # How fast banked free miles are growing, so the page can animate
+    # between polls instead of jumping once a tick. Only the SOLAR part of
+    # the draw counts: a car riding out a cloud at the floor is charging,
+    # but on grid electrons, and must not tick the counter up.
+    accrual, accrual_basis = 0.0, "none"
+    if last is not None and state["state"] == "charging":
+        car_w = float(last["car_w"] or 0)
+        grid_w = float(last["grid_w"] or 0)
+        free_w = max(0.0, car_w - max(0.0, grid_w))
+        _g = _green_status(
+            db, vin, state["solar_soc"], view.get("soc"),
+            view.get("range_mi"), state["free_miles_driven"],
+            state["tracked_miles"], state["free_miles_since"])
+        accrual, accrual_basis = green.accrual_mi_per_s(
+            free_w, _g["mi_per_kwh"], view.get("soc"),
+            view.get("range_mi"), _g["pack_kwh"])
     return {
         "state": state["state"],
         "enabled": bool(solar.load_config(db)["enabled"]),
         "surplus_w": last["surplus_w"] if last else None,
+        "accrual_mi_per_s": round(accrual, 8),
+        "accrual_basis": accrual_basis,
+        "as_of": int(time.time()),
         "amps": (last["amps_written"] or last["amps_before"]) if last else None,
         "soc": view.get("soc"),
         "limit": view.get("limit"),
@@ -354,7 +393,8 @@ async def get_solar_status() -> dict[str, Any]:
         "ledger_stale": bool(state["ledger_stale"]),
         **_green_status(db, vin, state["solar_soc"], view.get("soc"), view.get("range_mi"),
                         state["free_miles_driven"], state["tracked_miles"],
-                        state["free_miles_since"]),
+                        state["free_miles_since"],
+                        state["charged_solar_wh"], state["charged_grid_wh"]),
     }
 
 
@@ -498,3 +538,29 @@ async def put_garage_config(body: dict[str, Any] = Body(...)) -> dict[str, bool]
 
     solar.save_config(store()._db, **clean)
     return {"ok": True}
+
+
+@router.get("/solar/landmarks")
+async def get_landmarks() -> dict[str, Any]:
+    """Places reachable on banked sunshine, nearest first.
+
+    The WHOLE list is returned with a per-place threshold, not just what
+    currently fits: the page animates banked miles upward continuously
+    between polls, and this lets places light up as the number climbs
+    without another request.
+    """
+    if DEMO:
+        return demo.landmarks()
+    db = store()._db
+    vin = _vin()
+    state = solar.load_state(db, vin) if vin else dict(solar.STATE_DEFAULTS)
+    snap = store().snapshot(vin) if vin else None
+    view = (snap or {}).get("view") or {}
+    g = _green_status(db, vin, state["solar_soc"], view.get("soc"),
+                      view.get("range_mi"), state["free_miles_driven"],
+                      state["tracked_miles"], state["free_miles_since"])
+    return {
+        "banked_miles": g["banked_miles"],
+        "round_trip": True,
+        "places": landmarks.reachable(home.load(db), g["banked_miles"]),
+    }

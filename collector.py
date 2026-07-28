@@ -517,13 +517,32 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
         prev_tick_ts = solar.last_tick_ts(db, vin)
         gap_s = int(time.time()) - prev_tick_ts if prev_tick_ts is not None else 0
         gap_threshold_s = max(2 * getattr(cfg, "poll_asleep", 1800), 3600)
-        solar_charging = (machine.state in green.ENGAGED_STATES
-                          and green.tick_solar_w(car_w, grid_w) > 0)
+        # PROPORTIONAL attribution, not all-or-nothing. This used to pass a
+        # boolean -- engaged, and any solar at all -- which banked the WHOLE
+        # SoC rise as sun. A car drawing 2,000 W against 1,900 W of surplus
+        # is 5% utility-powered, and recording that as 100% solar makes the
+        # ledger flattering rather than true.
+        engaged_now = machine.state in green.ENGAGED_STATES
+        fraction = (green.tick_solar_fraction(car_w, grid_w)
+                    if engaged_now else 0.0)
         new_solar_soc, ledger_stale = green.ledger_step(
-            st["solar_soc"], st["ledger_soc"], int(soc_now), solar_charging,
+            st["solar_soc"], st["ledger_soc"], int(soc_now), fraction,
             gap_s, gap_threshold_s)
         ledger_fields = {"solar_soc": new_solar_soc, "ledger_soc": int(soc_now),
                          "ledger_stale": 1 if ledger_stale else 0}
+
+        # Lifetime energy into the car, split by origin. Accumulated from the
+        # MEASURED watts over this tick's own period, so neither figure
+        # depends on pack size or mi/kWh -- those enter only when the card
+        # converts watt-hours to miles.
+        if engaged_now and car_w > 0:
+            hours = conf["period_s"] / 3600.0
+            ledger_fields["charged_solar_wh"] = (
+                st["charged_solar_wh"]
+                + green.tick_solar_w(car_w, grid_w) * hours)
+            ledger_fields["charged_grid_wh"] = (
+                st["charged_grid_wh"]
+                + green.tick_grid_w(car_w, grid_w) * hours)
 
         # Task 20: lifetime free miles driven -- green.free_miles_step's own
         # "before" arguments are st["solar_soc"]/st["ledger_soc"], the SAME

@@ -157,8 +157,32 @@ def free_miles(solar_kwh: float | None, mi_per_kwh: float | None) -> float | Non
 # below). See the module docstring's doctrine: never guess, say why.
 # --------------------------------------------------------------------------
 
+def tick_grid_w(car_w: float, grid_w: float) -> float:
+    """The utility half of one tick's car draw: whatever tick_solar_w did not
+    claim.
+
+    A car pulling 2,000 W while the site imports 100 W is running 1,900 W of
+    sunshine and 100 W of utility. Defined as the complement rather than
+    independently, so solar + grid is exactly the draw by construction and
+    the two can never disagree about the same tick.
+    """
+    return max(0.0, car_w) - tick_solar_w(car_w, grid_w)
+
+
+def tick_solar_fraction(car_w: float, grid_w: float) -> float:
+    """What proportion of ONE tick's car draw was sunshine, in [0, 1].
+
+    Built on tick_solar_w for the same reason tick_grid_w is: the ledger, the
+    daily solar_kwh total and the live ticker must all answer this question
+    identically or the card contradicts itself.
+    """
+    if car_w <= 0:
+        return 0.0
+    return tick_solar_w(car_w, grid_w) / car_w
+
+
 def ledger_step(solar_soc: float, soc_before: int | None, soc_now: int,
-                solar_charging: bool, gap_s: int,
+                solar_fraction: float, gap_s: int,
                 gap_threshold_s: int) -> tuple[float, bool]:
     """Advance the banked-solar ledger by one observation.
 
@@ -171,11 +195,19 @@ def ledger_step(solar_soc: float, soc_before: int | None, soc_now: int,
     store.GAP_SECONDS), and gets back the new ledger value plus whether this
     observation is stale.
 
-    ENTERING the pack: a rise in SoC while the controller was engaged AND
-    this tick's solar attribution (tick_solar_w) was positive banks the
-    whole rise. A rise while grid charging is left UNCHANGED -- total SoC
-    went up, so the solar fraction falls on its own; grid electrons dilute
-    the bank, they do not remove sun already in it.
+    ENTERING the pack: a rise in SoC banks the solar PROPORTION of that rise,
+    `delta * solar_fraction`, where solar_fraction is this tick's measured
+    split (see car_power_split). The remainder dilutes the bank exactly as a
+    pure grid charge does -- total SoC went up, so the solar percentage falls
+    on its own; grid electrons dilute the sun already banked, they do not
+    remove it.
+
+    This used to take a BOOLEAN, and banked the whole rise whenever the
+    controller was engaged. That overstated the bank on every tick where the
+    car drew more than the surplus: a car pulling 2,000 W against 1,900 W of
+    surplus is 5% utility-powered, and recording it as 100% solar makes the
+    ledger flattering rather than true. A fraction of 0.0 reproduces the old
+    grid-charging branch exactly, and 1.0 the old solar branch.
 
     LEAVING the pack: any drop removes proportionally --
     ``solar_soc -= drop * (solar_soc / soc_before)``, equivalently
@@ -229,9 +261,9 @@ def ledger_step(solar_soc: float, soc_before: int | None, soc_now: int,
     raw = solar_soc
 
     if delta > 0:
-        if solar_charging:
-            raw += delta
-        # else: grid charging -- unchanged. See docstring.
+        # Bank only the solar PROPORTION. The rest dilutes, exactly as a pure
+        # grid charge always did -- see docstring.
+        raw += delta * max(0.0, min(1.0, solar_fraction))
     elif delta < 0 and soc_before > 0:
         raw -= (soc_before - soc_now) * (raw / soc_before)
 
@@ -354,3 +386,58 @@ def free_miles_step(
     return (free_miles_driven + miles_in_window * solar_share,
             tracked_miles + miles_in_window,
             odo_now)
+
+
+# A 2022 Model S Long Range. Used ONLY to turn watts into miles for the live
+# ticker before pack_kwh() has earned a measured figure, and always reported
+# with basis="estimated" so the UI can say so. Never used for the ledger
+# itself, which stays in SoC space precisely to avoid depending on this.
+NOMINAL_PACK_KWH = 100.0
+
+
+def accrual_mi_per_s(free_w: float, mi_per_kwh: float | None,
+                     soc: int | None, range_mi: float | None,
+                     pack: float | None) -> tuple[float, str]:
+    """How fast banked free miles are growing, in miles per second.
+
+    Returns (rate, basis) where basis is "measured", "rated" or "none".
+
+    The UI animates between polls from this, so it must describe only the
+    SOLAR part of the car's draw: `free_w` is the caller's job to compute as
+    the draw minus any grid import. A car riding out a cloud at the floor is
+    charging, but not on sunshine, and must not tick the counter up.
+
+    mi/kWh comes from the owner's own measured consumption when that exists.
+    Before then it is derived from the car's own rated range -- full rated
+    range divided by pack size -- which needs a pack figure, hence the
+    nominal. That is exactly the dependency the SoC-space ledger avoids, so
+    it lives here at the display edge and nowhere else.
+    """
+    if free_w <= 0:
+        return 0.0, "none"
+    mpk, basis = effective_mi_per_kwh(mi_per_kwh, soc, range_mi, pack)
+    if mpk is None:
+        return 0.0, "none"
+    return free_w / 1000.0 / 3600.0 * mpk, basis
+
+
+def effective_mi_per_kwh(mi_per_kwh: float | None, soc: int | None,
+                         range_mi: float | None,
+                         pack: float | None) -> tuple[float | None, str]:
+    """The mi/kWh to convert energy into miles with, and which basis it is.
+
+    One resolver, used by every energy-to-miles conversion on the card -- the
+    live ticker and the lifetime solar/grid totals -- so they can never
+    disagree about how far a kilowatt-hour goes.
+
+    Prefers the owner's own measured consumption. Falls back to the car's
+    rated range over a pack size, which is the only place in this project
+    that needs a pack figure at all; the ledger itself stays in SoC space
+    precisely to avoid it. Returns (None, "none") rather than guessing.
+    """
+    if mi_per_kwh and mi_per_kwh > 0:
+        return mi_per_kwh, "measured"
+    if not soc or range_mi is None:
+        return None, "none"
+    mpk = (range_mi / soc * 100.0) / (pack or NOMINAL_PACK_KWH)
+    return (mpk, "rated") if mpk > 0 else (None, "none")

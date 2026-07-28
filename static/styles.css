@@ -396,3 +396,37 @@ th .key { vertical-align: middle; margin-right: .35rem; }
 #solar-card .tank-facts .big { margin: 0 0 .15rem; }
 #solar-card .tank-sub { font-size: .95rem; font-weight: 600; color: var(--ink-2); margin: .2rem 0 0; }
 #garage-card .row { display: flex; align-items: center; gap: .6rem; margin: .5rem 0; }
+
+/* Live banked-miles ticker and the places it unlocks. The number is
+   tabular-nums so thousandths ticking over does not jiggle the sentence. */
+.live-miles {
+  font-variant-numeric: tabular-nums;
+}
+
+ul.reach {
+  list-style: none;
+  margin: 0.4rem 0 0;
+  padding: 0;
+  /* Without a cap, space-between throws the distance to the far edge of a
+     1150px card and it stops reading as belonging to the name beside it. */
+  max-width: 32rem;
+}
+
+ul.reach li {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.28rem 0;
+  border-bottom: 1px solid var(--rule, rgba(128, 128, 128, 0.18));
+  font-variant-numeric: tabular-nums;
+}
+
+ul.reach li:last-child { border-bottom: 0; }
+
+.reach-on .reach-name { font-weight: 600; }
+.reach-on .reach-dist { color: var(--ink-2); }
+
+/* Not yet reachable: present but clearly pending, so the list reads as a
+   destination approaching rather than a failure. */
+.reach-off { opacity: 0.45; }
+.reach-off .reach-dist { font-variant-numeric: tabular-nums; }
