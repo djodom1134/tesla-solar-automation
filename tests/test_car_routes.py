@@ -204,3 +204,41 @@ def test_demo_gap_threshold_tracks_store_gap_seconds(monkeypatch):
     # patched threshold -- every row after the first must read as a gap.
     # This only holds if soc_history looks up store.GAP_SECONDS at call time.
     assert all(r["gap"] for r in rows[1:])
+
+
+def test_app_javascript_is_served_no_store():
+    """ES modules are cached hard, and the cache key ignores the query string
+    on the importing PAGE -- so a hard reload of car.html can still execute a
+    stale car.js. That produced two baffling sessions in this project where
+    the server and the disk were byte-identical and correct while the page
+    ran code from an earlier deploy.
+    """
+    from fastapi.testclient import TestClient
+    import app as app_module
+
+    with TestClient(app_module.app) as client:
+        for path in ("/car.js", "/car.html", "/shared.js", "/styles.css"):
+            r = client.get(path)
+            assert r.status_code == 200, path
+            assert "no-store" in r.headers.get("cache-control", ""), (
+                f"{path} must not be cached: a stale module is indistinguishable "
+                "from a broken deploy")
+
+
+def test_vendored_assets_keep_normal_caching():
+    """Only the app's own files are no-store. Vendored libraries change when
+    the file changes, which is approximately never, and re-fetching them on
+    every load would be waste for no benefit."""
+    from pathlib import Path
+    from fastapi.testclient import TestClient
+    import app as app_module
+
+    vendor = Path(app_module.BASE_DIR) / "static" / "vendor"
+    files = sorted(p for p in vendor.rglob("*") if p.is_file()) if vendor.is_dir() else []
+    if not files:
+        pytest.skip("no vendored assets on this install")
+    rel = files[0].relative_to(vendor.parent)
+    with TestClient(app_module.app) as client:
+        r = client.get("/" + str(rel))
+        assert r.status_code == 200
+        assert "no-store" not in r.headers.get("cache-control", "")

@@ -257,9 +257,34 @@ async def api_dashboard(
 app.include_router(car_routes.router)
 app.include_router(solar_routes.router)
 
+class _NoStoreStatic(StaticFiles):
+    """Serve the app's own files with no-store.
+
+    ES modules are cached far more aggressively than plain scripts, and the
+    cache key ignores the query string on the importing PAGE -- so a hard
+    reload of car.html can still execute a stale car.js. Twice in this
+    project that produced the same baffling symptom: the server and the disk
+    byte-identical and correct, the page running code from an earlier deploy.
+    Once it rendered a card with no live counter; once it threw
+    "does not provide an export named ..." for an export that plainly existed.
+
+    This is a single-user dashboard on localhost, so there is nothing to gain
+    from caching and a whole class of ghost bugs to lose. Vendored assets
+    under /vendor keep their normal caching -- they change when the file
+    changes, which is approximately never.
+    """
+
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        if not path.startswith("vendor/"):
+            response.headers["Cache-Control"] = "no-store, must-revalidate"
+        return response
+
+
 # The static mount is a catch-all: any router included after this line is
 # unreachable. car_routes must be included above it.
-app.mount("/", StaticFiles(directory=BASE_DIR / "static", html=True), name="static")
+app.mount("/", _NoStoreStatic(directory=BASE_DIR / "static", html=True),
+          name="static")
 
 
 if __name__ == "__main__":
