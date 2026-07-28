@@ -849,16 +849,25 @@ async def run(once: bool = False) -> int:
 
             soc = (view or {}).get("soc")
             _log(f"{car_state}" + (f" soc={soc}%" if soc is not None else ""))
+            waiting_for_surplus = bool(
+                solar_wanted
+                and (watching
+                     or solar.load_state(store._db, vin)["state"]
+                     in ("idle", "stopped")))
+
             if once:
                 return 0
             await asyncio.sleep(
                 backoff_s
-                # `watching` wins outright. It is only ever true for an
-                # unreadable car with the machine idle or stopped, and
-                # "stopped" is itself in ENGAGED_STATES -- so testing
-                # `not engaged` here silently fell through to the 1800 s
-                # asleep poll and the watch never ran at its own cadence.
-                or (conf["watch_s"] if watching
+                # Anything WAITING FOR SURPLUS runs at the watch cadence,
+                # whether the car is asleep (unreadable, meter-only ticks) or
+                # awake and idle. Both are the same situation -- nothing to
+                # servo, just a threshold to notice -- and both were falling
+                # through to a 1800 s poll: poll_asleep for the sleeping case,
+                # poll_idle for the waking one, because "idle" is not in
+                # ENGAGED_STATES. Thirty minutes of standing surplus either
+                # way, which is the complaint that started this.
+                or (conf["watch_s"] if waiting_for_surplus
                     else next_interval(car_state, view, settings, engaged)))
     finally:
         await client.aclose()

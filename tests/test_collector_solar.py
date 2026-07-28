@@ -2305,3 +2305,64 @@ async def test_a_refused_charge_start_does_not_strand_the_machine(tmp_path, monk
     assert restores, f"the owner's amps must be restored: {client.commands}"
     assert st["dirty"] == 0, "and the dirty flag cleared once restored"
     store_.close()
+
+
+class _AwakeIdleLoopClient(_WatchLoopClient):
+    """Car online and idle, plugged in, with surplus below the start threshold
+    -- the machine sits in idle waiting for it to cross."""
+
+    async def vehicle(self, vin):
+        self.calls.append("vehicle")
+        return {"state": "online"}
+
+    async def vehicle_data(self, vin, *a, **k):
+        self.calls.append("vehicle_data")
+        return {"charge_state": {"charging_state": "Stopped",
+                                 "charger_actual_current": 0,
+                                 "charge_amps": 48,
+                                 "charge_current_request_max": 48,
+                                 "charger_voltage": 240,
+                                 "battery_level": 38,
+                                 "charge_limit_soc": 91,
+                                 "fast_charger_present": False},
+                "drive_state": {"latitude": 40.0, "longitude": -105.0,
+                                "timestamp": 0},
+                "vehicle_state": {"odometer": 1000}}
+
+
+@pytest.mark.asyncio
+async def test_an_awake_idle_car_also_waits_at_the_watch_cadence(monkeypatch, tmp_path):
+    """The same complaint in the other state.
+
+    A sleeping car falls to poll_asleep; an awake IDLE one falls to poll_idle,
+    because "idle" is not in ENGAGED_STATES. Both are 1800 s, and both are the
+    same situation -- nothing to servo, just a threshold to notice. Half an
+    hour of standing surplus either way.
+    """
+    calls: list[str] = []
+    db_path = tmp_path / "car.db"
+    seed = Store(db_path)
+    solar.save_config(seed._db, enabled=1, watch_s=300)
+    home.save(seed._db, 40.0, -105.0, 100)
+    solar.save_state(seed._db, "VIN1", state="idle", hold_s=0)
+    seed.close()
+
+    monkeypatch.setattr(collector.settings, "db_file", db_path)
+    # Surplus BELOW the 1300 W floor, so it stays in idle rather than starting.
+    monkeypatch.setattr(collector, "TeslaClient",
+                        lambda settings: _AwakeIdleLoopClient(calls, grid_w=-400.0))
+
+    slept: list[int] = []
+
+    async def fake_sleep(seconds):
+        slept.append(seconds)
+        if len(slept) >= 3:
+            raise StopTest()
+    monkeypatch.setattr(collector.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(StopTest):
+        await collector.run()
+
+    assert slept[-1] == 300, (
+        f"an awake car waiting for surplus must poll at watch_s, not "
+        f"poll_idle: {slept}")
