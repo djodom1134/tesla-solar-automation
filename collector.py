@@ -398,7 +398,22 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
                                  original_limit=view.get("limit"),
                                  engaged_at=int(time.time()))
                 st = solar.load_state(db, vin)
-            await _command(client, vin, "charge_start")
+            if not await _command(client, vin, "charge_start"):
+                # The car did not start. Most often it was still coming out
+                # of sleep: a command issued seconds behind wake_up comes
+                # back HTTP 500 (observed live 2026-07-28 09:30).
+                #
+                # Advancing to "charging" anyway strands the machine three
+                # ways at once -- it believes it is servoing a charge that
+                # does not exist, it writes amps to a car drawing nothing,
+                # and because "charging" is neither idle nor stopped the
+                # meter watch stops as well, so nothing re-checks for a full
+                # poll_asleep. Put the owner's settings back and stay put.
+                _log("charge_start refused; rolling back to stopped")
+                await _restore(client, db, vin, solar.load_state(db, vin), view)
+                solar.save_state(db, vin, **solar.machine_fields(
+                    solar.Machine(state="stopped", hold_s=0)))
+                return "stopped", False
         elif action == "adopt":
             # Taking over a charge the CAR started, not us -- issue no
             # charge_start (it is already running), but record the originals
@@ -813,6 +828,14 @@ async def run(once: bool = False) -> int:
                 state, wrote_last_tick = await solar_tick(
                     client, store, vin, view, settings, site_id)
                 engaged = conf["period_s"] if state in ENGAGED_STATES else 0
+                if watching and state not in ("idle", "stopped"):
+                    # Engaging from a watch tick necessarily woke the car, but
+                    # watch ticks skip poll_once, so car_state is still the
+                    # stale "offline" that next_interval short-circuits on --
+                    # sending the loop to sleep for poll_asleep instead of
+                    # servoing the charge it just started.
+                    car_state = "online"
+
                 # Invariant 4 (spec 3.7): a 429 caught during this tick's
                 # live_status call lengthens the NEXT sleep instead of
                 # retrying at the normal cadence. solar_tick persists the

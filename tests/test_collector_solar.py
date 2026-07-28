@@ -2241,3 +2241,67 @@ async def test_the_watch_polls_the_meter_without_touching_the_car(monkeypatch, t
         f"watch ticks must use watch_s, got {slept}")
     store_ = Store(db_path)
     store_.close()
+
+
+class _StartFailsClient(_SolarSiteClient):
+    """Wakes fine, but charge_start is refused -- the live 2026-07-28 failure,
+    where a command sent seconds behind wake_up came back HTTP 500 because the
+    car was still coming out of sleep."""
+
+    async def command(self, vin, name, params):
+        self.commands.append((name, dict(params)))
+        if name == "charge_start":
+            return 500, {}
+        if name == "set_charging_amps":
+            self.amps = params["charging_amps"]
+        return 200, {"response": {"result": True}}
+
+    async def wake_up(self, vin):
+        self.commands.append(("wake_up", {}))
+        return {"state": "online"}
+
+
+@pytest.mark.asyncio
+async def test_a_refused_charge_start_does_not_strand_the_machine(tmp_path, monkeypatch):
+    """Observed live 2026-07-28 09:30.
+
+    The watch fired, woke the car, and charge_start came back HTTP 500 -- but
+    the machine advanced to "charging" regardless. That strands it three ways
+    at once: it believes it is servoing a charge that does not exist, it
+    writes amps to a car that is not drawing, and because "charging" is
+    neither idle nor stopped the meter watch stops too, so nothing re-checks
+    for a full poll_asleep. The car sat at 9 A commanded, 0 A drawn, with the
+    next look half an hour away.
+
+    A start that did not start must leave the machine where it was.
+    """
+    store_ = Store(tmp_path / "car.db")
+    db = store_._db
+    solar.save_config(db, enabled=1, restart_hold_s=0)
+    home.save(db, 40.0, -105.0, 100)
+    solar.save_state(db, "VIN1", state="stopped", hold_s=0)
+    store_.record({"charging_state": "Stopped", "amps_actual": 0, "charging": 0,
+                   "charge_amps": 48, "amps_max": 48, "volts": 240,
+                   "soc": 38, "limit": 91, "lat": 40.0, "lon": -105.0,
+                   "fast_charger_present": False, "fast_charger": None,
+                   "vin": "VIN1", "sampled_at": int(time.time())}, at_home=True)
+    cfg = SimpleNamespace(timezone="America/Denver", proxy_url="https://localhost:4443")
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+
+    client = _StartFailsClient(house_w=1400.0, solar_w=7000.0)
+    state, _ = await collector.solar_tick(client, store_, "VIN1", None, cfg,
+                                          site_id=1)
+
+    assert state != "charging", (
+        "a refused charge_start must not leave the machine believing it is "
+        "charging -- that disables the watch and strands it for a full "
+        "poll_asleep")
+    st = solar.load_state(db, "VIN1")
+    assert st["state"] != "charging"
+    # The owner's 48 A must come back: amps were written before the start was
+    # refused, so the car is left holding the controller's value otherwise.
+    restores = [c for c in client.commands
+                if c[0] == "set_charging_amps" and c[1]["charging_amps"] == 48]
+    assert restores, f"the owner's amps must be restored: {client.commands}"
+    assert st["dirty"] == 0, "and the dirty flag cleared once restored"
+    store_.close()
