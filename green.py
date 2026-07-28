@@ -81,6 +81,59 @@ def solar_kwh(ticks: list[dict[str, Any]]) -> float:
     return wh / 1000
 
 
+def grid_kwh(ticks: list[dict[str, Any]]) -> float:
+    """Utility energy delivered to the car, the other half of solar_kwh.
+
+    DERIVED from the tick log rather than accumulated into a counter, and
+    deliberately so. A stored counter starts at zero on the day it is added,
+    so it disagrees with every figure computed from history until enough time
+    passes to hide the gap -- which is exactly how "charged so far" came to
+    contradict "banked solar" on the card. The tick log is never pruned and
+    already answers this question for any window, so there is nothing for a
+    counter to add except a way to drift.
+    """
+    wh = 0.0
+    for tick in ticks:
+        if tick.get("state") not in ENGAGED_STATES:
+            continue
+        car_w = float(tick.get("car_w") or 0)
+        grid_w = float(tick.get("grid_w") or 0)
+        period_s = float(tick.get("period_s") or 0)
+        wh += tick_grid_w(car_w, grid_w) * period_s / 3600
+    return wh / 1000
+
+
+def charged_split(ticks: list[dict[str, Any]]) -> tuple[float, float]:
+    """Lifetime energy into the car as (solar_kwh, grid_kwh), over EVERY tick
+    the car actually drew -- not only the ticks the controller was driving.
+
+    This is the difference between "how did the controller do" and "what is
+    actually in this car", and only the second one is honest on a card that
+    also shows a percentage. Scoping it to engaged ticks silently omits every
+    charge the owner started themselves at full rate from the grid: on this
+    site that read 61% solar against a true 29%, because solar_kwh's
+    ENGAGED_STATES filter dropped the manual sessions from the denominator
+    while leaving them in the pack.
+
+    The banked ledger already counts those sessions -- grid charging dilutes
+    the bank -- so anything shown beside it must count them too, or the two
+    figures describe different cars.
+
+    solar_kwh() keeps its narrower, controller-scoped meaning: it feeds
+    free_miles, which genuinely asks what the controller captured.
+    """
+    solar_wh = grid_wh = 0.0
+    for tick in ticks:
+        car_w = float(tick.get("car_w") or 0)
+        if car_w <= 0:
+            continue
+        grid_w = float(tick.get("grid_w") or 0)
+        period_s = float(tick.get("period_s") or 0)
+        solar_wh += tick_solar_w(car_w, grid_w) * period_s / 3600
+        grid_wh += tick_grid_w(car_w, grid_w) * period_s / 3600
+    return solar_wh / 1000, grid_wh / 1000
+
+
 def pack_kwh(sessions: list[dict[str, Any]]) -> tuple[float | None, int]:
     """Usable pack size, measured from real charge sessions rather than
     assumed or taken from a spec sheet.

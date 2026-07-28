@@ -407,6 +407,10 @@ def solar_status() -> dict:
         "charged_solar_miles": 794.0,
         "charged_grid_miles": 143.9,
         "charged_solar_share": 84.7,
+        # "measured" only -- the demo car has months of history, so mi/kWh is
+        # real. A fresh install reports None here and the card shows kWh
+        # alone, because a miles figure resting on an assumed pack size
+        # contradicts banked_miles, which needs no pack size at all.
         "charged_miles_basis": "measured",
         # Task 20: lifetime free miles driven -- a demo car with months of
         # history behind it, so the promoted headline has something to

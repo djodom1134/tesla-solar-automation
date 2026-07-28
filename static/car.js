@@ -542,21 +542,22 @@ async function loadSolar() {
   // half, and a controller that holds the floor through clouds imports a
   // little deliberately. Naming that is what makes the solar number
   // believable.
+  // Reported in kWh, which is measured. Miles are added only once mi/kWh has
+  // been measured too -- NOT from the rated/nominal-pack estimate. Banked
+  // miles above come from the car's own rated range and need no pack size at
+  // all, so a miles figure here resting on an assumed pack disagreed with it
+  // by whatever that assumption was wrong by, and the card contradicted
+  // itself. kWh cannot contradict anything.
   const split = $("solar-charged-split");
-  if (s.charged_solar_kwh === 0 && s.charged_grid_kwh === 0) {
+  if (!s.charged_solar_kwh && !s.charged_grid_kwh) {
     split.textContent = "Charged so far: nothing recorded yet.";
-  } else if (s.charged_solar_miles === null) {
-    split.textContent =
-      `Charged so far: ${nfmt(s.charged_solar_kwh, 1)} kWh from sun, `
-      + `${nfmt(s.charged_grid_kwh, 1)} kWh from grid `
-      + `(${nfmt(s.charged_solar_share, 0)}% solar).`;
   } else {
-    const basis = s.charged_miles_basis === "measured"
-      ? "measured mi/kWh" : "the car's rated range";
+    const miles = s.charged_solar_miles === null ? ""
+      : ` — ${nfmt(s.charged_solar_miles, 1)} free miles put in`;
     split.textContent =
-      `Charged so far: ${nfmt(s.charged_solar_miles, 1)} mi from sun, `
-      + `${nfmt(s.charged_grid_miles, 1)} mi from grid `
-      + `(${nfmt(s.charged_solar_share, 0)}% solar, ${basis}).`;
+      `Charged so far: ${nfmt(s.charged_solar_kwh, 2)} kWh from sun, `
+      + `${nfmt(s.charged_grid_kwh, 2)} kWh from grid `
+      + `(${nfmt(s.charged_solar_share, 0)}% solar)${miles}.`;
   }
 
   const warn = $("solar-warn");

@@ -531,18 +531,12 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
         ledger_fields = {"solar_soc": new_solar_soc, "ledger_soc": int(soc_now),
                          "ledger_stale": 1 if ledger_stale else 0}
 
-        # Lifetime energy into the car, split by origin. Accumulated from the
-        # MEASURED watts over this tick's own period, so neither figure
-        # depends on pack size or mi/kWh -- those enter only when the card
-        # converts watt-hours to miles.
-        if engaged_now and car_w > 0:
-            hours = conf["period_s"] / 3600.0
-            ledger_fields["charged_solar_wh"] = (
-                st["charged_solar_wh"]
-                + green.tick_solar_w(car_w, grid_w) * hours)
-            ledger_fields["charged_grid_wh"] = (
-                st["charged_grid_wh"]
-                + green.tick_grid_w(car_w, grid_w) * hours)
+        # Lifetime solar/grid energy into the car is NOT accumulated here.
+        # It is derived from the tick log on read (green.solar_kwh /
+        # green.grid_kwh), which this tick's own log_tick below feeds. A
+        # counter would start at zero on the day it was added and silently
+        # disagree with every history-derived figure beside it -- which is
+        # precisely how "charged so far" came to contradict "banked solar".
 
         # Task 20: lifetime free miles driven -- green.free_miles_step's own
         # "before" arguments are st["solar_soc"]/st["ledger_soc"], the SAME

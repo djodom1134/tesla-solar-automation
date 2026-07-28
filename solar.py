@@ -441,10 +441,6 @@ CREATE TABLE IF NOT EXISTS solar_state (
   -- Grid energy spent riding out a dip at the floor. Bounds grace alongside
   -- grace_s, and is the constraint that actually binds. See advance().
   grace_wh        REAL    NOT NULL DEFAULT 0,
-  -- Lifetime energy delivered to the car, split by origin. See
-  -- green.tick_solar_w / tick_grid_w for the attribution convention.
-  charged_solar_wh REAL   NOT NULL DEFAULT 0,
-  charged_grid_wh  REAL   NOT NULL DEFAULT 0,
   dirty           INTEGER NOT NULL DEFAULT 0,
   original_amps   INTEGER,
   original_limit  INTEGER,
@@ -532,7 +528,6 @@ STATE_DEFAULTS = {
     "solar_soc": 0.0, "ledger_soc": None, "ledger_stale": 0,
     "free_miles_driven": 0.0, "tracked_miles": 0.0, "ledger_odo": None,
     "free_miles_since": None,
-    "charged_solar_wh": 0.0, "charged_grid_wh": 0.0,
 }
 
 # The Machine fields that must survive between ticks. Anything here that is
@@ -572,11 +567,6 @@ STATE_NEW_COLUMNS = (
     ("free_miles_since", "INTEGER"),
     # Ride-through: grid energy spent holding at the floor through a dip.
     ("grace_wh", "REAL NOT NULL DEFAULT 0"),
-    # Lifetime energy INTO the car, split by where it actually came from.
-    # Watt-hours, because that is what is measured -- neither figure depends
-    # on pack size or mi/kWh, which enter only at display time.
-    ("charged_solar_wh", "REAL NOT NULL DEFAULT 0"),
-    ("charged_grid_wh", "REAL NOT NULL DEFAULT 0"),
 )
 
 

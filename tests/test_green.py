@@ -106,13 +106,13 @@ def test_ledger_starts_at_zero_and_first_tick_only_records():
     """No previous SoC exists yet -- the only honest move is to record the
     observation and bank nothing, never assume a rise or a drop happened
     before anything was watching."""
-    solar_soc, stale = green.ledger_step(0.0, None, 62, True, 999_999, THRESH)
+    solar_soc, stale = green.ledger_step(0.0, None, 62, 1.0, 999_999, THRESH)
     assert solar_soc == 0
     assert stale is False
 
 
 def test_ledger_rise_while_solar_charging_banks_it():
-    solar_soc, stale = green.ledger_step(0.0, 50, 70, True, 60, THRESH)
+    solar_soc, stale = green.ledger_step(0.0, 50, 70, 1.0, 60, THRESH)
     assert solar_soc == 20
     assert stale is False
 
@@ -120,19 +120,19 @@ def test_ledger_rise_while_solar_charging_banks_it():
 def test_ledger_rise_while_grid_charging_does_not_bank():
     """Total SoC rose, so the solar FRACTION falls on its own -- grid
     electrons dilute the bank, they do not remove sun already in it."""
-    solar_soc, stale = green.ledger_step(20.0, 50, 70, False, 60, THRESH)
+    solar_soc, stale = green.ledger_step(20.0, 50, 70, 0.0, 60, THRESH)
     assert solar_soc == 20
     assert stale is False
 
 
 def test_ledger_drop_drains_proportionally():
     """32 of 80 (40%) drops to 70: 40% of the 10-point drop leaves with it."""
-    solar_soc, _ = green.ledger_step(32.0, 80, 70, False, 60, THRESH)
+    solar_soc, _ = green.ledger_step(32.0, 80, 70, 0.0, 60, THRESH)
     assert solar_soc == pytest.approx(28.0)
 
 
 def test_ledger_drop_to_zero_soc_leaves_zero_banked():
-    solar_soc, _ = green.ledger_step(45.0, 90, 0, False, 60, THRESH)
+    solar_soc, _ = green.ledger_step(45.0, 90, 0, 0.0, 60, THRESH)
     assert solar_soc == 0
 
 
@@ -150,7 +150,7 @@ def test_ledger_drop_to_zero_soc_leaves_zero_banked():
 def test_ledger_long_gap_with_unchanged_soc_is_not_stale():
     """THE REGRESSION THAT MATTERS. The car slept the whole gap; nothing
     happened, so nothing was missed -- length alone must not flag this."""
-    solar_soc, stale = green.ledger_step(12.0, 60, 60, False, THRESH + 1, THRESH)
+    solar_soc, stale = green.ledger_step(12.0, 60, 60, 0.0, THRESH + 1, THRESH)
     assert stale is False
     assert solar_soc == 12.0
 
@@ -161,7 +161,7 @@ def test_ledger_long_gap_with_soc_risen_and_no_solar_charging_is_stale():
     charge or several ups and downs it never saw. Not solar-attributed here
     (state/attribution says grid), so the value is left unchanged -- but
     still reported stale, and still within the general clamp regardless."""
-    solar_soc, stale = green.ledger_step(20.0, 50, 70, False, THRESH + 1, THRESH)
+    solar_soc, stale = green.ledger_step(20.0, 50, 70, 0.0, THRESH + 1, THRESH)
     assert stale is True
     assert 0 <= solar_soc <= 70
 
@@ -170,7 +170,7 @@ def test_ledger_long_gap_with_soc_fallen_is_stale_and_drains_proportionally():
     """A drop still drains proportionally regardless of staleness -- the
     proportional-drain rule doesn't get suspended by not having watched it
     happen continuously -- but the gap is still reported stale."""
-    solar_soc, stale = green.ledger_step(32.0, 80, 70, False, THRESH + 1, THRESH)
+    solar_soc, stale = green.ledger_step(32.0, 80, 70, 0.0, THRESH + 1, THRESH)
     assert stale is True
     assert solar_soc == pytest.approx(28.0)
 
@@ -178,14 +178,14 @@ def test_ledger_long_gap_with_soc_fallen_is_stale_and_drains_proportionally():
 def test_ledger_short_gap_with_soc_movement_is_not_stale():
     """Ordinary accounting: seen and priced in tick by tick, regardless of
     whether the SoC moved -- only a LONG gap can ever be stale."""
-    solar_soc, stale = green.ledger_step(0.0, 50, 70, True, THRESH - 1, THRESH)
+    solar_soc, stale = green.ledger_step(0.0, 50, 70, 1.0, THRESH - 1, THRESH)
     assert stale is False
     assert solar_soc == 20
 
 
 def test_ledger_gap_exactly_at_the_threshold_is_not_stale():
     """Strictly greater than, not greater-or-equal."""
-    _, stale = green.ledger_step(10.0, 50, 55, True, THRESH, THRESH)
+    _, stale = green.ledger_step(10.0, 50, 55, 1.0, THRESH, THRESH)
     assert stale is False
 
 
@@ -194,7 +194,7 @@ def test_ledger_threshold_is_a_parameter_not_stores_constant(monkeypatch):
     proven, not just asserted, by wrecking store.GAP_SECONDS and confirming
     it has no effect whatsoever on the result."""
     monkeypatch.setattr(store, "GAP_SECONDS", 1)
-    _, stale = green.ledger_step(10.0, 50, 55, True, gap_s=100,
+    _, stale = green.ledger_step(10.0, 50, 55, 1.0, gap_s=100,
                                  gap_threshold_s=1800)
     assert stale is False, "must ignore store.GAP_SECONDS entirely"
 
@@ -206,7 +206,7 @@ def test_ledger_clamp_logs_a_warning(caplog):
         # delta == 0 leaves solar_soc unchanged pre-clamp; an already-
         # inconsistent input (25 > soc_now of 20) is what makes the general
         # clamp actually fire, independent of staleness.
-        green.ledger_step(25.0, 20, 20, False, THRESH + 1, THRESH)
+        green.ledger_step(25.0, 20, 20, 0.0, THRESH + 1, THRESH)
     assert any("clamp" in r.message for r in caplog.records)
 
 
@@ -231,13 +231,13 @@ def test_ledger_full_cycle_bank_drive_off_half_bank_again():
     """Hand arithmetic: bank 20 (0 -> 20 of 70); halve the pack by driving
     (70 -> 35), which -- proportional drain preserving the ratio -- halves
     the bank too (20 -> 10); bank 15 more (10 -> 25 of 50)."""
-    solar_soc, stale = green.ledger_step(0.0, 50, 70, True, 60, THRESH)
+    solar_soc, stale = green.ledger_step(0.0, 50, 70, 1.0, 60, THRESH)
     assert solar_soc == 20 and stale is False
 
-    solar_soc, _ = green.ledger_step(solar_soc, 70, 35, False, 60, THRESH)
+    solar_soc, _ = green.ledger_step(solar_soc, 70, 35, 0.0, 60, THRESH)
     assert solar_soc == pytest.approx(10.0)
 
-    solar_soc, _ = green.ledger_step(solar_soc, 35, 50, True, 60, THRESH)
+    solar_soc, _ = green.ledger_step(solar_soc, 35, 50, 1.0, 60, THRESH)
     assert solar_soc == pytest.approx(25.0)
 
 
@@ -451,3 +451,85 @@ def test_a_partial_rise_still_respects_the_clamp():
     assert 0 <= banked <= 5
     banked, _ = green.ledger_step(4.0, 5, 4, 0.9, 0, 3600)
     assert 0 <= banked <= 4
+
+
+def test_lifetime_charged_is_derived_not_counted():
+    """The defect the owner caught: "Charged so far" said 3.0 mi from sun
+    while "Banked solar" said 10.4 free miles -- the pack cannot hold more
+    sun than was ever put into it.
+
+    Cause one was a stored counter that began at zero the day its column was
+    added, so it silently excluded every tick before then. Deriving both
+    figures from the same never-pruned tick log removes the failure mode
+    rather than patching the number.
+    """
+    ticks = [
+        {"state": "charging", "car_w": 2000, "grid_w": 100, "period_s": 3600},
+        {"state": "charging", "car_w": 2000, "grid_w": -500, "period_s": 3600},
+        {"state": "idle", "car_w": 0, "grid_w": -4000, "period_s": 3600},
+    ]
+    assert green.solar_kwh(ticks) == pytest.approx(1.9 + 2.0)
+    assert green.grid_kwh(ticks) == pytest.approx(0.1 + 0.0)
+    # Every engaged watt-hour lands in exactly one bucket.
+    assert green.solar_kwh(ticks) + green.grid_kwh(ticks) == pytest.approx(4.0)
+
+
+def test_idle_ticks_contribute_to_neither_half():
+    """A car drawing nothing while the sun blazes charges nothing, and an
+    unengaged tick is not the controller's to claim either way."""
+    ticks = [{"state": "idle", "car_w": 5000, "grid_w": -9000, "period_s": 3600}]
+    assert green.solar_kwh(ticks) == 0.0
+    assert green.grid_kwh(ticks) == 0.0
+
+
+def test_the_two_miles_figures_use_different_bases_and_must_not_be_mixed():
+    """Why "charged so far" stops at kWh until mi/kWh is measured.
+
+    banked_miles_rated needs NO pack size -- it is a fraction of the car's own
+    reported range. kWh -> miles must go through mi/kWh = rated_range / pack,
+    and with pack unknown that is a guess. On this car the ledger implied
+    ~69 kWh against an assumed 100, so the same energy read 7.2 miles in one
+    line and 10.4 in the other.
+    """
+    soc, range_mi = 40, 139.08
+    banked = green.banked_miles_rated(3.0, soc, range_mi)
+    assert banked == pytest.approx(10.43, abs=0.01)
+
+    # The same 3 points of SoC, converted through an assumed 100 kWh pack.
+    mpk_assumed, basis = green.effective_mi_per_kwh(None, soc, range_mi, None)
+    assert basis == "rated"
+    via_energy = 3.0 / 100 * green.NOMINAL_PACK_KWH * mpk_assumed
+    assert via_energy == pytest.approx(10.43, abs=0.01), (
+        "consistent ONLY when the pack really is NOMINAL_PACK_KWH")
+
+    # With the pack the data actually implies, the same energy is fewer miles
+    # -- which is precisely the contradiction the card was showing.
+    mpk_real, _ = green.effective_mi_per_kwh(None, soc, range_mi, 68.8)
+    assert 2.065 * mpk_real == pytest.approx(banked, abs=0.05)
+    assert 2.065 * mpk_assumed < banked * 0.8, "the assumed pack understates it badly"
+
+
+def test_charged_split_counts_manual_grid_charging_too():
+    """The flattering-percentage bug. solar_kwh's ENGAGED_STATES filter drops
+    charges the owner started themselves, which are still very much in the
+    pack -- and which the banked ledger already counts. Leaving them out of
+    the denominator read 61% solar on this site against a true 29%.
+    """
+    ticks = [
+        # Controller driving a solar charge.
+        {"state": "charging", "car_w": 2000, "grid_w": -1000, "period_s": 3600},
+        # Owner charging at full rate from the grid; controller idle.
+        {"state": "idle", "car_w": 11000, "grid_w": 12000, "period_s": 3600},
+    ]
+    solar, grid = green.charged_split(ticks)
+    assert solar == pytest.approx(2.0)
+    assert grid == pytest.approx(11.0), "the manual session must be counted"
+    assert 100 * solar / (solar + grid) == pytest.approx(15.4, abs=0.1)
+
+    # solar_kwh keeps its narrower, controller-scoped meaning on purpose.
+    assert green.solar_kwh(ticks) == pytest.approx(2.0)
+
+
+def test_charged_split_ignores_ticks_where_the_car_drew_nothing():
+    assert green.charged_split(
+        [{"state": "idle", "car_w": 0, "grid_w": 5000, "period_s": 3600}]) == (0.0, 0.0)

@@ -148,7 +148,6 @@ def _sessions_and_segments(
 def _green_status(
     db, vin: str, solar_soc: float, soc: int | None, range_mi: float | None,
     free_miles_driven: float, tracked_miles: float, free_miles_since: int | None,
-    charged_solar_wh: float = 0.0, charged_grid_wh: float = 0.0,
 ) -> dict[str, Any]:
     """The free-miles answer, the daily FLOW (Task 16), the banked STOCK
     (Task 18) and the lifetime free miles actually driven (Task 20), honest
@@ -181,6 +180,19 @@ def _green_status(
     # One resolver for every energy-to-miles conversion on this card.
     _mpk, _mpk_basis = green.effective_mi_per_kwh(mpk, soc, range_mi, pack)
 
+    # Lifetime energy into the car, split by origin -- DERIVED from the tick
+    # log, never accumulated into a counter. A counter starts at zero on the
+    # day it is added, so it disagrees with every history-derived figure
+    # beside it; that is exactly how "charged so far" came to contradict
+    # "banked solar" on the card.
+    # EVERY tick the car drew, not only the ones the controller was driving:
+    # scoping this to engaged ticks omits charges the owner started at full
+    # rate from the grid, which read 61% solar against a true 29% on this
+    # site. The banked ledger counts those sessions (grid dilutes the bank),
+    # so anything shown beside it must count them too.
+    charged_solar, charged_grid = green.charged_split(_solar_ticks(db, vin, 0))
+    charged_total = charged_solar + charged_grid
+
     rated = green.banked_miles_rated(solar_soc, soc, range_mi)
     measured = green.banked_miles_measured(solar_soc, pack, mpk)
     if measured is not None:
@@ -209,20 +221,31 @@ def _green_status(
         "tracked_miles": round(tracked_miles, 1),
         "free_miles_share": free_share,
         "free_miles_since": free_miles_since,
-        # Lifetime energy INTO the car, split by where it actually came from,
-        # and the same figures as miles. Both use one resolver
-        # (green.effective_mi_per_kwh) so they cannot disagree with the live
-        # ticker about how far a kilowatt-hour goes.
-        "charged_solar_kwh": round(charged_solar_wh / 1000.0, 2),
-        "charged_grid_kwh": round(charged_grid_wh / 1000.0, 2),
+        # Lifetime energy INTO the car, split by origin. Reported in kWh,
+        # which is MEASURED, and converted to miles only when mi/kWh has been
+        # measured too.
+        #
+        # Not merely a labelling nicety: banked_miles is solar_soc/soc x the
+        # car's own rated range and needs no pack size at all, while
+        # kWh -> miles goes through mi/kWh = rated_range / pack. With pack
+        # unknown, NOMINAL_PACK_KWH stands in, and the two figures disagree by
+        # whatever that guess is wrong by -- on this car the ledger implies
+        # ~69 kWh against an assumed 100, so the same energy read as 7.2 miles
+        # in one line and 10.4 in the other. Showing a miles figure that rests
+        # on a guess, beside one that does not, is what made the card
+        # contradict itself.
+        "charged_solar_kwh": round(charged_solar, 2),
+        "charged_grid_kwh": round(charged_grid, 2),
         "charged_solar_miles": (
-            round(charged_solar_wh / 1000.0 * _mpk, 1) if _mpk else None),
+            round(charged_solar * mpk, 1) if mpk else None),
         "charged_grid_miles": (
-            round(charged_grid_wh / 1000.0 * _mpk, 1) if _mpk else None),
+            round(charged_grid * mpk, 1) if mpk else None),
         "charged_solar_share": (
-            round(100.0 * charged_solar_wh / (charged_solar_wh + charged_grid_wh), 1)
-            if (charged_solar_wh + charged_grid_wh) > 0 else None),
-        "charged_miles_basis": _mpk_basis,
+            round(100.0 * charged_solar / charged_total, 1)
+            if charged_total > 0 else None),
+        # "measured" only. Deliberately NOT _mpk_basis, which falls back to
+        # the rated/nominal-pack estimate -- see above.
+        "charged_miles_basis": "measured" if mpk else None,
     }
 
 
@@ -393,8 +416,7 @@ async def get_solar_status() -> dict[str, Any]:
         "ledger_stale": bool(state["ledger_stale"]),
         **_green_status(db, vin, state["solar_soc"], view.get("soc"), view.get("range_mi"),
                         state["free_miles_driven"], state["tracked_miles"],
-                        state["free_miles_since"],
-                        state["charged_solar_wh"], state["charged_grid_wh"]),
+                        state["free_miles_since"]),
     }
 
 
