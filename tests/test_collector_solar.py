@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 import time
 from types import SimpleNamespace
@@ -1989,4 +1990,114 @@ async def test_a_downward_correction_is_never_ramp_limited(tmp_path):
         "importing for another two ticks while the meter already knew the answer")
     assert 24 <= writes[0] <= 26, (
         f"expected ~25 A in one move, got {writes[0]} A")
+    store_.close()
+
+
+async def _no_sleep(_seconds):
+    """The wake path sleeps 5 s waiting for the car; tests need not."""
+    return None
+
+
+class _AsleepCarClient(_SolarSiteClient):
+    """A site with real surplus and a car that is asleep until woken.
+
+    vehicle() reports "asleep", so poll_once returns no view at all -- which
+    is exactly the condition under which the solar loop used to do nothing.
+    """
+
+    def __init__(self, house_w, solar_w):
+        super().__init__(house_w, solar_w)
+        self.awake = False
+
+    async def vehicle(self, vin):
+        return {"state": "online" if self.awake else "asleep"}
+
+    async def vehicle_data(self, vin):
+        raise AssertionError("must not pay for vehicle_data while asleep")
+
+    async def wake_up(self, vin):
+        self.commands.append(("wake_up", {}))
+        self.awake = True
+        return {"state": "online"}
+
+
+@pytest.mark.asyncio
+async def test_a_sleeping_plugged_in_car_is_woken_for_sustained_surplus(
+        tmp_path, monkeypatch):
+    """The gap observed live on 2026-07-28.
+
+    The car sat plugged in at 38% against a 91% limit -- 53 points of
+    headroom -- from 06:55 while the sun came up, and the controller never
+    engaged. solar_tick only runs when vehicle_data returns a view, and a
+    sleeping car returns none, so the machine could never reach the `wake`
+    action it already had.
+
+    Waking must still be EARNED: restart_hold_s of sustained surplus, not one
+    hopeful reading. A manual wake issued against a 1,720 W surplus on
+    2026-07-28 landed six minutes later against -120 W, having bought
+    nothing -- which is precisely what the hold exists to prevent.
+    """
+    store_ = Store(tmp_path / "car.db")
+    db = store_._db
+    solar.save_config(db, enabled=1)
+    home.save(db, 40.0, -105.0, 100)
+    solar.save_state(db, "VIN1", state="stopped", hold_s=0)
+
+    client = _AsleepCarClient(house_w=1400.0, solar_w=7000.0)   # 5.6 kW spare
+    # The stored snapshot is all the loop has to reason from.
+    store_.record({"charging_state": "Stopped", "amps_actual": 0, "charging": 0,
+                   "charge_amps": 48, "amps_max": 48, "volts": 240,
+                   "soc": 38, "limit": 91, "lat": 40.0, "lon": -105.0,
+                   "fast_charger_present": False, "fast_charger": None,
+                   "vin": "VIN1", "sampled_at": int(time.time())}, at_home=True)
+    cfg = SimpleNamespace(timezone="America/Denver", proxy_url="https://localhost:4443")
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+
+    # Tick 1: surplus is there but unproven -- accumulate, spend nothing.
+    state, _ = await collector.solar_tick(client, store_, "VIN1", None, cfg,
+                                          site_id=1)
+    assert ("wake_up", {}) not in client.commands, (
+        "a single reading must never buy a wake -- that is the mistake the "
+        "sustained hold exists to prevent")
+    assert solar.load_state(db, "VIN1")["hold_s"] > 0, "the hold must accumulate"
+
+    # restart_hold_s=300 against a 120 s period: the hold is compared as
+    # carried in, so it takes four ticks. Loop rather than hardcode the count.
+    for _ in range(6):
+        if ("wake_up", {}) in client.commands:
+            break
+        state, _ = await collector.solar_tick(client, store_, "VIN1", None,
+                                              cfg, site_id=1)
+    assert ("wake_up", {}) in client.commands, (
+        f"sustained surplus must wake a plugged-in, hungry car: {client.commands}")
+    assert state == "charging"
+    starts = [c for c in client.commands if c[0] == "charge_start"]
+    assert starts, f"and then actually start it: {client.commands}"
+    store_.close()
+
+
+@pytest.mark.asyncio
+async def test_a_sleeping_car_is_left_alone_when_there_is_nothing_to_gain(tmp_path):
+    """Discriminating half: same sleeping car, same sun, but already full.
+    Nothing should be spent -- no wake, no command, no vehicle_data.
+    """
+    store_ = Store(tmp_path / "car.db")
+    db = store_._db
+    solar.save_config(db, enabled=1)
+    home.save(db, 40.0, -105.0, 100)
+    solar.save_state(db, "VIN1", state="stopped", hold_s=0)
+
+    client = _AsleepCarClient(house_w=1400.0, solar_w=7000.0)
+    store_.record({"charging_state": "Stopped", "amps_actual": 0, "charging": 0,
+                   "charge_amps": 48, "amps_max": 48, "volts": 240,
+                   "soc": 91, "limit": 91, "lat": 40.0, "lon": -105.0,
+                   "fast_charger_present": False, "fast_charger": None,
+                   "vin": "VIN1", "sampled_at": int(time.time())}, at_home=True)
+    cfg = SimpleNamespace(timezone="America/Denver", proxy_url="https://localhost:4443")
+
+    for _ in range(4):
+        await collector.solar_tick(client, store_, "VIN1", None, cfg, site_id=1)
+
+    assert client.commands == [], (
+        f"a full car must never be woken for sunshine: {client.commands}")
     store_.close()

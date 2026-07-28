@@ -38,8 +38,22 @@ def next_interval(car_state: str, view: dict | None, cfg,
     """Seconds until the next poll. Pure, so it is testable without a car.
 
     `solar_engaged` is the solar period in seconds when the controller holds
-    the car, else 0. It wins over every other cadence EXCEPT sleep: a sleeping
-    car is never polled fast, because the loop cannot act on it anyway.
+    the car, else 0. It wins over every other cadence EXCEPT sleep.
+
+    A sleeping car is still never polled fast, but no longer because the loop
+    cannot act on it -- solar_tick now reasons from the stored snapshot and
+    can wake a plugged-in car for sustained surplus. The reason is now purely
+    economic, and the arithmetic is one-sided. Over a 10 h window at ~2 billed
+    requests per tick:
+
+        1800 s   20 ticks   $0.08/day    <= this
+         900 s   40 ticks   $0.16/day
+         600 s   60 ticks   $0.24/day
+
+    Halving the interval halves the worst-case wake latency (60 -> 30 min),
+    which recovers maybe 0.5 kWh of the morning ramp -- about $0.04 at the
+    measured $0.08/kWh self-consumption spread, against $0.08/day of extra
+    requests. Polling faster costs more than the sunshine it catches.
     """
     if car_state != "online":
         return cfg.poll_asleep
@@ -79,6 +93,12 @@ async def poll_once(client: TeslaClient, store: Store, vin: str, cfg):
     store.record(view, at_home=home.classify(view, home.load(store._db)))
     return car_state, view
 
+
+# How stale the stored snapshot may be and still justify waking a car for
+# sunshine. Six hours spans a working day: long enough that a car parked
+# and asleep since breakfast is still actionable at noon, short enough
+# that a car driven away yesterday never is.
+SNAPSHOT_MAX_AGE_S = 6 * 3600
 
 ENGAGED_STATES = {"charging", "grace", "stopped"}
 
@@ -191,6 +211,30 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
     db = store_._db
     conf = solar.load_config(db)
     st = solar.load_state(db, vin)
+
+    # A SLEEPING car returns no view at all (poll_once yields None), which
+    # used to end the tick before it began -- so the machine could never reach
+    # the `wake` action it already had. Observed 2026-07-28: the car sat
+    # plugged in at 38% against a 91% limit all morning while the loop logged
+    # 66 asleep ticks and never once looked at the meter.
+    #
+    # Fall back to the stored snapshot, but only to answer "is this worth
+    # waking for". Two guards make that safe: the machine must be idle or
+    # stopped (never servo amps against a car we cannot see), and the snapshot
+    # must still describe a plugged-in car with headroom -- see
+    # solar.sleeping_candidate. The sustained-surplus hold then applies
+    # unchanged, so a wake is still earned over several ticks rather than
+    # bought on one hopeful reading.
+    if view is None:
+        if st["state"] not in ("idle", "stopped"):
+            return st["state"], False
+        snap = store_.snapshot(vin)
+        age_s = (time.time() - snap["ts"]) if snap else None
+        shadow = snap["view"] if snap else None
+        if not solar.sleeping_candidate(shadow, age_s, SNAPSHOT_MAX_AGE_S):
+            return st["state"], False
+        view = shadow
+
     home_cfg = home.load(db)
     location = home.classify(view, home_cfg)
 

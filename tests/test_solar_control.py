@@ -212,3 +212,41 @@ def test_a_failed_recovery_attempt_does_not_refund_the_grace_budget():
         "REGRESSION: an alternating surplus refunded the energy budget every "
         "flicker, so grace never expired and the car imported at the floor "
         "indefinitely")
+
+
+def test_a_sleeping_car_is_worth_watching_only_when_it_could_actually_use_the_sun():
+    """The gate that lets the loop run on a SLEEPING car's last-known state.
+
+    Observed 2026-07-28: the car sat plugged in at 38% against a 91% limit
+    from 06:55 while the sun came up, and the controller never saw it. The
+    loop runs only when vehicle_data returns a view, and vehicle_data returns
+    nothing for a sleeping car -- so reaching the state machine's `wake`
+    action required a tick, a tick required a view, and a view required the
+    car to be awake. 66 asleep ticks were logged with 5 solar ticks between
+    them.
+
+    Acting on a stale view is only defensible when the view still implies
+    there is something to gain, so every clause here is a reason to spend
+    $0.02 on a wake.
+    """
+    fresh = {"charging_state": "Stopped", "soc": 38, "limit": 91}
+    assert solar.sleeping_candidate(fresh, age_s=600, max_age_s=21600)
+
+    # Not plugged: waking buys nothing.
+    assert not solar.sleeping_candidate(
+        {**fresh, "charging_state": "Disconnected"}, 600, 21600)
+    assert not solar.sleeping_candidate(
+        {**fresh, "charging_state": None}, 600, 21600)
+
+    # No headroom: already at its limit.
+    assert not solar.sleeping_candidate({**fresh, "soc": 91}, 600, 21600)
+    assert not solar.sleeping_candidate({**fresh, "soc": 90}, 600, 21600)
+
+    # Stale beyond usefulness -- the car may have been driven away since.
+    assert not solar.sleeping_candidate(fresh, age_s=21601, max_age_s=21600)
+
+    # Missing data is never an invitation to command a car.
+    assert not solar.sleeping_candidate(None, 600, 21600)
+    assert not solar.sleeping_candidate({**fresh, "soc": None}, 600, 21600)
+    assert not solar.sleeping_candidate({**fresh, "limit": None}, 600, 21600)
+    assert not solar.sleeping_candidate(fresh, age_s=None, max_age_s=21600)

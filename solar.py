@@ -136,6 +136,42 @@ def control(grid_w: float, current_a: int, tun: Tunables) -> Decision:
     )
 
 
+def sleeping_candidate(view: dict | None, age_s: float | None,
+                       max_age_s: float) -> bool:
+    """Whether a SLEEPING car's last-known state justifies watching the meter
+    on its behalf.
+
+    The loop runs only when vehicle_data returns a view, and vehicle_data
+    returns nothing for a sleeping car. That made the state machine's `wake`
+    action unreachable: a tick needed a view, a view needed the car awake, and
+    the car would not wake itself for sunshine. Observed 2026-07-28 -- the car
+    sat plugged in at 38% against a 91% limit from 06:55 through the whole
+    morning while the controller logged 66 asleep ticks and never looked at
+    the meter once.
+
+    The fix is to let the loop reason from the stored snapshot, which is only
+    defensible while that snapshot still implies something to gain. Every
+    clause below is a reason to spend $0.02 on a wake:
+
+      plugged   -- waking an unplugged car buys nothing and cannot charge
+      headroom  -- at or within a point of its limit there is nowhere to put
+                   the energy
+      fresh     -- an old snapshot may describe a car that has since been
+                   driven away; acting on it would wake a car somewhere else
+
+    Missing data is never an invitation to command a car, so every unknown
+    returns False rather than being treated as permissive.
+    """
+    if view is None or age_s is None or age_s > max_age_s:
+        return False
+    if view.get("charging_state") in (None, "Disconnected"):
+        return False
+    soc, limit = view.get("soc"), view.get("limit")
+    if soc is None or limit is None:
+        return False
+    return soc < limit - 1
+
+
 def backoff_seconds(consecutive_429s: int, period_s: int,
                     retry_after: float | None, cap_s: int = 1800) -> int:
     """How long to wait after a 429 before the next request.
