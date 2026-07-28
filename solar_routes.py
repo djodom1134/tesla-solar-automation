@@ -269,6 +269,9 @@ CONFIG_BOUNDS = {
     # instead of 0.12 is rejected rather than silently reported as a
     # hundred-fold cost.
     "import_rate": (0, 5), "export_rate": (0, 5),
+    # Floor of 60 s: the grid meter itself only refreshes that often,
+    # so anything faster re-reads one value at double the billing.
+    "watch_s": (60, 3600),
 }
 
 # Fields carrying real values rather than counts. int() would silently

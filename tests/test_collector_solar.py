@@ -2148,3 +2148,96 @@ async def test_an_awake_car_starts_on_the_first_qualifying_tick_and_is_not_woken
         f"the car was already online -- waking it costs $0.02 for nothing: "
         f"{client.commands}")
     store_.close()
+
+
+class _WatchLoopClient:
+    """A sleeping car and a site meter, recording which KIND of request each
+    tick makes. The distinction is the whole point: a site read is one
+    billable request, a vehicle state check is another, and a watch tick
+    should make only the former."""
+
+    def __init__(self, calls, grid_w=-5600.0):
+        self.calls = calls
+        self.grid_w = grid_w
+
+    async def resolve_vin(self):
+        return "VIN1"
+
+    async def energy_sites(self):
+        return [{"energy_site_id": 1}]
+
+    async def vehicle(self, vin):
+        self.calls.append("vehicle")
+        return {"state": "asleep"}
+
+    async def vehicle_data(self, vin, *a, **k):
+        self.calls.append("vehicle_data")
+        raise AssertionError("a sleeping car must never be paid for")
+
+    async def _get(self, path, ttl=0):
+        self.calls.append("site")
+        return {"grid_power": self.grid_w, "solar_power": 7000.0}
+
+    async def command(self, vin, name, params):
+        self.calls.append(f"cmd:{name}")
+        return 200, {"response": {"result": True}}
+
+    async def wake_up(self, vin):
+        self.calls.append("wake")
+        return {"state": "online"}
+
+    async def aclose(self):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_the_watch_polls_the_meter_without_touching_the_car(monkeypatch, tmp_path):
+    """A sleeping, plugged-in, hungry car is watched via the SITE meter alone.
+
+    Only the meter can say whether there is anything worth waking for, and it
+    is a site request -- the vehicle need not be disturbed at all until the
+    surplus actually crosses. Halving the per-tick cost is what makes a tight
+    cadence affordable: at one request per tick a 300 s watch costs less than
+    the 1800 s two-request poll it replaces, while responding 6x sooner.
+    """
+    calls: list[str] = []
+    db_path = tmp_path / "car.db"
+
+    seed = Store(db_path)
+    solar.save_config(seed._db, enabled=1, watch_s=300, restart_hold_s=99999)
+    home.save(seed._db, 40.0, -105.0, 100)
+    solar.save_state(seed._db, "VIN1", state="stopped", hold_s=0)
+    seed.record({"charging_state": "Stopped", "amps_actual": 0, "charging": 0,
+                 "charge_amps": 48, "amps_max": 48, "volts": 240,
+                 "soc": 38, "limit": 91, "lat": 40.0, "lon": -105.0,
+                 "fast_charger_present": False, "fast_charger": None,
+                 "vin": "VIN1", "sampled_at": int(time.time())}, at_home=True)
+    seed.close()
+
+    monkeypatch.setattr(collector.settings, "db_file", db_path)
+    monkeypatch.setattr(collector, "TeslaClient",
+                        lambda settings: _WatchLoopClient(calls))
+
+    slept: list[int] = []
+
+    async def fake_sleep(seconds):
+        slept.append(seconds)
+        if len(slept) >= 4:
+            raise StopTest()
+    monkeypatch.setattr(collector.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(StopTest):
+        await collector.run()
+
+    # The bootstrap tick still checks state once; every watch tick after it
+    # must read the meter and nothing else.
+    assert calls.count("site") >= 3, f"the meter must be polled each tick: {calls}"
+    assert calls.count("vehicle") <= 1, (
+        f"a watch tick must not pay for a vehicle state check: {calls}")
+    assert "vehicle_data" not in calls
+
+    # And it must do so at the WATCH cadence, not the 1800 s asleep poll.
+    assert slept[-1] == 300, (
+        f"watch ticks must use watch_s, got {slept}")
+    store_ = Store(db_path)
+    store_.close()

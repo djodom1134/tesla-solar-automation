@@ -733,8 +733,30 @@ async def run(once: bool = False) -> int:
             st = solar.load_state(store._db, vin)
             solar_wanted = bool(conf["enabled"]) or bool(st["dirty"])
 
+            # METER-ONLY WATCH. A plugged-in, hungry car that is asleep
+            # needs no vehicle request at all: only the SITE meter can say
+            # whether there is anything worth waking for. Skipping the state
+            # check halves the cost of a watch tick, which is what makes a
+            # tight cadence affordable -- and the car is touched exactly once,
+            # when the surplus actually crosses.
+            #
+            # Gated on the machine being idle or stopped, matching
+            # solar_tick's own guard: once engaged we need a real view, and
+            # the wake we just issued will supply one on the next pass.
+            watching = False
+            if (car_state != "online" and solar_wanted and site_id is not None
+                    and st["state"] in ("idle", "stopped")):
+                snap = store.snapshot(vin)
+                watching = solar.sleeping_candidate(
+                    snap["view"] if snap else None,
+                    (time.time() - snap["ts"]) if snap else None,
+                    SNAPSHOT_MAX_AGE_S)
+
             try:
-                if engaged and view is not None:
+                if watching:
+                    # No vehicle call at all this tick.
+                    view, ticks_since_view = None, 0
+                elif engaged and view is not None:
                     # Awake by definition. Skip the state check, and only pay
                     # for vehicle_data when this tick actually needs it.
                     if should_refresh_view(ticks_since_view,
@@ -766,7 +788,10 @@ async def run(once: bool = False) -> int:
 
             wrote_last_tick = False
             backoff_s = 0
-            if view is not None and solar_wanted:
+            # `watching` carries no view by design -- solar_tick reads the
+            # snapshot itself. Gating solely on `view is not None` here is
+            # what kept the watch from ever running.
+            if (view is not None or watching) and solar_wanted:
                 if not recovery_done:
                     db = store._db
                     recovery_done = await recover(
@@ -804,7 +829,14 @@ async def run(once: bool = False) -> int:
             if once:
                 return 0
             await asyncio.sleep(
-                backoff_s or next_interval(car_state, view, settings, engaged))
+                backoff_s
+                # `watching` wins outright. It is only ever true for an
+                # unreadable car with the machine idle or stopped, and
+                # "stopped" is itself in ENGAGED_STATES -- so testing
+                # `not engaged` here silently fell through to the 1800 s
+                # asleep poll and the watch never ran at its own cadence.
+                or (conf["watch_s"] if watching
+                    else next_interval(car_state, view, settings, engaged)))
     finally:
         await client.aclose()
         store.close()

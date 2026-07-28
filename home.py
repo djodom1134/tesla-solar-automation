@@ -65,9 +65,13 @@ def distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return 2 * EARTH_RADIUS_M * math.asin(math.sqrt(a))
 
 
-def classify(view: dict, cfg: HomeConfig | None) -> str:
+def classify(view: dict | None, cfg: HomeConfig | None) -> str:
     """"home" | "away" | "unknown". Never a boolean -- see the module docstring."""
-    if cfg is None:
+    if cfg is None or view is None:
+        # No view at all means a car we could not read this tick -- a sleeping
+        # one, most often. "unknown" is the honest answer and the safe one: it
+        # freezes the controller rather than letting a missing reading be
+        # mistaken for a car that has left.
         return "unknown"
     # Coordinates first, deliberately: "we cannot tell" outranks every other
     # signal, because unknown freezes the controller while away makes it act.
