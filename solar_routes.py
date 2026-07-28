@@ -254,7 +254,10 @@ async def put_home(body: dict[str, Any] = Body(...)) -> dict[str, bool]:
 CONFIG_BOUNDS = {
     "enabled": (0, 1), "period_s": (60, 900), "margin_w": (0, 2000),
     "deadband_w": (50, 2000), "ramp_a": (1, 48), "min_a": (5, 32),
-    "grace_s": (0, 3600), "restart_hold_s": (60, 3600),
+    # restart_hold_s may be 0: with the wake skipped for an online
+    # car, an awake restart costs one $0.001 command, and making it
+    # wait discards surplus to insure against a cost not incurred.
+    "grace_s": (0, 3600), "restart_hold_s": (0, 3600),
     "start_hold_s": (0, 3600), "raise_hold_s": (0, 7200),
     "soc_ceiling": (50, 100), "raise_limit": (0, 1),
     "daily_request_cap": (0, 20000), "view_refresh_ticks": (1, 60),

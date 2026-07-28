@@ -225,6 +225,7 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
     # solar.sleeping_candidate. The sustained-surplus hold then applies
     # unchanged, so a wake is still earned over several ticks rather than
     # bought on one hopeful reading.
+    from_snapshot = False
     if view is None:
         if st["state"] not in ("idle", "stopped"):
             return st["state"], False
@@ -234,6 +235,7 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
         if not solar.sleeping_candidate(shadow, age_s, SNAPSHOT_MAX_AGE_S):
             return st["state"], False
         view = shadow
+        from_snapshot = True
 
     home_cfg = home.load(db)
     location = home.classify(view, home_cfg)
@@ -363,6 +365,16 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
             _, commanded = await _restore(client, db, vin, st, view)
             restored = restored or commanded
         elif action == "wake":
+            # Only a car we could not read is actually asleep. advance()
+            # emits `wake` on every stopped -> charging transition because it
+            # is pure and cannot know, so the decision lands here.
+            #
+            # This matters more now that restart_hold_s may be 0: a wake is
+            # the most expensive request this system can make ($0.02, against
+            # $0.001 for a command), and spending one on a car we just read
+            # live buys precisely nothing.
+            if not from_snapshot:
+                continue
             # wake_up is a dedicated REST endpoint, NOT a signed command --
             # routing it through the proxy would 400. tesla.py:386.
             try:

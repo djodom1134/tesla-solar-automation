@@ -345,7 +345,12 @@ async def test_wake_failure_resets_the_hold_so_the_next_tick_does_not_retry(tmp_
     """I7: without persisting a reset hold, the machine stays 'stopped' with
     hold_s already at restart_hold_s, and advance() re-emits ["wake", ...] on
     the very next tick -- at $0.02/wake and a 120s period, ~$0.60/hour until
-    the daily cap intervenes ~13h later."""
+    the daily cap intervenes ~13h later.
+
+    Driven through the SLEEPING path (no live view, snapshot only), because
+    that is now the only way a wake is issued at all: an online car skips it,
+    since waking a car we just read live costs $0.02 for nothing.
+    """
     store_ = Store(tmp_path / "car.db")
     db = store_._db
     solar.save_config(db, enabled=1)
@@ -354,12 +359,12 @@ async def test_wake_failure_resets_the_hold_so_the_next_tick_does_not_retry(tmp_
 
     client = _WakeFailsClient()
     cfg = SimpleNamespace(timezone="America/Denver", proxy_url="https://localhost:4443")
-    view = {
-        "charging_state": "Stopped", "amps_actual": None, "amps_max": 48,
-        "volts": None, "charge_amps": 5, "soc": 50, "limit": 80,
-        "lat": 40.0, "lon": -105.0,
-        "fast_charger_present": False, "fast_charger": None,
-    }
+    store_.record({"charging_state": "Stopped", "amps_actual": 0, "charging": 0,
+                   "amps_max": 48, "volts": 240, "charge_amps": 5,
+                   "soc": 50, "limit": 80, "lat": 40.0, "lon": -105.0,
+                   "fast_charger_present": False, "fast_charger": None,
+                   "vin": "VIN1", "sampled_at": int(time.time())}, at_home=True)
+    view = None
 
     state, wrote = await collector.solar_tick(client, store_, "VIN1", view, cfg, site_id=1)
     assert state == "stopped"
@@ -1880,6 +1885,10 @@ class _SolarSiteClient:
         return 200, {"response": {"result": True}}
 
     async def wake_up(self, vin):
+        # Recorded, not silently swallowed: a wake is the most expensive
+        # request this system can make ($0.02 vs $0.001 for a command), so a
+        # test that cannot see one cannot police it.
+        self.commands.append(("wake_up", {}))
         return {"state": "online"}
 
     def view(self) -> dict:
@@ -2100,4 +2109,42 @@ async def test_a_sleeping_car_is_left_alone_when_there_is_nothing_to_gain(tmp_pa
 
     assert client.commands == [], (
         f"a full car must never be woken for sunshine: {client.commands}")
+    store_.close()
+
+
+@pytest.mark.asyncio
+async def test_an_awake_car_starts_on_the_first_qualifying_tick_and_is_not_woken(tmp_path):
+    """Owner's call: stopped -> charging should not wait.
+
+    The restart hold existed to avoid spending a $0.02 wake on a surplus that
+    might not last. But it charged that delay on EVERY restart, including the
+    common case where the car is already online and starting costs a $0.001
+    command. Eight minutes of surplus was being discarded to insure against a
+    cost that was not being incurred.
+
+    Two changes, together: restart_hold_s may now be 0, and `wake` is skipped
+    when the car is already online. A sleeping car still pays the hold, since
+    that is the case the hold was actually protecting.
+    """
+    store_ = Store(tmp_path / "car.db")
+    db = store_._db
+    solar.save_config(db, enabled=1, restart_hold_s=0)
+    home.save(db, 40.0, -105.0, 100)
+    solar.save_state(db, "VIN1", state="stopped", hold_s=0)
+
+    client = _SolarSiteClient(house_w=1400.0, solar_w=7000.0)   # 5.6 kW spare
+    cfg = SimpleNamespace(timezone="America/Denver", proxy_url="https://localhost:4443")
+
+    state, _ = await collector.solar_tick(client, store_, "VIN1", client.view(),
+                                          cfg, site_id=1)
+
+    assert state == "charging", (
+        "an awake car with real surplus must start on the first qualifying "
+        "tick, not eight minutes later")
+    starts = [c for c in client.commands if c[0] == "charge_start"]
+    assert starts, f"and must actually be started: {client.commands}"
+    wakes = [c for c in client.commands if c[0] == "wake_up"]
+    assert wakes == [], (
+        f"the car was already online -- waking it costs $0.02 for nothing: "
+        f"{client.commands}")
     store_.close()
