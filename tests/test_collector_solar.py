@@ -2445,3 +2445,80 @@ async def test_the_watch_stands_down_after_dark_and_resumes_at_dawn(
 
     assert slept[-1] == 300, (
         f"the watch MUST resume once the sun is back, got {slept}")
+
+
+class _AlreadyChargingClient(_SolarSiteClient):
+    """charge_start refused with reason `is_charging` -- the live 2026-07-29
+    failure. The car was ALREADY charging, which is success for our purposes,
+    not failure."""
+
+    async def command(self, vin, name, params):
+        self.commands.append((name, dict(params)))
+        if name == "charge_start":
+            return 200, {"response": {"result": False, "reason": "is_charging"}}
+        if name == "set_charging_amps":
+            self.amps = params["charging_amps"]
+        return 200, {"response": {"result": True}}
+
+
+@pytest.mark.asyncio
+async def test_charge_start_refused_because_it_is_already_charging_is_not_a_failure(
+        tmp_path, monkeypatch):
+    """Observed live 2026-07-29 10:11, and it cost 23 minutes of sunshine.
+
+    The rollback added for a refused charge_start treats every refusal as
+    "the car did not start". But `is_charging` means the opposite: it is
+    already running, and the only thing left to do is take control of it.
+    Rolling back abandoned a live charge pinned at the 5 A floor while
+    2.4 kW was exporting, and -- because "stopped" is not "charging" -- the
+    controller then had no reason to look at it again.
+    """
+    store_ = Store(tmp_path / "car.db")
+    db = store_._db
+    solar.save_config(db, enabled=1, restart_hold_s=0)
+    home.save(db, 40.0, -105.0, 100)
+    solar.save_state(db, "VIN1", state="stopped", hold_s=0)
+
+    client = _AlreadyChargingClient(house_w=2470.0, solar_w=4890.0)
+    client.charging = True          # the car really is charging, at the floor
+    client.amps = 5
+    cfg = SimpleNamespace(timezone="America/Denver", proxy_url="https://localhost:4443")
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+
+    state, _ = await collector.solar_tick(client, store_, "VIN1", client.view(),
+                                          cfg, site_id=1)
+
+    assert state == "charging", (
+        "a car that refuses charge_start BECAUSE it is charging is charging -- "
+        f"rolling back to stopped abandons it at the floor: {client.commands}")
+    writes = [c[1]["charging_amps"] for c in client.commands
+              if c[0] == "set_charging_amps"]
+    assert writes, f"and it must be servoed up to the surplus: {client.commands}"
+    assert writes[-1] > 5, (
+        f"2.4 kW of surplus should lift it well off the 5 A floor, got {writes}")
+
+
+@pytest.mark.asyncio
+async def test_the_dark_backoff_cannot_blind_itself_to_dawn(tmp_path, monkeypatch):
+    """The deadlock the stand-down created, seen live on 2026-07-29.
+
+    solar_ticks only gets a row when solar_tick RUNS. If a tick returns early
+    without logging -- as the charge_start rollback did -- the newest rows
+    stay yesterday's zeros, is_dark keeps reading them, and the loop holds at
+    1800 s straight through a sunny morning. Seeing dawn requires a tick, and
+    the back-off had suppressed the tick.
+
+    So darkness must be judged on FRESH readings only. Stale ones mean "we do
+    not know", which fails open, exactly like having no history at all.
+    """
+    now = int(time.time())
+    # Three genuinely dark readings, but from last night.
+    stale = [{"ts": now - 11 * 3600, "solar_w": 0.0}] * 3
+    assert not solar.is_dark_at(stale, now), (
+        "readings 11 hours old cannot prove it is dark NOW -- that is how the "
+        "loop slept through a sunny morning")
+
+    fresh = [{"ts": now - 300, "solar_w": 0.0},
+             {"ts": now - 600, "solar_w": 0.0},
+             {"ts": now - 900, "solar_w": 0.0}]
+    assert solar.is_dark_at(fresh, now), "recent dark readings still count"

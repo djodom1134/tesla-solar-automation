@@ -100,6 +100,18 @@ async def poll_once(client: TeslaClient, store: Store, vin: str, cfg):
 # that a car driven away yesterday never is.
 SNAPSHOT_MAX_AGE_S = 6 * 3600
 
+# Refusals that mean "already in the state you asked for", keyed by the
+# command they are benign FOR. The pairing is the point: `not_charging` from
+# charge_stop means the car is stopped, which is what we wanted -- but the
+# same string from set_charging_amps means the write did NOT happen, and
+# calling that success would let the controller integrate against an amps
+# value the car never adopted. That is the invariant _command exists to hold,
+# and an earlier draft of this set broke it by listing reasons globally.
+ALREADY_DONE_REASONS = {
+    "charge_start": {"is_charging"},
+    "charge_stop": {"not_charging"},
+}
+
 ENGAGED_STATES = {"charging", "grace", "stopped"}
 
 
@@ -121,7 +133,18 @@ async def _command(client: TeslaClient, vin: str, name: str, **params) -> bool:
         return False
     result = (body or {}).get("response") or {}
     if result.get("result") is False:
-        _log(f"command {name} refused: {result.get('reason')}")
+        reason = result.get("reason")
+        # Some refusals mean "already in the state you asked for", which is
+        # success for every purpose this controller has. Treating them as
+        # failure is worse than cosmetic: the charge_start rollback then
+        # abandons a live charge. Observed 2026-07-29 -- the car was charging
+        # at its 5 A floor, charge_start came back `is_charging`, and the
+        # controller rolled back to "stopped" and left it there through 2.4 kW
+        # of export.
+        if reason in ALREADY_DONE_REASONS.get(name, ()):
+            _log(f"command {name}: already {reason}; treating as done")
+            return True
+        _log(f"command {name} refused: {reason}")
         return False
     return True
 
@@ -874,8 +897,9 @@ async def run(once: bool = False) -> int:
             # the sun was up at 1 a.m. Falls back to the ordinary asleep/idle
             # cadence, which still notices dawn within half an hour, well
             # before there is 1.2 kW of surplus to act on.
-            if waiting_for_surplus and solar.is_dark(
-                    solar.recent_solar_w(store._db, vin, solar.DARK_TICKS)):
+            if waiting_for_surplus and solar.is_dark_at(
+                    solar.recent_solar(store._db, vin, solar.DARK_TICKS),
+                    time.time()):
                 waiting_for_surplus = False
 
             if once:

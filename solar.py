@@ -804,40 +804,72 @@ DARK_W = 150.0
 DARK_TICKS = 3
 
 
-def is_dark(recent_solar_w: list[float]) -> bool:
-    """True when the array has been producing essentially nothing for a while.
+# How old a reading may be and still say anything about NOW. Two hours is
+# several stand-down intervals, so a healthy loop always has fresher data,
+# while last night's zeros can never vouch for this morning.
+DARK_MAX_AGE_S = 2 * 3600
+
+
+def is_dark_at(recent: list[dict], now_ts: float) -> bool:
+    """True when the array has recently been producing essentially nothing.
 
     Used to stand the meter watch down overnight. Derived from the site's own
     production rather than a clock or a sunrise table: no new dependency, no
-    timezone arithmetic, and it is automatically right in December, during an
+    timezone arithmetic, and automatically right in December, during an
     eclipse, and under a foot of snow.
 
-    Requires several consecutive dark readings so a single missing or zero
-    sample at dusk cannot park the watch for the night. Fails OPEN -- with
-    too little history to be sure, keep watching, because the cost of an
-    unnecessary tick is $0.002 and the cost of sleeping through a sunny
-    morning is the whole feature.
+    FRESHNESS IS THE LOAD-BEARING PART, and its absence caused a real
+    deadlock on 2026-07-29. solar_ticks only gains a row when a tick actually
+    runs, so any tick that returns early without logging leaves yesterday's
+    zeros as the newest rows. The back-off then read those zeros, held the
+    loop at 1800 s, and slept straight through a sunny morning -- seeing dawn
+    required a tick, and the back-off had suppressed the tick. A stale
+    reading must therefore mean "we do not know", never "it is dark".
+
+    Requires several consecutive dark readings, so one missing or zero sample
+    at dusk cannot park the watch for the night. Fails OPEN throughout: with
+    too little history, or stale history, keep watching -- an unnecessary
+    tick costs $0.002 and sleeping through a sunny morning costs the feature.
     """
+    if len(recent) < DARK_TICKS:
+        return False
+    for row in recent[:DARK_TICKS]:
+        watts, ts = row.get("solar_w"), row.get("ts")
+        if watts is None or ts is None:
+            return False
+        if now_ts - ts > DARK_MAX_AGE_S:
+            return False
+        if watts > DARK_W:
+            return False
+    return True
+
+
+def is_dark(recent_solar_w: list[float]) -> bool:
+    """Freshness-free variant, kept for the pure unit tests. Prefer
+    is_dark_at, which is the one the collector uses -- a reading with no
+    timestamp cannot be checked for staleness, and staleness is what made
+    this deadlock."""
     if len(recent_solar_w) < DARK_TICKS:
         return False
     return all(w is not None and w <= DARK_W
                for w in recent_solar_w[:DARK_TICKS])
 
 
-def recent_solar_w(db: sqlite3.Connection, vin: str, limit: int) -> list[float]:
-    """The last `limit` LOGGED solar_w readings for vin, newest first.
+def recent_solar(db: sqlite3.Connection, vin: str, limit: int) -> list[dict]:
+    """The last `limit` LOGGED (ts, solar_w) readings for vin, newest first.
 
-    Feeds is_dark(). Same shape and reasoning as recent_grid_w below: the
-    tick log already records this every tick, so the history costs nothing
-    extra to read.
+    Feeds is_dark_at(). The TIMESTAMP is not decoration: solar_ticks only
+    gains a row when a tick runs, so without it last night's zeros look
+    exactly like this minute's and the watch can stand itself down through a
+    sunny morning -- which it did, on 2026-07-29.
     """
     rows = db.execute(
-        """SELECT solar_w FROM solar_ticks
+        """SELECT ts, solar_w FROM solar_ticks
            WHERE vin = ? AND solar_w IS NOT NULL
            ORDER BY ts DESC LIMIT ?""",
         (vin, limit),
     ).fetchall()
-    return [row["solar_w"] for row in rows]
+    return [{"ts": row["ts"], "solar_w": row["solar_w"]} for row in rows]
 
 
 def recent_grid_w(db: sqlite3.Connection, vin: str, limit: int) -> list[float]:
