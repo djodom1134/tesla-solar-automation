@@ -141,7 +141,13 @@ async def _command(client: TeslaClient, vin: str, name: str, **params) -> bool:
         # at its 5 A floor, charge_start came back `is_charging`, and the
         # controller rolled back to "stopped" and left it there through 2.4 kW
         # of export.
-        if reason in ALREADY_DONE_REASONS.get(name, ()):
+        # Matched as a SUBSTRING: the signing proxy wraps the car's own
+        # reason in prose -- the live string is
+        # "car could not execute command: is_charging", not "is_charging" --
+        # so an equality test silently never fires. That is exactly how the
+        # first attempt at this fix deployed and changed nothing.
+        text = str(reason or "")
+        if any(r in text for r in ALREADY_DONE_REASONS.get(name, ())):
             _log(f"command {name}: already {reason}; treating as done")
             return True
         _log(f"command {name} refused: {reason}")

@@ -2522,3 +2522,36 @@ async def test_the_dark_backoff_cannot_blind_itself_to_dawn(tmp_path, monkeypatc
              {"ts": now - 600, "solar_w": 0.0},
              {"ts": now - 900, "solar_w": 0.0}]
     assert solar.is_dark_at(fresh, now), "recent dark readings still count"
+
+
+@pytest.mark.asyncio
+async def test_already_charging_is_recognised_through_the_proxys_prose():
+    """The live string, verbatim from collector.log on 2026-07-29:
+
+        car could not execute command: is_charging
+
+    The signing proxy wraps the car's own reason in a sentence, so an
+    equality test against "is_charging" never fires -- which is how the first
+    attempt at this fix deployed, changed nothing, and left the car pinned at
+    5 A for another half hour. The suite passed both before and after that
+    attempt, because nothing in it used the real string.
+    """
+    class _Wrapped:
+        async def command(self, vin, name, params):
+            return 200, {"response": {
+                "result": False,
+                "reason": "car could not execute command: is_charging"}}
+
+    assert await collector._command(_Wrapped(), "VIN1", "charge_start") is True
+
+    # And the pairing still holds through the prose: the same wrapped shape
+    # from set_charging_amps is a genuine failure, because the write did not
+    # happen and integrating against it would corrupt the control loop.
+    class _WrappedAmps:
+        async def command(self, vin, name, params):
+            return 200, {"response": {
+                "result": False,
+                "reason": "car could not execute command: is_charging"}}
+
+    assert await collector._command(
+        _WrappedAmps(), "VIN1", "set_charging_amps", charging_amps=15) is False
