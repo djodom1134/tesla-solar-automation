@@ -868,6 +868,16 @@ async def run(once: bool = False) -> int:
                      or solar.load_state(store._db, vin)["state"]
                      in ("idle", "stopped")))
 
+            # Stand the watch down after dark. Waiting for surplus at 300 s
+            # all night spent ~33 ticks a night on this site -- roughly
+            # $1.98/month, a fifth of the whole API credit -- asking whether
+            # the sun was up at 1 a.m. Falls back to the ordinary asleep/idle
+            # cadence, which still notices dawn within half an hour, well
+            # before there is 1.2 kW of surplus to act on.
+            if waiting_for_surplus and solar.is_dark(
+                    solar.recent_solar_w(store._db, vin, solar.DARK_TICKS)):
+                waiting_for_surplus = False
+
             if once:
                 return 0
             await asyncio.sleep(

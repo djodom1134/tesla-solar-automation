@@ -792,6 +792,54 @@ def may_restore(dirty: int, location: str, online: bool, proxy_up: bool) -> bool
     return bool(dirty) and location == "home" and online and proxy_up
 
 
+# A site that is producing this little is producing nothing worth waking a
+# car for: the car's own floor is min_a * volts, ~1,200 W. Set well below
+# that, so the back-off engages only in genuine darkness -- deep dusk, or an
+# array under snow -- and never during a merely cloudy afternoon that the
+# controller should still be watching.
+DARK_W = 150.0
+
+# Consecutive dark readings before standing down, so one missing or zero
+# sample at dusk cannot park the watch for the night.
+DARK_TICKS = 3
+
+
+def is_dark(recent_solar_w: list[float]) -> bool:
+    """True when the array has been producing essentially nothing for a while.
+
+    Used to stand the meter watch down overnight. Derived from the site's own
+    production rather than a clock or a sunrise table: no new dependency, no
+    timezone arithmetic, and it is automatically right in December, during an
+    eclipse, and under a foot of snow.
+
+    Requires several consecutive dark readings so a single missing or zero
+    sample at dusk cannot park the watch for the night. Fails OPEN -- with
+    too little history to be sure, keep watching, because the cost of an
+    unnecessary tick is $0.002 and the cost of sleeping through a sunny
+    morning is the whole feature.
+    """
+    if len(recent_solar_w) < DARK_TICKS:
+        return False
+    return all(w is not None and w <= DARK_W
+               for w in recent_solar_w[:DARK_TICKS])
+
+
+def recent_solar_w(db: sqlite3.Connection, vin: str, limit: int) -> list[float]:
+    """The last `limit` LOGGED solar_w readings for vin, newest first.
+
+    Feeds is_dark(). Same shape and reasoning as recent_grid_w below: the
+    tick log already records this every tick, so the history costs nothing
+    extra to read.
+    """
+    rows = db.execute(
+        """SELECT solar_w FROM solar_ticks
+           WHERE vin = ? AND solar_w IS NOT NULL
+           ORDER BY ts DESC LIMIT ?""",
+        (vin, limit),
+    ).fetchall()
+    return [row["solar_w"] for row in rows]
+
+
 def recent_grid_w(db: sqlite3.Connection, vin: str, limit: int) -> list[float]:
     """The last `limit` LOGGED grid_w readings for vin, newest first.
 

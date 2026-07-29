@@ -2366,3 +2366,82 @@ async def test_an_awake_idle_car_also_waits_at_the_watch_cadence(monkeypatch, tm
     assert slept[-1] == 300, (
         f"an awake car waiting for surplus must poll at watch_s, not "
         f"poll_idle: {slept}")
+
+
+@pytest.mark.asyncio
+async def test_the_watch_stands_down_after_dark_and_resumes_at_dawn(
+        monkeypatch, tmp_path):
+    """Measured on this site: 33 watch ticks a night, ~$1.98/month, spent
+    asking whether the sun was up at 1 a.m.
+
+    The pair matters more than either half. Backing off is easy; the risk is
+    backing off and never coming back, which would silently disable the whole
+    feature some morning and look exactly like it working.
+    """
+    calls: list[str] = []
+    db_path = tmp_path / "car.db"
+    seed = Store(db_path)
+    solar.save_config(seed._db, enabled=1, watch_s=300)
+    home.save(seed._db, 40.0, -105.0, 100)
+    solar.save_state(seed._db, "VIN1", state="stopped", hold_s=0)
+    seed.record({"charging_state": "Stopped", "amps_actual": 0, "charging": 0,
+                 "charge_amps": 48, "amps_max": 48, "volts": 240,
+                 "soc": 38, "limit": 91, "lat": 40.0, "lon": -105.0,
+                 "fast_charger_present": False, "fast_charger": None,
+                 "vin": "VIN1", "sampled_at": int(time.time())}, at_home=True)
+    seed.close()
+
+    night = _WatchLoopClient(calls, grid_w=1800.0)      # importing, no sun
+    night.solar_w = 0.0
+
+    async def dark_get(path, ttl=0):
+        calls.append("site")
+        return {"grid_power": 1800.0, "solar_power": 0.0}
+    night._get = dark_get
+
+    monkeypatch.setattr(collector.settings, "db_file", db_path)
+    monkeypatch.setattr(collector, "TeslaClient", lambda settings: night)
+
+    slept: list[int] = []
+
+    # solar_ticks is keyed (vin, ts) with INSERT OR REPLACE, so ticks that all
+    # land in the same wall-clock second overwrite each other and only ONE row
+    # ever exists -- is_dark would then never see DARK_TICKS readings and
+    # would fail open forever. Advance the clock so each tick logs its own row,
+    # exactly as it does in production at a 300 s cadence.
+    clock = [int(time.time())]
+    monkeypatch.setattr(collector.time, "time", lambda: clock[0])
+
+    async def fake_sleep(seconds):
+        slept.append(seconds)
+        clock[0] += max(int(seconds), 1)
+        if len(slept) >= 5:
+            raise StopTest()
+    monkeypatch.setattr(collector.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(StopTest):
+        await collector.run()
+
+    # The first ticks still run (no history yet -- is_dark fails open), then
+    # once DARK_TICKS dark readings are logged it drops off the watch cadence.
+    assert slept[-1] != 300, (
+        f"after dark the watch must stand down, got {slept}")
+    assert slept[-1] == collector.settings.poll_asleep, (
+        f"and fall back to the ordinary asleep cadence: {slept}")
+
+    # --- dawn: the same database, now with sun on the array ---------------
+    calls.clear()
+    day = _WatchLoopClient(calls, grid_w=-5600.0)
+
+    async def sunny_get(path, ttl=0):
+        calls.append("site")
+        return {"grid_power": -5600.0, "solar_power": 7000.0}
+    day._get = sunny_get
+    monkeypatch.setattr(collector, "TeslaClient", lambda settings: day)
+
+    slept.clear()
+    with pytest.raises(StopTest):
+        await collector.run()
+
+    assert slept[-1] == 300, (
+        f"the watch MUST resume once the sun is back, got {slept}")

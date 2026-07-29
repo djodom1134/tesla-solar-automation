@@ -250,3 +250,35 @@ def test_a_sleeping_car_is_worth_watching_only_when_it_could_actually_use_the_su
     assert not solar.sleeping_candidate({**fresh, "soc": None}, 600, 21600)
     assert not solar.sleeping_candidate({**fresh, "limit": None}, 600, 21600)
     assert not solar.sleeping_candidate(fresh, age_s=None, max_age_s=21600)
+
+
+def test_darkness_is_measured_from_the_array_not_a_clock():
+    """The watch polls the meter every 300 s. Left running overnight that
+    spent ~33 ticks a night on this site -- about $1.98/month, a fifth of the
+    owner's whole API credit -- asking whether the sun was up at 1 a.m.
+
+    Derived from the site's own production rather than a sunrise table: no
+    new dependency, no timezone arithmetic, and automatically right in
+    December, during an eclipse, and under snow.
+    """
+    assert solar.is_dark([0.0, 0.0, 0.0])
+    assert solar.is_dark([120.0, 40.0, 0.0]), "well below the car's 1.2 kW floor"
+
+    # A cloudy afternoon is NOT darkness -- the controller must keep watching.
+    assert not solar.is_dark([2400.0, 180.0, 90.0])
+    assert not solar.is_dark([0.0, 0.0, 300.0])
+
+
+def test_darkness_needs_several_consecutive_readings():
+    """One zero at dusk, or a single missing sample, must not park the watch
+    for the night."""
+    assert not solar.is_dark([0.0])
+    assert not solar.is_dark([0.0, 0.0])
+    assert not solar.is_dark([0.0, 0.0, 4000.0])
+
+
+def test_too_little_history_keeps_watching():
+    """Fails OPEN. An unnecessary tick costs $0.002; sleeping through a sunny
+    morning costs the whole feature."""
+    assert not solar.is_dark([])
+    assert not solar.is_dark([None, None, None])
