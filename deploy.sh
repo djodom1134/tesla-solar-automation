@@ -43,17 +43,23 @@ rsync -az --delete \
   -e "$SSH" ./ "$USER@$HOST:$DEST/"
 
 say "2/4  secrets (0600) and keys (0700 dir)"
-$SSH "$USER@$HOST" "mkdir -p '$DEST/keys' '$DEST/data' && chmod 700 '$DEST/keys'"
+$SSH "$USER@$HOST" "mkdir -p '$DEST/keys' '$DEST/data' '$DEST/secrets' \
+  && chmod 700 '$DEST/keys' '$DEST/secrets'"
 for f in "${SECRETS[@]}"; do
   [ -f "$f" ] || { echo "  missing $f -- refusing to deploy a half-configured app"; exit 1; }
 done
-# .env sits at the project root; .tokens.json goes to the data volume, because
-# the app REWRITES it on every token refresh and a read-only mount would break
-# re-authentication some hours after a clean-looking deploy.
-scp -i "$KEY" -q .env "$USER@$HOST:$DEST/.env"
+# .env lands as secrets/app.env, deliberately NOT the project's own .env:
+# Compose auto-reads ./.env to interpolate its own file, so leaving real
+# secrets there feeds them to an interpolator that has no need for them and
+# mangles any value containing a `$`.
+#
+# .tokens.json goes to the data volume because the app REWRITES it on every
+# token refresh; a read-only mount would break re-authentication some hours
+# after a clean-looking deploy.
+scp -i "$KEY" -q .env "$USER@$HOST:$DEST/secrets/app.env"
 scp -i "$KEY" -q .tokens.json "$USER@$HOST:$DEST/data/.tokens.json"
 scp -i "$KEY" -q "${KEYFILES[@]}" "$USER@$HOST:$DEST/keys/"
-$SSH "$USER@$HOST" "chmod 600 '$DEST/.env' '$DEST/data/.tokens.json' '$DEST'/keys/*.pem"
+$SSH "$USER@$HOST" "chmod 600 '$DEST/secrets/app.env' '$DEST/data/.tokens.json' '$DEST'/keys/*.pem"
 
 say "3/4  database snapshot (SQLite backup API, safe on a live file)"
 python3 - "$DEST" <<'PY'

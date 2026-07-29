@@ -7,12 +7,34 @@
 # ---------------------------------------------------------------- proxy build
 FROM golang:1.23-bookworm AS proxy-build
 
-# Pinned to the exact pseudo-version already proven against this car, not
-# @latest: this binary signs vehicle commands, and a silent upgrade between a
-# working deploy and the next rebuild is not a surprise worth having.
-ARG VEHICLE_COMMAND_VERSION=v0.0.0-20260722231406-724d8c85e3c5
-RUN CGO_ENABLED=0 go install \
-    github.com/teslamotors/vehicle-command/cmd/tesla-http-proxy@${VEHICLE_COMMAND_VERSION}
+# Pinned to the exact commit already proven against this car, not @latest:
+# this binary signs vehicle commands, and a silent upgrade between a working
+# deploy and the next rebuild is not a surprise worth having. The commit is
+# the one encoded in the Mac binary's pseudo-version
+# v0.0.0-20260722231406-724d8c85e3c5.
+ARG VEHICLE_COMMAND_COMMIT=724d8c85e3c5
+# Cloned and built rather than `go install pkg@version`, which refuses this
+# module outright: vehicle-command's go.mod carries `replace` directives, and
+# go install rejects any module whose go.mod would be interpreted differently
+# as a dependency than as the main module.
+#
+# GOMAXPROCS/-p are pinned to BUILD_JOBS, and on this host that is not a
+# preference. servy is an i7-4790K that idles at 72-95 C against a 105 C
+# critical trip -- a cooling fault, not a load problem -- and an all-core Go
+# compile walked it into hardware thermal shutdown twice on 2026-07-29,
+# taking Home Assistant down with it. One compile job draws roughly an
+# eighth of the package power of eight. Raise this only on a host whose
+# cooling is known good.
+ARG BUILD_JOBS=1
+# Clone and dependency download are I/O-bound and cool; the compile is the
+# heat. Kept in separate layers so a thermally aborted attempt still caches
+# everything up to the compile, and each retry redoes only the hot part.
+RUN git clone https://github.com/teslamotors/vehicle-command.git /src \
+ && cd /src && git checkout ${VEHICLE_COMMAND_COMMIT}
+RUN cd /src && go mod download
+RUN cd /src \
+ && CGO_ENABLED=0 GOMAXPROCS=${BUILD_JOBS} \
+    go build -p ${BUILD_JOBS} -o /go/bin/tesla-http-proxy ./cmd/tesla-http-proxy
 
 # ------------------------------------------------------------------- runtime
 FROM python:3.13-slim-bookworm

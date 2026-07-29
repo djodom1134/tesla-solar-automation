@@ -4,7 +4,15 @@
 .env
 .env.*
 .tokens.json
-.tokens.json.lock
+# The flock sidecar is `.tokens.lock` -- with_suffix(".lock") REPLACES the
+# extension, it does not append. An earlier `.tokens.json.lock` matched
+# nothing and the file shipped.
+.tokens.lock
+# secrets/ holds app.env, the real .env under a name Compose will not
+# interpolate. It is a build-context directory like any other: absent from
+# this list, `COPY . .` bakes the Tesla client secret into a layer, which is
+# exactly what happened on the first successful build here.
+secrets/
 keys/
 
 # Live data. car.db belongs on a volume, not in the image -- baking it in
@@ -25,6 +33,5 @@ __pycache__/
 .pytest_cache/
 .superpowers/
 docs/
-tools/
 node_modules/
 .DS_Store

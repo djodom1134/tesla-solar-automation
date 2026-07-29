@@ -14,6 +14,14 @@
 # The alternative -- reissuing the certificate with a docker-internal SAN --
 # would mean regenerating TLS material for a working, car-paired proxy to buy
 # nothing but a tidier topology.
+#
+# THE SECRET ENV FILE IS secrets/app.env, NOT .env, and the name matters.
+# Compose automatically reads ./.env in the project directory to interpolate
+# ${VARS} in this file. Leaving the app's real secrets there hands them to
+# Compose's interpolator for no reason, and any `$` inside a value -- an API
+# key, a password -- is then treated as a variable reference: the first deploy
+# printed `WARNING: The "r6" variable is not set` from exactly that. Compose
+# never needs these values; only the container does.
 
 name: tesla
 
@@ -61,7 +69,7 @@ services:
     volumes:
       - ./data:/data
       - ./keys:/keys:ro
-      - ./.env:/app/.env:ro
+      - ./secrets/app.env:/app/.env:ro
     command: ["python", "app.py"]
     healthcheck:
       # urllib rather than curl: the slim image has no curl, and adding one
@@ -81,5 +89,5 @@ services:
     volumes:
       - ./data:/data
       - ./keys:/keys:ro
-      - ./.env:/app/.env:ro
+      - ./secrets/app.env:/app/.env:ro
     command: ["python", "collector.py"]
