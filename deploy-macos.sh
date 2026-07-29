@@ -148,6 +148,7 @@ mk() {  # label, program-args-xml
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>\$4</integer>
+  \${5:-}
 </dict></plist>
 PLIST
   plutil -lint "\$HOME/Library/LaunchAgents/\$1.plist" >/dev/null
@@ -165,8 +166,18 @@ mk "$LABEL_PREFIX-proxy" "\
 mk "$LABEL_PREFIX-collector" "\
 <string>$DEST/.venv/bin/python</string><string>$DEST/collector.py</string>" collector 60
 
+# HOST=0.0.0.0 lives HERE, not in .env, and that is deliberate: this script
+# copies .env from the source Mac on every run, so a HOST edited on the target
+# would be silently reverted by the next deploy. config.py loads dotenv with
+# override=False, so a launchd EnvironmentVariables entry wins over the file.
+#
+# 127.0.0.1 is right for a laptop and wrong for a server -- it left the
+# dashboard listening but unreachable from the LAN on the first cutover.
 mk "$LABEL_PREFIX-app" "\
-<string>$DEST/.venv/bin/python</string><string>$DEST/app.py</string>" app 30
+<string>$DEST/.venv/bin/python</string><string>$DEST/app.py</string>" app 30 "\
+<key>EnvironmentVariables</key><dict>\
+<key>HOST</key><string>0.0.0.0</string>\
+</dict>"
 EOF
 
 # Whether any of this survives a reboot unattended depends on auto-login:
@@ -177,6 +188,34 @@ if [ -n "$AL" ]; then echo "  auto-login as \"$AL\" -- agents WILL start after a
 else echo "  NO auto-login: LaunchAgents start with a user session, so after a"
      echo "  reboot nothing runs until someone logs in. Either enable auto-login,"
      echo "  or move these to /Library/LaunchDaemons (root, starts at boot)."; fi'
+
+# macOS 15+ gates OUTBOUND connections to LAN addresses behind a Local Network
+# privacy prompt, per responsible application. A launchd agent has no UI to
+# raise that prompt, so it is denied SILENTLY: the collector's Fleet API calls
+# work (internet, not local), loopback works, and only the LAN device fails.
+# On the first Mac mini deploy this presented as garage_url configured, the
+# device answering curl from a shell, and the app insisting reachable:false.
+say "local-network permission check"
+$SSH "$TARGET" "bash -s" <<'PROBE'
+G=$(cd ~/tesla_automation && ./.venv/bin/python -c "
+import sqlite3, solar
+c = sqlite3.connect('file:car.db?mode=ro', uri=True); c.row_factory = sqlite3.Row
+print(solar.load_config(c).get('garage_url') or '')" 2>/dev/null)
+if [ -z "$G" ]; then
+  echo "  no garage_url configured -- nothing on the LAN to reach, skipping"
+else
+  R=$(curl -s -m 8 http://127.0.0.1:8000/api/car/garage 2>/dev/null)
+  case "$R" in
+    *'"reachable":true'*) echo "  OK: the app can reach $G" ;;
+    *) echo "  BLOCKED: the app cannot reach $G, though the device is configured."
+       echo "  macOS gates LAN access per app and a launchd agent cannot prompt."
+       echo "  Fix on the target, in the GUI:"
+       echo "    System Settings > Privacy & Security > Local Network > enable Python"
+       echo "  Until then: solar charging works, garage auto-open and the"
+       echo "  scheduled close do NOT." ;;
+  esac
+fi
+PROBE
 
 cat <<EOF
 
