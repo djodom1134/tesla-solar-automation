@@ -111,3 +111,63 @@ async def test_meters_return_null_not_zero_when_the_car_is_unknown(tmp_path, mon
     assert body["car_solar_kwh"] is None, "null, never 0"
     assert body["car_total_kwh"] is None
     st.close()
+
+
+@pytest.mark.asyncio
+async def test_battery_out_is_pinned_at_zero_because_there_is_no_v2h(tmp_path, monkeypatch):
+    """The car is storage, but one-way storage.
+
+    HA computes home = solar + grid_in - grid_out + battery_out - battery_in.
+    Charging the car really is not house consumption, so battery_in belongs.
+    But this site has no vehicle-to-home: reporting driving energy as
+    battery_out would ADD it to home consumption and inflate the house load by
+    every mile driven -- energy that physically left the property.
+    """
+    st = Store(tmp_path / "car.db")
+    solar.save_config(st._db, enabled=1)
+    st.record({"vin": "VIN1", "soc": 60, "sampled_at": int(time.time()),
+               "charging_state": "Stopped", "amps_actual": 0, "charging": 0},
+              at_home=True)
+    solar.log_tick(st._db, "VIN1", ts=int(time.time()), state="charging",
+                   grid_w=-1000.0, solar_w=5000.0, car_w=4000.0, period_s=3600)
+    monkeypatch.setattr(ha_routes, "DEMO", False)
+    monkeypatch.setattr(ha_routes, "store", lambda: st)
+    monkeypatch.setattr(ha_routes.settings, "vin", "VIN1")
+
+    body = await ha_routes.ha_meters()
+    assert body["battery_in_kwh"] == body["car_total_kwh"], (
+        "everything charged into the car is energy stored, not consumed")
+    assert body["battery_out_kwh"] == 0.0, (
+        "no V2H -- the car never gives energy back to the house")
+    st.close()
+
+
+@pytest.mark.asyncio
+async def test_live_power_comes_from_the_tick_log_not_a_billed_call(tmp_path, monkeypatch):
+    """live_status is billed. The collector already pays for one every tick
+    and writes the result, so serving it again is free -- at the cost of
+    freshness, which the HA templates gate on rather than hiding."""
+    st = Store(tmp_path / "car.db")
+    solar.save_config(st._db, enabled=1)
+    solar.save_state(st._db, "VIN1", heartbeat_ts=int(time.time()),
+                     heartbeat_sleep_s=120)
+    st.record({"vin": "VIN1", "soc": 60, "sampled_at": int(time.time()),
+               "charging_state": "Charging", "amps_actual": 16, "charging": 1},
+              at_home=True)
+    solar.log_tick(st._db, "VIN1", ts=int(time.time()), state="charging",
+                   grid_w=-1500.0, solar_w=6000.0, car_w=3840.0, period_s=120)
+    monkeypatch.setattr(ha_routes, "DEMO", False)
+    monkeypatch.setattr(ha_routes, "store", lambda: st)
+    monkeypatch.setattr(ha_routes.settings, "vin", "VIN1")
+
+    body = await ha_routes.ha_state()
+    assert body["solar_w"] == 6000.0
+    assert body["grid_w"] == -1500.0
+    assert body["grid_export_w"] == 1500.0, "exporting splits out non-negative"
+    assert body["grid_import_w"] == 0.0
+    # house = site consumption minus the car: 6000 + (-1500) - 3840
+    assert body["house_w"] == pytest.approx(660.0)
+    # And the whole vehicle view rides along, so a new Tesla field needs a
+    # template rather than an endpoint change.
+    assert body["car"]["soc"] == 60
+    st.close()

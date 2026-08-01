@@ -96,8 +96,23 @@ async def ha_state() -> dict[str, Any]:
     view = (snap or {}).get("view") or {}
 
     last = db.execute(
-        "SELECT ts, surplus_w, amps_written, amps_before FROM solar_ticks"
-        " WHERE vin = ? ORDER BY ts DESC LIMIT 1", (vin,)).fetchone() if vin else None
+        "SELECT ts, surplus_w, amps_written, amps_before, solar_w, grid_w, car_w"
+        " FROM solar_ticks WHERE vin = ? ORDER BY ts DESC LIMIT 1",
+        (vin,)).fetchone() if vin else None
+
+    # LIVE POWER, from the tick log rather than a fresh live_status call.
+    # live_status is a billed request; the collector already pays for one
+    # every tick and writes the result here, so serving it again costs
+    # nothing. The price is freshness -- as recent as the last tick, which is
+    # 120 s while engaged and up to 1800 s after dark -- and the HA templates
+    # gate on exactly that rather than presenting a stale number as live.
+    solar_w = last["solar_w"] if last else None
+    grid_w = last["grid_w"] if last else None
+    car_w = last["car_w"] if last else None
+    # The house alone: everything the site drew minus what the car took.
+    # solar + grid is total site consumption (grid positive = import).
+    house_w = (solar_w + grid_w - (car_w or 0)
+               if solar_w is not None and grid_w is not None else None)
 
     # Three separate clocks, never conflated. Each gates a different set of
     # entities, because "the collector is alive", "the control loop ran
@@ -139,11 +154,29 @@ async def ha_state() -> dict[str, Any]:
         # time the car falls asleep in the garage.
         "location": home.classify(view, home.load(db)) if view else "unknown",
 
-        # Tunables HA may display and (later) write.
+        # Tunables HA may display and write.
         "margin_w": conf["margin_w"],
         "min_a": conf["min_a"],
         "soc_ceiling": conf["soc_ceiling"],
         "grace_budget_wh": conf["grace_budget_wh"],
+
+        # --- live power, all from the last tick (free) --------------------
+        "solar_w": solar_w,
+        # Signed, Tesla's own convention: positive is IMPORT.
+        "grid_w": grid_w,
+        # And split, because HA graphs a non-negative series far better than
+        # one that crosses zero.
+        "grid_import_w": max(0.0, grid_w) if grid_w is not None else None,
+        "grid_export_w": max(0.0, -grid_w) if grid_w is not None else None,
+        "car_w": car_w,
+        "house_w": house_w,
+
+        # --- everything else Tesla told us, verbatim ----------------------
+        # The whole derived view. It costs nothing extra (one snapshot read
+        # already happened) and means a new field needs no endpoint change --
+        # only a template. Nested dicts (doors, windows, tpms_bar, ...) come
+        # through intact.
+        "car": view,
     }
 
 
@@ -180,10 +213,33 @@ async def ha_meters() -> dict[str, Any]:
         "SELECT state, car_w, grid_w, period_s FROM solar_ticks WHERE vin = ?",
         (vin,))]
     solar_kwh, grid_kwh = green.charged_split(ticks)
+    total = solar_kwh + grid_kwh
+
     return {
         "schema": SCHEMA,
         "car_solar_kwh": round(solar_kwh, 3),
         "car_grid_kwh": round(grid_kwh, 3),
-        "car_total_kwh": round(solar_kwh + grid_kwh, 3),
+        "car_total_kwh": round(total, 3),
+
+        # --- the car AS STORAGE, for the Energy Dashboard battery slots ----
+        #
+        # HA computes:
+        #   home = solar + grid_import - grid_export + battery_out - battery_in
+        #
+        # battery_IN is genuinely right here. Energy charged into the car is
+        # not consumed by the house -- it is stored in something that then
+        # drives away -- so subtracting it makes "home consumption" mean the
+        # house WITHOUT the car, which is the more useful number.
+        #
+        # battery_OUT is permanently ZERO, and that is not a placeholder. This
+        # site has no vehicle-to-home: the car never returns energy to the
+        # house. Feeding driving energy here would ADD it to home consumption
+        # and inflate the house load by every mile driven -- energy that left
+        # the property entirely.
+        #
+        # A counter pinned at 0.0 is safe for total_increasing: it never
+        # decreases, so it can never trip the meter-reset rule.
+        "battery_in_kwh": round(total, 3),
+        "battery_out_kwh": 0.0,
         **site,
     }
