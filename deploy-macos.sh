@@ -30,11 +30,22 @@ say()  { printf '\n\033[1m%s\033[0m\n' "$*"; }
 fail() { printf '\n\033[31m%s\033[0m\n' "$*" >&2; exit 1; }
 
 # ------------------------------------------------------------------ 0. probe
+# SEED_DATA=1 forces live state to be replaced. It refuses while the target's
+# agents are running, because that is exactly the condition that corrupts.
+SEED_DATA="${SEED_DATA:-0}"
+
 say "0/6  probing $TARGET"
 read -r R_HOME R_ARCH R_OS <<<"$($SSH "$TARGET" 'echo "$HOME $(uname -m) $(sw_vers -productVersion)"')" \
   || fail "cannot reach $TARGET over ssh -- add your key with:
     ssh-copy-id -i ~/.ssh/id_ed25519 $TARGET"
 DEST="${DEST:-$R_HOME/tesla_automation}"
+if [ "$SEED_DATA" = 1 ]; then
+  RUNNING=$($SSH "$TARGET" "launchctl list 2>/dev/null | grep -c tenxcious || true")
+  [ "${RUNNING:-0}" = 0 ] || fail "SEED_DATA=1 would replace car.db and .tokens.json,
+but $RUNNING agent(s) are still running on $TARGET. Overwriting a live SQLite
+file corrupts it. Stop them first:
+    $SSH $TARGET 'for a in collector app proxy; do launchctl bootout gui/\$(id -u)/$LABEL_PREFIX-\$a; done'"
+fi
 echo "  home=$R_HOME arch=$R_ARCH macOS=$R_OS"
 echo "  dest=$DEST"
 
@@ -96,26 +107,50 @@ for f in .env .tokens.json keys/private-key.pem keys/tls-cert.pem keys/tls-key.p
   [ -f "$f" ] || fail "missing $f -- refusing to deploy a half-configured app"
 done
 scp $SSH_OPTS -q .env "$TARGET:$DEST/.env"
-scp $SSH_OPTS -q .tokens.json "$TARGET:$DEST/.tokens.json"
+# .tokens.json is LIVE STATE, not configuration. Tesla rotates the refresh
+# token on every use and invalidates the old one, so a running target holds
+# the only valid copy and this Mac's is already superseded. Overwriting it
+# destroyed authentication on 2026-08-01 and was only recovered because
+# TokenStore.save() keeps a .bak. SEED it when absent; never replace it.
+if [ "$SEED_DATA" != 1 ] && $SSH "$TARGET" "[ -s '$DEST/.tokens.json' ]"; then
+  echo "  tokens: target already has them -- NOT overwriting (live, rotating)"
+else
+  scp $SSH_OPTS -q .tokens.json "$TARGET:$DEST/.tokens.json"
+  echo "  tokens: seeded (target had none)"
+fi
 scp $SSH_OPTS -q keys/private-key.pem keys/public-key.pem \
                  keys/tls-cert.pem keys/tls-key.pem "$TARGET:$DEST/keys/"
-$SSH "$TARGET" "chmod 600 '$DEST/.env' '$DEST/.tokens.json' '$DEST'/keys/*-key.pem"
+$SSH "$TARGET" "chmod 600 '$DEST/.env' '$DEST'/keys/*-key.pem; chmod 600 '$DEST/.tokens.json' 2>/dev/null; true"
 
 # --------------------------------------------------------------- 4. database
-say "4/6  database snapshot"
-# NOT cp. car.db runs in WAL mode with a multi-megabyte -wal sidecar; copying
-# the main file alone yields a database missing its most recent transactions,
-# which here means missing charge history and a stale solar ledger. The backup
-# API takes a consistent snapshot of a database being actively written to.
-python3 - <<'PY'
+say "4/6  database"
+# car.db is LIVE STATE. Once the target is running, its copy is the ONLY
+# current one -- it holds the solar ledger, the tick history and the request
+# counter, all of which advance every tick.
+#
+# Worse, scp over a live SQLite file CORRUPTS it: three processes hold it open
+# in WAL mode, and replacing the main file leaves the -wal describing a
+# database that no longer exists. That happened on 2026-08-01 ("database disk
+# image is malformed"); it was recovered only via sqlite3 .recover salvaging
+# the WAL. SEED when absent; never replace a database that is being written.
+if [ "$SEED_DATA" != 1 ] && $SSH "$TARGET" "[ -s '$DEST/car.db' ]"; then
+  echo "  target already has car.db -- NOT overwriting (live, and scp over WAL corrupts)"
+  echo "  to migrate data deliberately: stop the target's agents, then"
+  echo "    SEED_DATA=1 $0"
+else
+  # NOT cp. WAL mode means the main file alone is missing recent transactions;
+  # the backup API takes a consistent snapshot of a database being written to.
+  python3 - <<'PYSNAP'
 import sqlite3, pathlib
 src = sqlite3.connect("file:car.db?mode=ro", uri=True)
 out = pathlib.Path("/tmp/car.db.snapshot"); out.unlink(missing_ok=True)
 dst = sqlite3.connect(out); src.backup(dst); dst.close(); src.close()
 print(f"  snapshot {out.stat().st_size:,} bytes")
-PY
-scp $SSH_OPTS -q /tmp/car.db.snapshot "$TARGET:$DEST/car.db"
-rm -f /tmp/car.db.snapshot
+PYSNAP
+  scp $SSH_OPTS -q /tmp/car.db.snapshot "$TARGET:$DEST/car.db"
+  rm -f /tmp/car.db.snapshot
+  echo "  seeded (target had none)"
+fi
 
 # ------------------------------------------------------------------- 5. venv
 say "5/6  venv + dependencies"
