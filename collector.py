@@ -777,15 +777,10 @@ async def ingest_site_meters(client, db, site_id, cfg, now: float) -> int:
     tz = ZoneInfo(cfg.timezone)
     today = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0)
 
+    yesterday = int((today - timedelta(days=1)).timestamp())
+    for ch in meters.CHANNELS:
+        meters.seed(db, ch, yesterday)
     last = meters.last_closed_bucket(db, "site_import")
-    if last is None:
-        # First run: start the counters at zero from yesterday. Backfilling
-        # would not give HA any history anyway -- a total_increasing sensor's
-        # first sample only establishes a baseline, it is never counted.
-        for ch in meters.CHANNELS:
-            meters.advance(db, ch, 0.0,
-                           closed_bucket=int((today - timedelta(days=1)).timestamp()))
-        return 0
 
     ingested = 0
     day = datetime.fromtimestamp(last, tz) + timedelta(days=1)
@@ -802,15 +797,29 @@ async def ingest_site_meters(client, db, site_id, cfg, now: float) -> int:
         rows = [energy.derive(r) for r in (hist or {}).get("time_series") or []]
         total = energy.summarize(rows)
         stamp = int(day.timestamp())
-        meters.advance(db, "site_import", total.get("grid_import", 0) * 1000, stamp)
-        meters.advance(db, "site_export", total.get("grid_export", 0) * 1000, stamp)
-        meters.advance(db, "site_solar", total.get("solar", 0) * 1000, stamp)
+        meters.close_day(db, "site_import", total.get("grid_import", 0) * 1000, stamp)
+        meters.close_day(db, "site_export", total.get("grid_export", 0) * 1000, stamp)
+        meters.close_day(db, "site_solar", total.get("solar", 0) * 1000, stamp)
         _log(f"site meters +{day:%Y-%m-%d}: "
              f"import {total.get('grid_import', 0):.1f} kWh, "
              f"export {total.get('grid_export', 0):.1f} kWh, "
              f"solar {total.get('solar', 0):.1f} kWh")
         ingested += 1
         day += timedelta(days=1)
+
+    # Then today's partial, every pass. This is what gives HA hourly shape:
+    # without it the counter would sit still all day and then jump a whole
+    # day's energy at once, which HA books into a single five-minute bucket.
+    try:
+        hist = await client.calendar_history(
+            site_id, "day", datetime.now(tz), cfg.timezone)
+        rows = [energy.derive(r) for r in (hist or {}).get("time_series") or []]
+        t = energy.summarize(rows)
+        meters.observe_today(db, "site_import", t.get("grid_import", 0) * 1000)
+        meters.observe_today(db, "site_export", t.get("grid_export", 0) * 1000)
+        meters.observe_today(db, "site_solar", t.get("solar", 0) * 1000)
+    except (TeslaAPIError, TeslaAuthError, httpx.HTTPError, OSError) as exc:
+        _log(f"site meter today-read failed: {exc}")
     return ingested
 
 

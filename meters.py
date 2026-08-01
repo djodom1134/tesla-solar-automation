@@ -22,9 +22,12 @@ Under-reporting during catch-up is the safe failure. A spike is the
 destructive one, because it is indistinguishable from real consumption and
 lands permanently in long-term statistics.
 
-Site channels advance ONLY on closed day buckets -- days strictly before
-today in the configured timezone -- so the open bucket's revisions can never
-reach the counter at all.
+Two quantities per channel. closed_wh folds in one fully-closed day at a
+time and is the stable baseline. cumulative_wh -- what HA actually sees -- is
+closed_wh plus today's partial day, ratcheted. Reading the OPEN bucket is
+what gives the Energy Dashboard hourly shape instead of one step per day, and
+it is safe only BECAUSE of the ratchet: a downward revision leaves the
+counter untouched, an upward one is real energy and is taken.
 """
 from __future__ import annotations
 
@@ -34,7 +37,12 @@ import time
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meters (
   channel              TEXT PRIMARY KEY,
+  -- What HA sees: ratcheted, and INCLUDES today's partial day so the Energy
+  -- Dashboard gets hourly shape rather than one daily step.
   cumulative_wh        REAL NOT NULL DEFAULT 0,
+  -- Only fully-closed days. The stable baseline that today's partial is
+  -- added to; it advances once per day and never wobbles.
+  closed_wh            REAL NOT NULL DEFAULT 0,
   last_closed_bucket   INTEGER,
   updated_ts           INTEGER
 );
@@ -68,35 +76,72 @@ def kwh(db: sqlite3.Connection, channel: str) -> float | None:
     return round(row["cumulative_wh"] / 1000.0, 3) if row else None
 
 
-def advance(db: sqlite3.Connection, channel: str, add_wh: float,
-            closed_bucket: int | None = None) -> float:
-    """Add energy to a channel, forward only. Returns the new total in Wh.
+def _row(db: sqlite3.Connection, channel: str):
+    return db.execute(
+        "SELECT cumulative_wh, closed_wh, last_closed_bucket FROM meters"
+        " WHERE channel = ?", (channel,)).fetchone()
 
-    add_wh is a DELTA, not an absolute: callers hand over one closed day at a
-    time. Negative deltas are ignored rather than subtracted -- a day cannot
-    un-happen, and the only way to see one is a source that changed its mind.
+
+def _write(db, channel, cumulative, closed, bucket):
+    db.execute(
+        """INSERT INTO meters (channel, cumulative_wh, closed_wh,
+                               last_closed_bucket, updated_ts)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(channel) DO UPDATE SET
+             cumulative_wh = excluded.cumulative_wh,
+             closed_wh = excluded.closed_wh,
+             last_closed_bucket = excluded.last_closed_bucket,
+             updated_ts = excluded.updated_ts""",
+        (channel, cumulative, closed, bucket, int(time.time())))
+    db.commit()
+
+
+def close_day(db: sqlite3.Connection, channel: str, day_wh: float,
+              bucket_ts: int) -> float:
+    """Fold one FULLY CLOSED day into the stable baseline. Returns closed_wh.
+
+    A delta, applied once per day. Negative is ignored rather than subtracted:
+    a day cannot un-happen, and the only way to see one is a source that
+    changed its mind.
     """
     if channel not in CHANNELS:
         raise KeyError(f"unknown meter channel {channel!r}")
-    row = db.execute(
-        "SELECT cumulative_wh, last_closed_bucket FROM meters WHERE channel = ?",
-        (channel,)).fetchone()
-    current = row["cumulative_wh"] if row else 0.0
-    # max(), not +=, is the ratchet: a negative or nonsensical delta leaves
-    # the counter exactly where it was.
-    new = max(current, current + max(0.0, float(add_wh)))
-    bucket = closed_bucket if closed_bucket is not None else (
-        row["last_closed_bucket"] if row else None)
-    db.execute(
-        """INSERT INTO meters (channel, cumulative_wh, last_closed_bucket, updated_ts)
-           VALUES (?, ?, ?, ?)
-           ON CONFLICT(channel) DO UPDATE SET
-             cumulative_wh = excluded.cumulative_wh,
-             last_closed_bucket = excluded.last_closed_bucket,
-             updated_ts = excluded.updated_ts""",
-        (channel, new, bucket, int(time.time())))
-    db.commit()
-    return new
+    row = _row(db, channel)
+    closed = (row["closed_wh"] if row else 0.0) + max(0.0, float(day_wh))
+    cumulative = max(row["cumulative_wh"] if row else 0.0, closed)
+    _write(db, channel, cumulative, closed, bucket_ts)
+    return closed
+
+
+def observe_today(db: sqlite3.Connection, channel: str, today_wh: float) -> float:
+    """Ratchet the exposed counter to the closed baseline plus today so far.
+
+    ABSOLUTE, not a delta, and this is what gives the Energy Dashboard hourly
+    resolution instead of one step per day. Ingesting only closed days would
+    make the counter jump a whole day's energy at once, and HA would book all
+    of it into the five-minute bucket it happened to land in.
+
+    Reading the OPEN bucket is safe precisely because of the ratchet: Tesla
+    revises it downward as data settles, and a downward revision simply leaves
+    the counter where it was. Upward revisions are real energy and are taken.
+    """
+    if channel not in CHANNELS:
+        raise KeyError(f"unknown meter channel {channel!r}")
+    row = _row(db, channel)
+    if row is None:
+        return 0.0
+    target = row["closed_wh"] + max(0.0, float(today_wh))
+    cumulative = max(row["cumulative_wh"], target)
+    _write(db, channel, cumulative, row["closed_wh"], row["last_closed_bucket"])
+    return cumulative
+
+
+def seed(db: sqlite3.Connection, channel: str, bucket_ts: int) -> None:
+    """Create a channel at zero, so the first real observation has a baseline."""
+    if channel not in CHANNELS:
+        raise KeyError(f"unknown meter channel {channel!r}")
+    if _row(db, channel) is None:
+        _write(db, channel, 0.0, 0.0, bucket_ts)
 
 
 def last_closed_bucket(db: sqlite3.Connection, channel: str) -> int | None:
