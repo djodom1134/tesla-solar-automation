@@ -53,8 +53,24 @@ CREATE TABLE IF NOT EXISTS meters (
 CHANNELS = ("site_import", "site_export", "site_solar")
 
 
+# Columns added after the table first shipped. CREATE TABLE IF NOT EXISTS is
+# a NO-OP on an existing table, so a new column in SCHEMA above reaches a
+# fresh install and nothing else -- the deployed database keeps the old shape
+# and every query naming the column fails with "no such column". This project
+# has been bitten by exactly that twice; the ALTER is the only thing that
+# actually migrates.
+NEW_COLUMNS = (
+    ("closed_wh", "REAL NOT NULL DEFAULT 0"),
+)
+
+
 def migrate(db: sqlite3.Connection) -> None:
     db.executescript(SCHEMA)
+    existing = {row[1] for row in db.execute("PRAGMA table_info(meters)")}
+    for name, decl in NEW_COLUMNS:
+        if name not in existing:
+            db.execute(f"ALTER TABLE meters ADD COLUMN {name} {decl}")
+    db.commit()
 
 
 def read_all(db: sqlite3.Connection) -> dict[str, dict]:

@@ -90,3 +90,25 @@ def test_todays_partial_gives_hourly_shape_without_letting_it_go_backwards():
     # And when today closes, the baseline absorbs it without double-counting.
     meters.close_day(db, "site_solar", 12_500.0, 1_700_086_400)
     assert meters.kwh(db, "site_solar") == 42.5
+
+
+def test_migrate_adds_columns_to_an_ALREADY_EXISTING_table():
+    """CREATE TABLE IF NOT EXISTS is a no-op on a table that exists, so a
+    column added to SCHEMA reaches new installs only. The deployed database
+    keeps the old shape and every query naming it fails with "no such
+    column" -- which is precisely what happened on the Mac mini.
+    """
+    db = sqlite3.connect(":memory:")
+    db.row_factory = sqlite3.Row
+    # The ORIGINAL shape, without closed_wh.
+    db.execute("""CREATE TABLE meters (
+        channel TEXT PRIMARY KEY, cumulative_wh REAL NOT NULL DEFAULT 0,
+        last_closed_bucket INTEGER, updated_ts INTEGER)""")
+    db.execute("INSERT INTO meters (channel, cumulative_wh) VALUES ('site_solar', 7000)")
+
+    meters.migrate(db)
+
+    cols = {r[1] for r in db.execute("PRAGMA table_info(meters)")}
+    assert "closed_wh" in cols, "the ALTER must run on an existing table"
+    # And the pre-existing data must survive the migration untouched.
+    assert meters.kwh(db, "site_solar") == 7.0
