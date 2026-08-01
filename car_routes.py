@@ -9,12 +9,15 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Body, HTTPException, Query
 
 import commands as command_catalog
 import demo
+import solar
 import tesla
 import vehicle
 from config import settings
@@ -47,7 +50,26 @@ def _client() -> TeslaClient:
 
 
 async def _vin() -> str:
-    return "5YJSA00000F000000" if DEMO else await _client().resolve_vin()
+    """The VIN, from the cheapest source that knows it.
+
+    resolve_vin() is a BILLED call -- with TESLA_VIN unset it falls through to
+    GET /api/1/vehicles -- and this ran on every route, including /history,
+    which otherwise touches nothing but the local samples table. A dashboard
+    left open on a wall tablet paid for a vehicle list on every refresh.
+
+    Three tiers, cheapest first, mirroring solar_routes._vin(): the configured
+    VIN, then the one the collector has been recording under, and only then
+    the API. Empty string is never returned here (unlike solar_routes, whose
+    callers tolerate it) because these routes address a specific car.
+    """
+    if DEMO:
+        return "5YJSA00000F000000"
+    if settings.vin:
+        return settings.vin
+    recorded = store().latest_vin()
+    if recorded:
+        return recorded
+    return await _client().resolve_vin()
 
 
 @router.get("/state")
@@ -108,12 +130,33 @@ async def car_history(range: str = Query("24h")) -> dict[str, Any]:
     return {"rows": rows, "since": first, "range": range}
 
 
+def _spend(vin: str) -> None:
+    """Book one billed Tesla request against the daily cap, or refuse.
+
+    The cap guarded ONLY the collector: solar.count_request() was called at
+    collector.py:284 and nowhere else, so every billed HTTP route spent
+    outside it. requests_today reported a comfortable number while the budget
+    drained through a door it did not watch -- and /wake is the most expensive
+    request this system can make, at $0.02 against a $10/month credit.
+
+    Counted BEFORE the call, not after: a request that is about to be made is
+    already committed, and counting on the way back would let a hung or
+    failing call be retried past the cap for free.
+    """
+    today = datetime.now(ZoneInfo(settings.timezone)).strftime("%Y-%m-%d")
+    count, capped = solar.count_request(store()._db, vin, today)
+    if capped:
+        raise HTTPException(
+            429, f"daily Tesla request cap reached ({count}); resets tomorrow")
+
+
 @router.post("/wake")
 async def car_wake() -> dict[str, Any]:
     """Explicit user action only. Never called on a timer or a page load."""
     if DEMO:
         return {"state": "online"}
     vin = await _vin()
+    _spend(vin)
     result = await _client().wake_up(vin)
     return {"state": (result or {}).get("state", "unknown")}
 

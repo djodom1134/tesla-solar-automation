@@ -10,6 +10,9 @@ from tesla import TeslaAuthError
 class _FakeStore:
     """Stands in for car_routes.store() so /health tests never touch car.db."""
 
+    def latest_vin(self):
+        return None
+
     def snapshot(self, vin):
         return None
 
@@ -31,6 +34,9 @@ class _FakeClientNotAuthenticated:
 class _FakeStoreWithView:
     """Stands in for car_routes.store() with a controllable snapshot, to drive
     the trigger_homelink lat/lon injection without touching car.db."""
+
+    def latest_vin(self):
+        return None
 
     def __init__(self, view):
         self._view = view
@@ -242,3 +248,126 @@ def test_vendored_assets_keep_normal_caching():
         r = client.get("/" + str(rel))
         assert r.status_code == 200
         assert "no-store" not in r.headers.get("cache-control", "")
+
+
+class _CountingVinClient:
+    """Counts resolve_vin() calls -- each one is a billed GET /api/1/vehicles
+    when TESLA_VIN is unset."""
+
+    def __init__(self):
+        self.resolve_calls = 0
+
+    async def resolve_vin(self):
+        self.resolve_calls += 1
+        return "5YJSA00000F000000"
+
+
+def test_history_costs_no_tesla_request(monkeypatch, tmp_path):
+    """/api/car/history reads the local samples table and nothing else -- but
+    it went through _vin(), which called resolve_vin(), which falls through to
+    GET /api/1/vehicles whenever TESLA_VIN is unset (it is). A free endpoint
+    was paying a billed call on every load, and a dashboard left open on a
+    wall tablet paid it every refresh.
+    """
+    monkeypatch.setattr(car_routes, "DEMO", False)
+    fake = _CountingVinClient()
+    monkeypatch.setattr(car_routes, "_client", lambda: fake)
+
+    class _HistoryStore:
+        """No real sqlite: TestClient dispatches the route on another thread,
+        and a Connection cannot cross threads."""
+        def first_sample(self, vin): return None
+        def history(self, vin, start, end): return []
+
+    monkeypatch.setattr(car_routes, "store", _HistoryStore)
+    monkeypatch.setattr(car_routes.settings, "vin", "5YJSA00000F000000")
+
+    with TestClient(app_module.app) as client:
+        r = client.get("/api/car/history?range=24h")
+
+    assert r.status_code == 200
+    assert fake.resolve_calls == 0, (
+        "a local history read must not spend a Tesla request resolving the VIN")
+
+
+def test_vin_prefers_config_then_database_and_only_then_the_api(monkeypatch, tmp_path):
+    """Three tiers, cheapest first. resolve_vin() is the last resort, not the
+    first move."""
+    import asyncio
+    fake = _CountingVinClient()
+    monkeypatch.setattr(car_routes, "DEMO", False)
+    monkeypatch.setattr(car_routes, "_client", lambda: fake)
+
+    rows = []
+    class _SampleStore:
+        def latest_vin(self): return rows[0] if rows else None
+    monkeypatch.setattr(car_routes, "store", _SampleStore)
+
+    # 1. configured -- free
+    monkeypatch.setattr(car_routes.settings, "vin", "CONFIGURED_VIN")
+    assert asyncio.run(car_routes._vin()) == "CONFIGURED_VIN"
+    assert fake.resolve_calls == 0
+
+    # 2. not configured, but a sample exists -- still free
+    monkeypatch.setattr(car_routes.settings, "vin", "")
+    rows.append("DBVIN")
+    assert asyncio.run(car_routes._vin()) == "DBVIN"
+    assert fake.resolve_calls == 0, "the database already knows the VIN"
+
+    # 3. nothing configured, nothing recorded -- only NOW is the API justified
+    rows.clear()
+    assert asyncio.run(car_routes._vin()) == "5YJSA00000F000000"
+    assert fake.resolve_calls == 1, "last resort, and only once"
+
+
+def test_wake_counts_against_the_daily_cap_and_refuses_when_tripped(monkeypatch, tmp_path):
+    """daily_request_cap guarded only the collector.
+
+    solar.count_request() was called at collector.py:284 and nowhere else, so
+    every billed HTTP route -- /wake at $0.02 a press, /command, /state --
+    spent outside the cap entirely. requests_today reported a comfortable
+    number while the budget drained through a door it did not watch. A
+    backstop that does not count the most expensive request is not a backstop.
+    """
+    import solar
+    from types import SimpleNamespace
+
+    st = store.Store(tmp_path / "car.db")
+    # solar.count_request uses `capped = count >= cap`, so the cap-th request
+    # is the one refused, not the one after it. That fencepost is the
+    # collector's existing contract (collector.py:284) -- match it here rather
+    # than changing a semantic the control loop already depends on.
+    solar.save_config(st._db, daily_request_cap=3)
+
+    woke = []
+
+    class _Client:
+        async def resolve_vin(self): return "VIN1"
+        async def wake_up(self, vin):
+            woke.append(vin)
+            return {"state": "online"}
+
+    monkeypatch.setattr(car_routes, "DEMO", False)
+    monkeypatch.setattr(car_routes, "_client", lambda: _Client())
+    monkeypatch.setattr(car_routes, "store", lambda: st)
+    monkeypatch.setattr(car_routes.settings, "vin", "VIN1")
+
+    import asyncio
+    # Two wakes fit inside a cap of 3; the third trips it.
+    asyncio.run(car_routes.car_wake())
+    asyncio.run(car_routes.car_wake())
+    assert len(woke) == 2
+    assert solar.load_state(st._db, "VIN1")["requests_today"] == 2, (
+        "each wake must be counted, not just the collector's own polls")
+
+    # The third must be refused -- and must NOT reach the car.
+    from fastapi import HTTPException
+    try:
+        asyncio.run(car_routes.car_wake())
+        raised = None
+    except HTTPException as exc:
+        raised = exc
+    assert raised is not None and raised.status_code == 429, (
+        "over the cap, a wake must be refused rather than billed")
+    assert len(woke) == 2, "the refused wake must never have touched the car"
+    st.close()

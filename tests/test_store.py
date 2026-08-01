@@ -509,3 +509,26 @@ def test_record_tolerates_a_view_missing_the_new_keys(tmp_path):
     assert row["charge_energy_added"] is None
     assert row["at_home"] is None
     s.close()
+
+
+def test_latest_vin_answers_which_car_without_touching_the_api(tmp_path):
+    """Exists so a route can answer "which car is this?" for free.
+
+    car_routes._vin() used to call resolve_vin() on every request, which with
+    TESLA_VIN unset falls through to a billed GET /api/1/vehicles -- paid even
+    by /history, which otherwise reads nothing but this table.
+    """
+    st = store.Store(tmp_path / "car.db")
+    assert st.latest_vin() is None, "nothing recorded yet is None, not a guess"
+
+    st.record({"vin": "VIN_OLD", "soc": 50, "sampled_at": 100,
+               "charging_state": "Stopped", "amps_actual": 0, "charging": 0},
+              at_home=True)
+    assert st.latest_vin() == "VIN_OLD"
+
+    # Most RECENT wins -- a car swapped in is the one the routes should address.
+    st.record({"vin": "VIN_NEW", "soc": 60, "sampled_at": 200,
+               "charging_state": "Stopped", "amps_actual": 0, "charging": 0},
+              at_home=True)
+    assert st.latest_vin() == "VIN_NEW"
+    st.close()

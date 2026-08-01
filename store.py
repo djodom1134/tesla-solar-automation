@@ -137,6 +137,16 @@ class Store:
             return None
         return {"ts": row["ts"], "view": json.loads(row["json"])}
 
+    def latest_vin(self) -> str | None:
+        """The VIN most recently recorded, or None.
+
+        Exists so routes can answer "which car is this?" without a billed
+        resolve_vin() call and without reaching into _db from another module.
+        """
+        row = self._db.execute(
+            "SELECT vin FROM samples ORDER BY ts DESC LIMIT 1").fetchone()
+        return row["vin"] if row and row["vin"] else None
+
     def first_sample(self, vin: str) -> int | None:
         row = self._db.execute(
             "SELECT MIN(ts) AS t FROM samples WHERE vin = ?", (vin,)
