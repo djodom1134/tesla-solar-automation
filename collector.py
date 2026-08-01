@@ -15,14 +15,16 @@ import argparse
 import asyncio
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import httpx
 
+import energy
 import garage
 import green
 import home
+import meters
 import solar
 import tesla
 import vehicle
@@ -752,6 +754,66 @@ async def garage_scheduled_close_tick(db, vin: str, cfg: dict, tz: str) -> None:
          f"{(verify or {}).get('garageDoorState', 'unknown')!r}")
 
 
+
+# How often to look for a newly-closed day. Hourly is ample: a day closes
+# once, and checking more often just spends requests discovering nothing.
+SITE_INGEST_INTERVAL_S = 3600
+
+
+async def ingest_site_meters(client, db, site_id, cfg, now: float) -> int:
+    """Advance the site energy counters by any days that have CLOSED.
+
+    Only whole days strictly before today in the configured timezone are
+    ingested. Tesla revises the open bucket downward as data settles, and a
+    counter that followed it would either move backwards -- which HA reads as
+    a meter swap, zeroing its baseline and then booking the next sample in
+    full -- or double-count when the bucket later grew.
+
+    Returns the number of days ingested, which is also the number of billed
+    requests made: one per day, normally zero or one.
+    """
+    if site_id is None:
+        return 0
+    tz = ZoneInfo(cfg.timezone)
+    today = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    last = meters.last_closed_bucket(db, "site_import")
+    if last is None:
+        # First run: start the counters at zero from yesterday. Backfilling
+        # would not give HA any history anyway -- a total_increasing sensor's
+        # first sample only establishes a baseline, it is never counted.
+        for ch in meters.CHANNELS:
+            meters.advance(db, ch, 0.0,
+                           closed_bucket=int((today - timedelta(days=1)).timestamp()))
+        return 0
+
+    ingested = 0
+    day = datetime.fromtimestamp(last, tz) + timedelta(days=1)
+    # Bounded per pass so a long outage cannot spend the whole daily budget
+    # catching up in one go.
+    while day < today and ingested < 3:
+        try:
+            hist = await client.calendar_history(
+                site_id, "day", day.replace(hour=23, minute=59, second=59),
+                cfg.timezone)
+        except (TeslaAPIError, TeslaAuthError, httpx.HTTPError, OSError) as exc:
+            _log(f"site meter ingest failed for {day:%Y-%m-%d}: {exc}")
+            return ingested
+        rows = [energy.derive(r) for r in (hist or {}).get("time_series") or []]
+        total = energy.summarize(rows)
+        stamp = int(day.timestamp())
+        meters.advance(db, "site_import", total.get("grid_import", 0) * 1000, stamp)
+        meters.advance(db, "site_export", total.get("grid_export", 0) * 1000, stamp)
+        meters.advance(db, "site_solar", total.get("solar", 0) * 1000, stamp)
+        _log(f"site meters +{day:%Y-%m-%d}: "
+             f"import {total.get('grid_import', 0):.1f} kWh, "
+             f"export {total.get('grid_export', 0):.1f} kWh, "
+             f"solar {total.get('solar', 0):.1f} kWh")
+        ingested += 1
+        day += timedelta(days=1)
+    return ingested
+
+
 async def run(once: bool = False) -> int:
     client = TeslaClient(settings)
     store = Store(settings.db_file)
@@ -766,6 +828,8 @@ async def run(once: bool = False) -> int:
     # a heartbeat is overdue against the cadence actually in force -- which
     # ranges from 120 s engaged to 1800 s after dark.
     last_sleep_s = 60
+    # Runs on first pass, then hourly.
+    last_site_ingest = 0.0
     try:
         try:
             vin = await client.resolve_vin()
@@ -793,6 +857,14 @@ async def run(once: bool = False) -> int:
             conf = solar.load_config(store._db)
             st = solar.load_state(store._db, vin)
             solar_wanted = bool(conf["enabled"]) or bool(st["dirty"])
+
+            if time.time() - last_site_ingest >= SITE_INGEST_INTERVAL_S:
+                last_site_ingest = time.time()
+                try:
+                    await ingest_site_meters(client, store._db, site_id,
+                                             settings, time.time())
+                except Exception as exc:      # never let this kill the loop
+                    _log(f"site meter ingest error: {exc}")
 
             # Beat at the TOP, before any branch that can `continue` or
             # `return`. Every early exit below is a legitimate quiet path --

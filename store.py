@@ -8,6 +8,8 @@ insert is idempotent on the second.
 from __future__ import annotations
 
 import json
+
+import meters
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -92,6 +94,7 @@ class Store:
         self._db.executescript(solar.SCHEMA)
         solar.migrate_state(self._db)
         solar.migrate_config(self._db)
+        meters.migrate(self._db)
         self._db.commit()
 
     def close(self) -> None:

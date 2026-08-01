@@ -32,6 +32,7 @@ from fastapi import APIRouter
 
 import green
 import home
+import meters
 import solar
 from config import settings
 from store import Store
@@ -164,12 +165,16 @@ async def ha_meters() -> dict[str, Any]:
 
     db = store()._db
     vin = _vin()
+    # Site channels come from the ratchet, and are independent of the car:
+    # they are still true when no car has ever been recorded.
+    site = {f"{ch}_kwh": meters.kwh(db, ch) for ch in meters.CHANNELS}
+
     if not vin:
         # null, never 0. HA discards non-numeric states from statistics, so
         # unavailable is harmless -- while a 0 would read as a counter reset
         # and inject the entire lifetime total into one 5-minute bucket.
         return {"schema": SCHEMA, "car_solar_kwh": None, "car_grid_kwh": None,
-                "car_total_kwh": None}
+                "car_total_kwh": None, **site}
 
     ticks = [dict(r) for r in db.execute(
         "SELECT state, car_w, grid_w, period_s FROM solar_ticks WHERE vin = ?",
@@ -180,4 +185,5 @@ async def ha_meters() -> dict[str, Any]:
         "car_solar_kwh": round(solar_kwh, 3),
         "car_grid_kwh": round(grid_kwh, 3),
         "car_total_kwh": round(solar_kwh + grid_kwh, 3),
+        **site,
     }
