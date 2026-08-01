@@ -441,6 +441,10 @@ CREATE TABLE IF NOT EXISTS solar_state (
   -- Grid energy spent riding out a dip at the floor. Bounds grace alongside
   -- grace_s, and is the constraint that actually binds. See advance().
   grace_wh        REAL    NOT NULL DEFAULT 0,
+  -- Liveness. Written every loop iteration regardless of what the tick
+  -- decided; see STATE_NEW_COLUMNS for why tick age cannot answer this.
+  heartbeat_ts      INTEGER,
+  heartbeat_sleep_s INTEGER,
   dirty           INTEGER NOT NULL DEFAULT 0,
   original_amps   INTEGER,
   original_limit  INTEGER,
@@ -528,6 +532,7 @@ STATE_DEFAULTS = {
     "solar_soc": 0.0, "ledger_soc": None, "ledger_stale": 0,
     "free_miles_driven": 0.0, "tracked_miles": 0.0, "ledger_odo": None,
     "free_miles_since": None,
+    "heartbeat_ts": None, "heartbeat_sleep_s": None,
 }
 
 # The Machine fields that must survive between ticks. Anything here that is
@@ -567,6 +572,13 @@ STATE_NEW_COLUMNS = (
     ("free_miles_since", "INTEGER"),
     # Ride-through: grid energy spent holding at the floor through a dip.
     ("grace_wh", "REAL NOT NULL DEFAULT 0"),
+    # Liveness, for anything asking "is the collector actually running?".
+    # solar_ticks cannot answer that: a tick logs a row only when the
+    # controller runs, and the loop legitimately writes none when solar is
+    # disabled, after dark, or while the car sleeps. Judging liveness by tick
+    # age would report the collector dead every night.
+    ("heartbeat_ts", "INTEGER"),
+    ("heartbeat_sleep_s", "INTEGER"),
 )
 
 

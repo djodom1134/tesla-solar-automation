@@ -762,6 +762,10 @@ async def run(once: bool = False) -> int:
     # tick at no cost, because recover() itself returns True immediately when
     # nothing is dirty.
     recovery_done = False
+    # What the loop slept before this iteration, so a reader can judge whether
+    # a heartbeat is overdue against the cadence actually in force -- which
+    # ranges from 120 s engaged to 1800 s after dark.
+    last_sleep_s = 60
     try:
         try:
             vin = await client.resolve_vin()
@@ -789,6 +793,14 @@ async def run(once: bool = False) -> int:
             conf = solar.load_config(store._db)
             st = solar.load_state(store._db, vin)
             solar_wanted = bool(conf["enabled"]) or bool(st["dirty"])
+
+            # Beat at the TOP, before any branch that can `continue` or
+            # `return`. Every early exit below is a legitimate quiet path --
+            # cap tripped, recovery pending, auth lost -- and a heartbeat
+            # written only on the happy path would report a working collector
+            # as dead precisely when something is wrong.
+            solar.save_state(store._db, vin, heartbeat_ts=int(time.time()),
+                             heartbeat_sleep_s=int(last_sleep_s))
 
             # METER-ONLY WATCH. A plugged-in, hungry car that is asleep
             # needs no vehicle request at all: only the SITE meter can say
@@ -910,6 +922,10 @@ async def run(once: bool = False) -> int:
 
             if once:
                 return 0
+            last_sleep_s = (
+                backoff_s
+                or (conf["watch_s"] if waiting_for_surplus
+                    else next_interval(car_state, view, settings, engaged)))
             await asyncio.sleep(
                 backoff_s
                 # Anything WAITING FOR SURPLUS runs at the watch cadence,

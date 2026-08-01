@@ -21,6 +21,7 @@ from fastapi.staticfiles import StaticFiles
 import car_routes
 import demo
 import energy
+import ha_routes
 import solar
 import solar_routes
 from config import BASE_DIR, settings
@@ -256,6 +257,8 @@ async def api_dashboard(
 
 app.include_router(car_routes.router)
 app.include_router(solar_routes.router)
+# Above the static mount, like the others -- that mount is a catch-all.
+app.include_router(ha_routes.router)
 
 class _NoStoreStatic(StaticFiles):
     """Serve the app's own files with no-store.
