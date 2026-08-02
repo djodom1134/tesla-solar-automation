@@ -8,7 +8,10 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+import time
+
 import garage
+import solar
 import solar_routes
 
 
@@ -456,3 +459,82 @@ def test_an_implausible_tariff_is_rejected(client):
     r = client.put("/api/car/solar/config", json={"import_rate": 12})
     assert r.status_code == 400
     assert "import_rate" in r.text
+
+
+def _saved_config():
+    """Read solar_config back on a connection of our OWN.
+
+    TestClient dispatches routes on a worker thread, so the Store the route
+    created belongs to that thread and sqlite3 refuses to hand it back here.
+    Reopening the file is also the stricter check: it proves the value was
+    committed, not merely held in the writer's transaction.
+    """
+    import sqlite3
+
+    from config import settings
+    db = sqlite3.connect(settings.db_file)
+    db.row_factory = sqlite3.Row
+    try:
+        return solar.load_config(db)
+    finally:
+        db.close()
+
+
+def test_charge_mode_starts_at_off(client, monkeypatch):
+    monkeypatch.setattr(solar_routes, "DEMO", False)
+    body = client.get("/api/car/charge-mode").json()
+    assert body["mode"] == "off"
+    assert body["expires_ts"] is None
+
+
+def test_setting_now_stamps_the_next_midnight(client, monkeypatch):
+    monkeypatch.setattr(solar_routes, "DEMO", False)
+    body = client.put("/api/car/charge-mode", json={"mode": "now"}).json()
+    assert body["mode"] == "now"
+
+    from config import settings
+    assert body["expires_ts"] == solar.next_midnight_ts(
+        settings.timezone, time.time())
+    assert _saved_config()["force_charge_until"] == body["expires_ts"]
+
+
+def test_setting_solar_clears_the_force_and_enables(client, monkeypatch):
+    monkeypatch.setattr(solar_routes, "DEMO", False)
+    client.put("/api/car/charge-mode", json={"mode": "now"})
+    body = client.put("/api/car/charge-mode", json={"mode": "solar"}).json()
+
+    assert body["mode"] == "solar"
+    assert body["expires_ts"] is None
+    conf = _saved_config()
+    assert conf["force_charge_until"] is None
+    assert conf["enabled"] == 1
+
+
+def test_setting_off_clears_the_force_and_disables(client, monkeypatch):
+    monkeypatch.setattr(solar_routes, "DEMO", False)
+    client.put("/api/car/charge-mode", json={"mode": "now"})
+    body = client.put("/api/car/charge-mode", json={"mode": "off"}).json()
+
+    assert body["mode"] == "off"
+    conf = _saved_config()
+    assert conf["force_charge_until"] is None
+    assert conf["enabled"] == 0
+
+
+def test_an_unknown_mode_is_refused(client, monkeypatch):
+    monkeypatch.setattr(solar_routes, "DEMO", False)
+    assert client.put(
+        "/api/car/charge-mode", json={"mode": "fast"}).status_code == 400
+    assert client.put("/api/car/charge-mode", json={}).status_code == 400
+
+
+def test_force_charge_until_is_not_writable_through_the_config_route(
+        client, monkeypatch):
+    """A client that could set the timestamp directly could set it a year
+    out, and the midnight expiry -- the whole safety property of "now" --
+    would be gone. The mode route is the only way in."""
+    monkeypatch.setattr(solar_routes, "DEMO", False)
+    r = client.put("/api/car/solar/config",
+                   json={"force_charge_until": 99999999999})
+    assert r.status_code == 400
+    assert "unknown fields" in r.json()["detail"]

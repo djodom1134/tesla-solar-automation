@@ -353,6 +353,52 @@ async def put_solar_config(body: dict[str, Any] = Body(...)) -> dict[str, bool]:
     return {"ok": True}
 
 
+CHARGE_MODES = ("solar", "now", "off")
+
+
+def _mode_payload(conf: dict, now: float) -> dict[str, Any]:
+    return {
+        "mode": solar.charge_mode(conf, now),
+        # Only meaningful while forcing. Reported as null otherwise rather
+        # than as a stale timestamp the caller has to interpret.
+        "expires_ts": (conf["force_charge_until"]
+                       if solar.forcing(conf, now) else None),
+        "enabled": bool(conf["enabled"]),
+    }
+
+
+@router.get("/charge-mode")
+async def get_charge_mode() -> dict[str, Any]:
+    return _mode_payload(solar.load_config(store()._db), time.time())
+
+
+@router.put("/charge-mode")
+async def put_charge_mode(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """Set the charge mode.
+
+    force_charge_until is deliberately NOT in CONFIG_BOUNDS, so it cannot be
+    written through PUT /solar/config. A client that could set the timestamp
+    directly could set it a year out, and the midnight expiry -- the whole
+    safety property of "now" -- would be gone. This route is the only way in,
+    and it computes the expiry itself.
+    """
+    mode = body.get("mode")
+    if mode not in CHARGE_MODES:
+        raise HTTPException(400, f"mode must be one of {list(CHARGE_MODES)}")
+
+    now = time.time()
+    if mode == "now":
+        solar.save_config(
+            store()._db,
+            force_charge_until=solar.next_midnight_ts(settings.timezone, now))
+    elif mode == "solar":
+        solar.save_config(store()._db, force_charge_until=None, enabled=1)
+    else:
+        solar.save_config(store()._db, force_charge_until=None, enabled=0)
+
+    return _mode_payload(solar.load_config(store()._db), now)
+
+
 @router.get("/solar/status")
 async def get_solar_status() -> dict[str, Any]:
     if DEMO:
