@@ -9,6 +9,7 @@ import httpx
 import pytest
 
 import collector
+import green
 import home
 import solar
 import tesla
@@ -2568,12 +2569,13 @@ class _NightImportClient:
     when what it is really doing is waiting for the car to catch up.
     """
 
-    def __init__(self, view=None):
+    def __init__(self, view=None, grid_w=2000.0):
         self.commands = []
         self.view = view
+        self.grid_w = grid_w
 
     async def _get(self, path, ttl=0):
-        return {"grid_power": 2000.0, "solar_power": 0.0}
+        return {"grid_power": self.grid_w, "solar_power": 0.0}
 
     async def command(self, vin, name, params):
         self.commands.append((name, dict(params)))
@@ -2709,3 +2711,68 @@ async def test_forcing_wakes_a_sleeping_car_at_most_once_per_window(
     assert len(wakes) == 1, (
         f"5 ticks inside one {collector.FORCE_WAKE_MIN_S}s window issued "
         f"{len(wakes)} wakes; each one is $0.02")
+
+
+@pytest.mark.asyncio
+async def test_a_forced_charge_still_moves_the_attribution_ledger(
+    tmp_path, monkeypatch,
+):
+    """The regression that would silently break "miles added today".
+
+    green.charged_split derives the entire solar/grid split from solar_ticks,
+    and a row needs car_w AND grid_w. It is tempting to skip live_status while
+    forcing -- there is no control loop to run, so why pay for the meter?
+    Because skipping it makes a forced overnight charge INVISIBLE: the ledger
+    under-reports by the whole charge and the Energy Dashboard's car meters
+    flatline through it. Far worse than the 5-15% downward bias already
+    documented in the HA spec.
+    """
+    monkeypatch.setattr(tesla, "proxy_up", lambda url: True)
+
+    store_ = Store(tmp_path / "car.db")
+    db = store_._db
+    solar.save_config(db, enabled=1,
+                      force_charge_until=int(time.time()) + 3600)
+    home.save(db, 40.0, -105.0, 100)
+    solar.save_state(db, "VIN1", state="idle")
+
+    # solar_ticks is keyed (vin, ts) and log_tick does INSERT OR REPLACE, so
+    # three ticks inside one wall-clock second would collapse into a single
+    # row and this test would read a written ledger as an empty one. Advance
+    # a fake clock a second per reading; the force window is an hour wide, so
+    # the drift changes nothing else.
+    base = time.time()
+    ticker = iter(range(1, 10_000))
+    monkeypatch.setattr(time, "time", lambda: base + next(ticker))
+
+    view = {
+        "charging_state": "Charging", "amps_actual": 48, "amps_max": 48,
+        "volts": 240, "charge_amps": 24, "soc": 55, "limit": 80,
+        "lat": 40.0, "lon": -105.0,
+        "fast_charger_present": False, "fast_charger": None,
+    }
+    # Import must cover the car's own 11.5 kW draw plus the house. The 2 kW
+    # the other test uses would be physically impossible beside solar_power=0
+    # -- charged_split infers solar as (car_w - grid import), so it would
+    # correctly conclude 9.5 kW came from a sun that is not shining.
+    client = _NightImportClient(view, grid_w=12000.0)
+    cfg = SimpleNamespace(timezone="America/Denver",
+                          proxy_url="https://localhost:4443")
+
+    for _ in range(3):
+        await collector.solar_tick(client, store_, "VIN1", view, cfg, site_id=1)
+
+    rows = [dict(r) for r in db.execute(
+        "SELECT state, car_w, grid_w, period_s FROM solar_ticks WHERE vin = ?",
+        ("VIN1",))]
+    assert len(rows) == 3, (
+        f"force mode logged {len(rows)} ticks, not 3 -- the ledger is blind "
+        "to this charge")
+    assert all(r["car_w"] is not None and r["grid_w"] is not None
+               for r in rows), "a tick row without both watts attributes nothing"
+
+    solar_kwh, grid_kwh = green.charged_split(rows)
+    assert grid_kwh > 0, "night-time charging booked no grid energy"
+    assert solar_kwh == 0.0, (
+        f"attributed {solar_kwh} kWh to the sun at 2 a.m. with solar_power=0")
+    store_.close()

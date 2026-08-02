@@ -175,3 +175,55 @@ def test_force_charge_until_round_trips_as_null():
     assert solar.load_config(db)["force_charge_until"] is None
     solar.save_config(db, force_charge_until=1785740400)
     assert solar.load_config(db)["force_charge_until"] == 1785740400
+
+
+def test_the_whole_force_lifecycle_in_sequence():
+    """Solar engaged -> force set -> hand-off -> start -> latch -> Complete
+    -> expiry. Pure, so it runs in CI with no network and no Tesla account.
+
+    This is the coverage the spec wanted from a backtest scenario.
+    tools/backtest.py cannot host it: that harness replays real
+    calendar_history for one of three specific past days over the network.
+    """
+    until = 5000
+    started = False
+    issued = []
+
+    def plan(state, car_charging, amps_actual):
+        nonlocal started
+        actions, started = solar.force_plan(
+            state=state, location="home", plugged=True,
+            car_charging=car_charging, amps_actual=amps_actual,
+            amps_max=48, force_started=started)
+        issued.append(actions)
+        return actions
+
+    # 1. The solar controller is mid-engagement at its 5 A floor.
+    assert plan("charging", True, 5) == ["restore"]
+
+    # 2. Handed off -- the machine is idle, the car has stopped.
+    assert plan("idle", False, 0) == ["force_start", "force_amps"]
+    assert started is False, "the latch must not set before charging is seen"
+
+    # 3. Charging observed at the floor -- lift it, and latch.
+    assert plan("idle", True, 5) == ["force_amps"]
+    assert started is True
+
+    # 4. Steady at the target -- no commands at all.
+    assert plan("idle", True, 48) == []
+
+    # 5. The car reached its charge limit and stopped.
+    assert plan("idle", False, 0) == []
+    assert solar.force_expired(force_charge_until=until, now=1000,
+                               car_charging=False, force_started=True)
+
+    # And nothing ever tried to restart it after the latch was set.
+    assert issued.count(["force_start", "force_amps"]) == 1, (
+        f"restarted a finished charge: {issued}")
+
+
+def test_midnight_expires_a_charge_that_is_still_running():
+    """The other expiry path. The owner chose midnight, so a charge still in
+    progress at 00:00 is stopped and handed back to solar."""
+    assert solar.force_expired(force_charge_until=5000, now=5000,
+                               car_charging=True, force_started=True)
