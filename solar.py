@@ -761,6 +761,11 @@ def load_config(db: sqlite3.Connection) -> dict:
 # wiring. BEGIN IMMEDIATE above is defence in depth, and this comment is the
 # thing to re-read before adding a config write to the collector or a state
 # write to the web app.
+#
+# ONE deliberate exception, added with charge_mode: the collector clears
+# force_charge_until when a force expires. Nothing else can observe local
+# midnight, and the web app may not be running. It is confined to that single
+# field -- collector.py's force branch carries the same note.
 def save_config(db: sqlite3.Connection, **fields) -> None:
     unknown = set(fields) - set(CONFIG_DEFAULTS)
     if unknown:

@@ -279,7 +279,13 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
     # right after an ordinary charge_start and restores the owner's settings
     # mid-charge, forcing the machine back to idle every other tick. See C5.
 
-    if not conf["enabled"] and st["state"] == "idle":
+    now_ts = time.time()
+    is_forcing = solar.forcing(conf, now_ts)
+
+    # The cheap early-out, which force mode must not take: with enabled=0 and
+    # the machine idle there is normally nothing to do, but a force is
+    # precisely a reason to act with enabled=0.
+    if not conf["enabled"] and not is_forcing and st["state"] == "idle":
         return "idle", False
 
     # --- read the meter ----------------------------------------------------
@@ -376,7 +382,34 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
         plugged=view.get("charging_state") not in (None, "Disconnected"),
         car_charging=view.get("charging_state") in solar.LIVE_CHARGING_STATES,
         period_s=conf["period_s"])
-    machine, actions = solar.advance(machine, tick, solar.policy_from(conf), tun)
+    if is_forcing:
+        # The solar machine does not run at all while forcing -- it stays
+        # idle, and force_plan decides. Note the tick is still LOGGED below:
+        # green.charged_split derives the whole solar/grid attribution from
+        # solar_ticks, and skipping the log would make a forced overnight
+        # charge invisible to the ledger and to "miles added today".
+        actions, started_next = solar.force_plan(
+            state=st["state"], location=location, plugged=tick.plugged,
+            car_charging=tick.car_charging,
+            amps_actual=int(view.get("amps_actual") or 0),
+            amps_max=tun.max_a, force_started=bool(st["force_started"]))
+        machine = solar.Machine()
+        if started_next != bool(st["force_started"]):
+            solar.save_state(db, vin, force_started=int(started_next))
+        if solar.force_expired(
+                force_charge_until=conf["force_charge_until"], now=now_ts,
+                car_charging=tick.car_charging,
+                force_started=bool(st["force_started"])):
+            _log("force charge expired; restoring and returning to solar")
+            await _restore(client, db, vin, st, view)
+            solar.save_state(db, vin, force_started=0)
+            # solar_config is the WEB APP's table (see save_config's comment).
+            # This is the one collector write to it, and it is deliberate:
+            # nothing else can observe midnight. Keep it to this single field.
+            solar.save_config(db, force_charge_until=None)
+            actions = []
+    else:
+        machine, actions = solar.advance(machine, tick, solar.policy_from(conf), tun)
 
     # Without a known original amps there is nothing to restore to, and both
     # restore paths would silently no-op forever. Refuse to engage rather
@@ -445,6 +478,28 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
                 solar.save_state(db, vin, **solar.machine_fields(
                     solar.Machine(state="stopped", hold_s=0)))
                 return "stopped", False
+        elif action == "force_start":
+            # Record the restorable original BEFORE touching anything, the
+            # same invariant charge_start holds above: without a known
+            # original there is nothing to restore to and both restore paths
+            # silently no-op forever.
+            if view.get("charge_amps") is None:
+                _log("charge_amps unknown; refusing to force without a "
+                     "restorable original")
+                break
+            if not st["dirty"]:
+                solar.save_state(db, vin, dirty=1,
+                                 original_amps=view.get("charge_amps"),
+                                 engaged_at=int(now_ts))
+                st = solar.load_state(db, vin)
+            if not await _command(client, vin, "charge_start"):
+                _log("forced charge_start refused")
+                break
+
+        elif action == "force_amps":
+            await _command(client, vin, "set_charging_amps",
+                           charging_amps=tun.max_a)
+
         elif action == "adopt":
             # Taking over a charge the CAR started, not us -- issue no
             # charge_start (it is already running), but record the originals
@@ -759,6 +814,10 @@ async def garage_scheduled_close_tick(db, vin: str, cfg: dict, tz: str) -> None:
 # once, and checking more often just spends requests discovering nothing.
 SITE_INGEST_INTERVAL_S = 3600
 
+# A wake is $0.02, 20x a command. A car that refuses to wake must not be
+# asked every tick until midnight.
+FORCE_WAKE_MIN_S = 300
+
 
 async def ingest_site_meters(client, db, site_id, cfg, now: float) -> int:
     """Advance the site energy counters by any days that have CLOSED.
@@ -839,6 +898,7 @@ async def run(once: bool = False) -> int:
     last_sleep_s = 60
     # Runs on first pass, then hourly.
     last_site_ingest = 0.0
+    last_force_wake = 0.0
     try:
         try:
             vin = await client.resolve_vin()
@@ -865,7 +925,8 @@ async def run(once: bool = False) -> int:
         while True:
             conf = solar.load_config(store._db)
             st = solar.load_state(store._db, vin)
-            solar_wanted = bool(conf["enabled"]) or bool(st["dirty"])
+            solar_wanted = (bool(conf["enabled"]) or bool(st["dirty"])
+                            or solar.forcing(conf, time.time()))
 
             if time.time() - last_site_ingest >= SITE_INGEST_INTERVAL_S:
                 last_site_ingest = time.time()
@@ -893,8 +954,13 @@ async def run(once: bool = False) -> int:
             # Gated on the machine being idle or stopped, matching
             # solar_tick's own guard: once engaged we need a real view, and
             # the wake we just issued will supply one on the next pass.
+            # A forced charge must WAKE a sleeping car, not watch it: the
+            # meter-only watch deliberately makes no vehicle call, and force
+            # mode needs one.
             watching = False
-            if (car_state != "online" and solar_wanted and site_id is not None
+            if (car_state != "online" and solar_wanted
+                    and not solar.forcing(conf, time.time())
+                    and site_id is not None
                     and st["state"] in ("idle", "stopped")):
                 snap = store.snapshot(vin)
                 watching = solar.sleeping_candidate(
@@ -926,6 +992,33 @@ async def run(once: bool = False) -> int:
                 # Nothing to retry against; launchd will restart us later.
                 _log(f"auth lost: {exc}")
                 return 1
+
+            # A forced charge must WAKE a sleeping car. The meter-only watch
+            # is disabled while forcing (above) precisely so we land here --
+            # but poll_once returns no view for a sleeping car, and the tick
+            # gate below would then skip the tick entirely.
+            #
+            # Rate-limited AND counted against the cap: this is the most
+            # expensive request this system makes, and a car that will not
+            # wake must not be asked every tick until midnight.
+            if (solar.forcing(conf, time.time()) and view is None
+                    and time.time() - last_force_wake >= FORCE_WAKE_MIN_S):
+                last_force_wake = time.time()
+                today = datetime.now(
+                    ZoneInfo(settings.timezone)).strftime("%Y-%m-%d")
+                _, capped = solar.count_request(store._db, vin, today)
+                if capped:
+                    _log("force wake skipped: daily request cap reached")
+                else:
+                    _log("force charge: waking the car")
+                    try:
+                        await client.wake_up(vin)
+                    except (TeslaAPIError, TeslaAuthError, httpx.HTTPError,
+                            OSError) as exc:
+                        _log(f"force wake failed: {exc}")
+                    else:
+                        car_state, view = await poll_once(
+                            client, store, vin, settings)
 
             # Task 17b: independent of solar entirely -- neither gated on
             # solar_wanted nor on recovery, and the scheduled close runs
@@ -984,8 +1077,12 @@ async def run(once: bool = False) -> int:
 
             soc = (view or {}).get("soc")
             _log(f"{car_state}" + (f" soc={soc}%" if soc is not None else ""))
+            # Force mode is not waiting for surplus, and must not be stood
+            # down after dark -- which is when a forced charge almost always
+            # runs.
             waiting_for_surplus = bool(
                 solar_wanted
+                and not solar.forcing(conf, time.time())
                 and (watching
                      or solar.load_state(store._db, vin)["state"]
                      in ("idle", "stopped")))

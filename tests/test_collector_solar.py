@@ -2555,3 +2555,157 @@ async def test_already_charging_is_recognised_through_the_proxys_prose():
 
     assert await collector._command(
         _WrappedAmps(), "VIN1", "set_charging_amps", charging_amps=15) is False
+
+
+class _NightImportClient:
+    """2 kW of import and no sun -- the exact condition that makes the solar
+    machine stop a charge. A forced charge must survive it.
+
+    Accepting a set_charging_amps updates the view it was given, because a
+    real car does: should_refresh_view() returns True on the tick after any
+    write, so the loop always re-reads vehicle_data before deciding again. A
+    frozen view would make the controller look like it re-commands forever
+    when what it is really doing is waiting for the car to catch up.
+    """
+
+    def __init__(self, view=None):
+        self.commands = []
+        self.view = view
+
+    async def _get(self, path, ttl=0):
+        return {"grid_power": 2000.0, "solar_power": 0.0}
+
+    async def command(self, vin, name, params):
+        self.commands.append((name, dict(params)))
+        if name == "set_charging_amps" and self.view is not None:
+            self.view["amps_actual"] = params["charging_amps"]
+            self.view["charge_amps"] = params["charging_amps"]
+        return 200, {"response": {"result": True}}
+
+    async def wake_up(self, vin):
+        raise AssertionError("the car was already online")
+
+
+@pytest.mark.asyncio
+async def test_a_forced_charge_survives_ticks_that_solar_would_have_killed(
+    tmp_path, monkeypatch,
+):
+    """THE regression this whole feature exists to prevent.
+
+    With enabled=1 and no force, a night-time tick ADOPTS the running charge
+    (solar.py:315-323), writes set_amps against a negative surplus, breaches
+    the floor within two ticks, transits grace and issues charge_stop --
+    about four billed commands to end exactly where it began.
+
+    With force live, four ticks of the same heavy import must issue no
+    charge_stop at all.
+    """
+    monkeypatch.setattr(tesla, "proxy_up", lambda url: True)
+
+    store_ = Store(tmp_path / "car.db")
+    db = store_._db
+    solar.save_config(db, enabled=1,
+                      force_charge_until=int(time.time()) + 3600)
+    home.save(db, 40.0, -105.0, 100)
+    solar.save_state(db, "VIN1", state="idle")
+
+    view = {
+        "charging_state": "Charging", "amps_actual": 5, "amps_max": 48,
+        "volts": 240, "charge_amps": 24, "soc": 55, "limit": 80,
+        "lat": 40.0, "lon": -105.0,
+        "fast_charger_present": False, "fast_charger": None,
+    }
+    client = _NightImportClient(view)
+    cfg = SimpleNamespace(timezone="America/Denver",
+                          proxy_url="https://localhost:4443")
+
+    for _ in range(4):
+        await collector.solar_tick(client, store_, "VIN1", view, cfg, site_id=1)
+
+    names = [c[0] for c in client.commands]
+    assert "charge_stop" not in names, (
+        f"force mode let the solar machine stop the charge: {client.commands}")
+
+    # The car was sitting at the controller's 5 A floor; force must lift it.
+    amps = [c[1]["charging_amps"] for c in client.commands
+            if c[0] == "set_charging_amps"]
+    assert amps and amps[0] == 48, (
+        f"expected a lift to amps_max, got {amps}")
+    assert len(amps) == 1, (
+        f"amps rewritten every tick instead of once: {amps}")
+
+    assert solar.load_state(db, "VIN1")["force_started"] == 1, (
+        "the latch never set, so the mode will expire on the next tick")
+    store_.close()
+
+
+class _AsleepLoopClient:
+    """A car that never wakes, and a meter showing heavy import. Records
+    every wake attempt."""
+
+    def __init__(self, wakes: list[float]):
+        self.wakes = wakes
+
+    async def resolve_vin(self):
+        return "VIN1"
+
+    async def energy_sites(self):
+        return [{"energy_site_id": 1}]
+
+    async def vehicle(self, vin):
+        return {"state": "asleep"}
+
+    async def vehicle_data(self, vin, *a, **k):
+        raise AssertionError("a sleeping car must not be read")
+
+    async def wake_up(self, vin):
+        self.wakes.append(time.time())
+        return {"state": "asleep"}      # refuses to come online
+
+    async def _get(self, path, ttl=0):
+        return {"grid_power": 2000.0, "solar_power": 0.0}
+
+    async def aclose(self):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_forcing_wakes_a_sleeping_car_at_most_once_per_window(
+    monkeypatch, tmp_path,
+):
+    """Without the wake, "charge my car up" at 2 a.m. fails SILENTLY all
+    night: the meter-only watch is disabled while forcing, poll_once returns
+    no view for a sleeping car, and the tick gate skips the tick entirely.
+
+    The rate limit is the other half of it. A wake is $0.02 against a
+    $10/month credit, and a car that will not wake must not be asked again
+    every tick until midnight.
+    """
+    wakes: list[float] = []
+    db_path = tmp_path / "car.db"
+
+    seed = Store(db_path)
+    solar.save_config(seed._db, enabled=1,
+                      force_charge_until=int(time.time()) + 3600)
+    home.save(seed._db, 40.0, -105.0, 100)
+    seed.close()
+
+    monkeypatch.setattr(collector.settings, "db_file", db_path)
+    monkeypatch.setattr(collector, "TeslaClient",
+                        lambda settings: _AsleepLoopClient(wakes))
+
+    sleep_count = 0
+
+    async def fake_sleep(seconds):
+        nonlocal sleep_count
+        sleep_count += 1
+        if sleep_count >= 5:
+            raise StopTest()
+    monkeypatch.setattr(collector.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(StopTest):
+        await collector.run()
+
+    assert len(wakes) == 1, (
+        f"5 ticks inside one {collector.FORCE_WAKE_MIN_S}s window issued "
+        f"{len(wakes)} wakes; each one is $0.02")
