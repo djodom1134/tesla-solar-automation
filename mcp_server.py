@@ -49,7 +49,12 @@ mcp = MCPServer("tesla")
 PERIODS = {
     "today": ("since local midnight", lambda now: solar_routes._midnight_ts()),
     "week":  ("rolling 7 days", lambda now: int(now) - 7 * 86400),
-    "all":   ("lifetime", lambda now: 0),
+    # NOT "lifetime". The controller's tick log is young -- days old on this
+    # install -- while the car has tens of thousands of miles on it. Labelling
+    # a week "lifetime" invited exactly the reading it got: "70.4 miles total"
+    # taken as the whole life of the vehicle. The real start date is
+    # substituted below, from the first tick actually on record.
+    "all":   ("since the first recorded tick", lambda now: 0),
 }
 
 READ_TOOLS = ("get_car_status", "get_charging_summary", "get_solar_status",
@@ -111,13 +116,30 @@ async def get_charging_summary(period: str = "today") -> dict[str, Any]:
     db = solar_routes.store()._db
     vin = solar_routes._vin()
 
-    ticks = solar_routes._solar_ticks(db, vin, since_of(now))
+    since = since_of(now)
+    ticks = solar_routes._solar_ticks(db, vin, since)
     last_ts = solar.last_tick_ts(db, vin) if vin else None
     state = solar.load_state(db, vin) if vin else dict(solar.STATE_DEFAULTS)
     conf = solar.load_config(db)
 
+    # The earliest tick this window actually contains. A window is only as
+    # old as the record behind it: "rolling 7 days" over a log that began
+    # three days ago describes three days, and saying otherwise invites the
+    # reader to divide by the wrong number.
+    row = db.execute(
+        "SELECT MIN(ts) AS first FROM solar_ticks WHERE vin = ? AND ts >= ?",
+        (vin, since)).fetchone() if vin else None
+    window_start = row["first"] if row and row["first"] else None
+    if window_start:
+        started = datetime.fromtimestamp(
+            window_start, ZoneInfo(settings.timezone)).strftime("%Y-%m-%d")
+        days = max(1, int((now - window_start) / 86400))
+        label = (f"{label} ({started}, {days} day{'s' if days != 1 else ''} "
+                 "of recorded history)")
+
     common = {
         "window": label,
+        "window_start_ts": window_start,
         # How many controller ticks were actually LOGGED in this window. The
         # denominator behind every figure below, exposed because zero of them
         # and a quiet day are different claims that used to look identical.

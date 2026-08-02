@@ -277,3 +277,21 @@ async def test_a_quiet_controller_overnight_does_not_read_as_a_broken_collector(
         assert "collector" in out["stale_reason"].lower()
         assert "running" in out["stale_reason"].lower() or \
                "alive" in out["stale_reason"].lower()
+
+
+@pytest.mark.asyncio
+async def test_all_does_not_claim_to_be_the_cars_lifetime(monkeypatch):
+    """"lifetime" was reported beside a car with 55,946 miles on the
+    odometer, for a tick log that began seven days earlier -- so "70.4 miles
+    total, 43.1 from solar" read as the whole life of the vehicle. The window
+    must name the date it actually starts from."""
+    monkeypatch.setattr(solar_routes, "_vin", lambda: "VIN1")
+    midnight = solar_routes._midnight_ts()
+    _seed_ticks([(midnight + 60, 5000.0, -3000.0)])
+
+    out = await mcp_server.CALLABLES["get_charging_summary"](period="all")
+    assert "lifetime" not in out["window"].lower(), (
+        f"still claims lifetime: {out['window']!r}")
+    assert out["window_start_ts"], "no start date to anchor the window"
+    assert str(mcp_server.datetime.fromtimestamp(
+        out["window_start_ts"]).year) in out["window"]
