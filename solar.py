@@ -34,6 +34,8 @@ from __future__ import annotations
 import sqlite3
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 # charger_voltage reads 2 (not 0) when idle, so power is only meaningful in
 # these two states -- docs/tesla-field-reference.md:97.
@@ -383,6 +385,99 @@ def advance(m: Machine, t: Tick, pol: Policy, tun: Tunables) -> tuple[Machine, l
     return Machine(state="stopped", hold_s=m.hold_s + t.period_s), []
 
 
+# --- charge_mode: the "now" override ---------------------------------------
+#
+# advance() above cannot express "charge regardless of the sun". With
+# enabled=1 an externally started charge lands in idle with car_charging=True,
+# is ADOPTED, has set_amps written against a negative night surplus, breaches
+# the floor within two ticks, transits grace and stops -- about four billed
+# commands to end exactly where it began. So force mode does not run advance()
+# at all; it runs force_plan() instead, and the solar machine stays idle
+# throughout.
+#
+# Mode is DERIVED, never stored: `enabled` keeps its exact meaning, so every
+# existing test, the HA switch and the setup page stay correct.
+
+
+def forcing(conf: dict, now: float) -> bool:
+    """Whether a force is live right now.
+
+    Compared against the clock, never merely tested for presence: the column
+    is cleared by the collector on its next tick, so between expiry and that
+    tick the timestamp is still there and still in the past.
+    """
+    until = conf.get("force_charge_until")
+    return bool(until) and now < until
+
+
+def charge_mode(conf: dict, now: float) -> str:
+    """"now" | "solar" | "off"."""
+    if forcing(conf, now):
+        return "now"
+    return "solar" if conf["enabled"] else "off"
+
+
+def next_midnight_ts(tz: str, now: float) -> int:
+    """The next local midnight strictly after `now`.
+
+    Adding a day to the aware datetime BEFORE replacing the time-of-day is
+    what makes this correct across a DST boundary: replace-then-add would
+    build a wall-clock midnight that does not exist on a spring-forward day.
+    """
+    zone = ZoneInfo(tz)
+    tomorrow = datetime.fromtimestamp(now, zone) + timedelta(days=1)
+    return int(tomorrow.replace(hour=0, minute=0, second=0,
+                                microsecond=0).timestamp())
+
+
+def force_plan(*, state: str, location: str, plugged: bool,
+               car_charging: bool, amps_actual: int, amps_max: int,
+               force_started: bool) -> tuple[list[str], bool]:
+    """What to do this tick while charge_mode is "now". Pure.
+
+    Returns (actions, force_started_next). Actions are names, not calls --
+    collector.py performs them, exactly as with advance().
+
+    Order matters. The unknown-location freeze comes first for the same
+    reason it does in advance(): Tesla OMITS location keys rather than
+    nulling them, so "scope revoked", "sharing off" and "genuinely elsewhere"
+    are indistinguishable, and none of them is grounds to command a car.
+
+    The hand-off comes second. The solar controller may be mid-engagement,
+    holding the car at its 5 A floor with `dirty` set and `original_amps`
+    recorded. Forcing on top of that would overwrite the amps the restore
+    path exists to put back.
+    """
+    if location == "unknown":
+        return [], force_started
+    if state != "idle":
+        return ["restore"], force_started
+    if not plugged or location != "home":
+        return [], force_started
+    if car_charging:
+        # Only write when the car is not already where we want it. The
+        # controller's own "already holds this value" suppression, applied
+        # here: steady state is zero commands per tick, not one every 120 s.
+        actions = [] if amps_actual >= amps_max else ["force_amps"]
+        return actions, True
+    if force_started:
+        # It ran and has stopped -- reaching the limit reports Complete.
+        # Do NOT restart it: that would fight the owner's own stop forever.
+        # force_expired() turns this into the expiry.
+        return [], True
+    return ["force_start", "force_amps"], False
+
+
+def force_expired(*, force_charge_until: int | None, now: float,
+                  car_charging: bool, force_started: bool) -> bool:
+    """Whether the force should end now. Pure."""
+    if not force_charge_until:
+        return False
+    if now >= force_charge_until:
+        return True
+    return bool(force_started) and not car_charging
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS solar_config (
   id                INTEGER PRIMARY KEY CHECK (id = 1),
@@ -417,6 +512,11 @@ CREATE TABLE IF NOT EXISTS solar_config (
   view_refresh_ticks INTEGER NOT NULL DEFAULT 5,
   deadline_soc      INTEGER,
   deadline_hour     INTEGER,
+  -- charge_mode = "now": a unix timestamp the force expires at, NULL when
+  -- not forcing. A TIMESTAMP rather than a flag plus a day-stamp, so an app
+  -- that is down at midnight expires late on its next tick instead of
+  -- missing the rollover entirely.
+  force_charge_until  INTEGER,
   -- Task 17b: the ratgdo garage opener. garage_close_hour is NULL = off, the
   -- same "absence means disabled" convention as deadline_hour above.
   garage_url          TEXT,
@@ -466,6 +566,11 @@ CREATE TABLE IF NOT EXISTS solar_state (
   -- for the scheduled close, same convention as requests_day above.
   garage_armed          INTEGER NOT NULL DEFAULT 0,
   garage_last_close_day TEXT,
+  -- Have we yet OBSERVED the forced charge running? Right after charge_start
+  -- the car reports Starting, or briefly still Stopped, so "not charging" is
+  -- not evidence of an ended charge until this is set. Without it the mode
+  -- expires on its own first tick.
+  force_started         INTEGER NOT NULL DEFAULT 0,
   -- Task 18: the banked-solar ledger. solar_soc is percentage points of the
   -- CURRENT soc that came from the sun (see green.ledger_step) -- a stock,
   -- not a flow, tracked in SoC space so it needs no pack size and no
@@ -518,6 +623,7 @@ CONFIG_DEFAULTS = {
     "deadline_soc": None, "deadline_hour": None,
     "garage_url": None, "garage_auto_open": 0, "garage_ring_m": 800,
     "garage_close_hour": None, "garage_close_warn_s": 8,
+    "force_charge_until": None,
 }
 
 STATE_DEFAULTS = {
@@ -529,6 +635,7 @@ STATE_DEFAULTS = {
     "capped": 0, "engaged_at": None,
     "consecutive_429s": 0, "backoff_s": 0,
     "garage_armed": 0, "garage_last_close_day": None,
+    "force_started": 0,
     "solar_soc": 0.0, "ledger_soc": None, "ledger_stale": 0,
     "free_miles_driven": 0.0, "tracked_miles": 0.0, "ledger_odo": None,
     "free_miles_since": None,
@@ -579,6 +686,9 @@ STATE_NEW_COLUMNS = (
     # age would report the collector dead every night.
     ("heartbeat_ts", "INTEGER"),
     ("heartbeat_sleep_s", "INTEGER"),
+    # charge_mode "now": the latch that stops the force expiring on its own
+    # first tick -- see the SCHEMA comment above.
+    ("force_started", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 
@@ -610,6 +720,8 @@ CONFIG_NEW_COLUMNS = (
     ("import_rate", "REAL"),
     ("export_rate", "REAL"),
     ("watch_s", "INTEGER NOT NULL DEFAULT 300"),
+    # charge_mode "now": when the force expires -- see the SCHEMA comment.
+    ("force_charge_until", "INTEGER"),
 )
 
 
