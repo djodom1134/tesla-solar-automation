@@ -36,6 +36,13 @@ router = APIRouter(prefix="/api/car")
 
 _store: Store | None = None
 
+# A wake is $0.02 against a $10/month credit -- 20x a command. One per
+# minute is generous for a human pressing a button and closes a held-down
+# key or a retrying client. Process-local by design: this guards the cost of
+# an impulse, and a restart is not an impulse.
+_last_wake_ts: float = 0.0
+WAKE_MIN_INTERVAL_S = 60
+
 
 def store() -> Store:
     global _store
@@ -156,6 +163,12 @@ async def car_wake() -> dict[str, Any]:
     if DEMO:
         return {"state": "online"}
     vin = await _vin()
+    global _last_wake_ts
+    since = time.time() - _last_wake_ts
+    if since < WAKE_MIN_INTERVAL_S:
+        raise HTTPException(
+            429, f"wake rate-limited; retry in {int(WAKE_MIN_INTERVAL_S - since)}s")
+    _last_wake_ts = time.time()
     _spend(vin)
     result = await _client().wake_up(vin)
     return {"state": (result or {}).get("state", "unknown")}
@@ -207,6 +220,15 @@ async def car_command(cmd_id: str, payload: dict[str, Any] = Body(default={})):
                 "the vehicle_location scope is granted.",
             )
         body = {**body, "lat": lat, "lon": lon}
+
+    # Counted BEFORE the call, exactly as _spend's docstring requires: a
+    # request about to be made is already committed, and counting on the way
+    # back would let a hung call be retried past the cap for free.
+    #
+    # AFTER the needs_location block, though, not before it: that block
+    # refuses locally with a 400 and never reaches Tesla, so counting above
+    # it would drain the cap for requests that were never billed.
+    _spend(vin)
 
     status, raw = await _client().command(vin, cmd_id, body)
     result = command_catalog.interpret(status, raw)

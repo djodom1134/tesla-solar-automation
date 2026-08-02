@@ -1,4 +1,5 @@
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 import app as app_module
@@ -168,6 +169,9 @@ def test_trigger_homelink_injects_lat_lon_from_the_snapshot(monkeypatch):
     )
     fake_client = _FakeClientCommand()
     monkeypatch.setattr(car_routes, "_client", lambda: fake_client)
+    # A command now books against the daily cap, and _FakeStoreWithView has
+    # no sqlite connection for count_request to write through.
+    monkeypatch.setattr(car_routes, "_spend", lambda vin: None)
 
     client = _client(app_module.app)
     resp = client.post("/api/car/command/trigger_homelink", json={})
@@ -366,6 +370,9 @@ def test_wake_counts_against_the_daily_cap_and_refuses_when_tripped(monkeypatch,
     monkeypatch.setattr(car_routes, "_client", lambda: _Client())
     monkeypatch.setattr(car_routes, "store", lambda: st)
     monkeypatch.setattr(car_routes.settings, "vin", "VIN1")
+    # This test is about the daily cap, not the one-per-minute wake limit;
+    # three wakes back to back would otherwise trip the latter first.
+    monkeypatch.setattr(car_routes, "WAKE_MIN_INTERVAL_S", 0)
 
     import asyncio
     # Two wakes fit inside a cap of 3; the third trips it.
@@ -386,3 +393,54 @@ def test_wake_counts_against_the_daily_cap_and_refuses_when_tripped(monkeypatch,
         "over the cap, a wake must be refused rather than billed")
     assert len(woke) == 2, "the refused wake must never have touched the car"
     st.close()
+
+
+async def _fake_vin():
+    return "5YJSA00000F000000"
+
+
+class _FakeClient:
+    def __init__(self):
+        self.cache = _FakeCache()
+
+    async def command(self, vin, cmd_id, body):
+        return 200, {"response": {"result": True}}
+
+    async def wake_up(self, vin):
+        return {"state": "online"}
+
+
+def _fake_client():
+    return _FakeClient()
+
+
+@pytest.mark.asyncio
+async def test_a_command_is_counted_against_the_daily_cap(monkeypatch):
+    """The cap guarded only the collector. POST /api/car/command/{id} spent
+    entirely outside it, so requests_today reported a comfortable number
+    while the budget drained through a door it did not watch."""
+    spent = []
+    monkeypatch.setattr(car_routes, "_spend", lambda vin: spent.append(vin))
+    monkeypatch.setattr(car_routes, "DEMO", False)
+    monkeypatch.setattr(car_routes, "_vin", _fake_vin)
+    monkeypatch.setattr(car_routes, "_client", _fake_client)
+
+    await car_routes.car_command("flash_lights", {})
+    assert spent == ["5YJSA00000F000000"], "the command did not book a request"
+
+
+@pytest.mark.asyncio
+async def test_a_second_wake_inside_the_window_is_refused(monkeypatch):
+    """A wake is $0.02 -- the most expensive request this system makes --
+    against a $10/month credit. Nothing stopped a button from being held
+    down."""
+    monkeypatch.setattr(car_routes, "_spend", lambda vin: None)
+    monkeypatch.setattr(car_routes, "DEMO", False)
+    monkeypatch.setattr(car_routes, "_vin", _fake_vin)
+    monkeypatch.setattr(car_routes, "_client", _fake_client)
+    monkeypatch.setattr(car_routes, "_last_wake_ts", 0.0)
+
+    await car_routes.car_wake()
+    with pytest.raises(HTTPException) as exc:
+        await car_routes.car_wake()
+    assert exc.value.status_code == 429
