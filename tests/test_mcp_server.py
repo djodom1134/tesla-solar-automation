@@ -172,3 +172,28 @@ async def test_solar_status_states_how_old_its_numbers_are(monkeypatch):
     out = await mcp_server.CALLABLES["get_solar_status"]()
     assert "data_age_s" in out
     assert "stale" in out, "the judgement itself, not just the raw seconds"
+
+
+# --- transport security: reachable from the LAN, still not from anywhere ---
+
+def test_the_streamable_app_accepts_the_configured_host():
+    """The MCP SDK enables DNS-rebinding protection with an allow-list that
+    defaults to 127.0.0.1 only, so a LAN client got 421 Misdirected Request
+    -- "Invalid Host header: 192.168.87.56:8000". Loopback-only testing hid
+    it completely, and the whole point of this endpoint is that Claude
+    Desktop on another machine can reach the mini."""
+    hosts = mcp_server._allowed_hosts()
+    assert "127.0.0.1" in hosts and "localhost" in hosts
+    assert any(h.endswith(":8000") or ":" in h for h in hosts), (
+        "the Host header carries the port, so bare hostnames do not match")
+
+
+def test_extra_hosts_come_from_configuration_not_a_wildcard(monkeypatch):
+    """Rebinding protection stays ON. The owner names the addresses; this
+    never degrades to allow-anything, which would be the easy wrong fix."""
+    monkeypatch.setattr(mcp_server.settings, "mcp_allowed_hosts",
+                        "192.168.87.56:8000, mini.local:8000")
+    hosts = mcp_server._allowed_hosts()
+    assert "192.168.87.56:8000" in hosts
+    assert "mini.local:8000" in hosts
+    assert "*" not in hosts

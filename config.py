@@ -94,6 +94,13 @@ class Settings:
     api_token: str = field(default_factory=lambda: _clean(os.getenv("API_TOKEN")))
     api_token_ha: str = field(default_factory=lambda: _clean(os.getenv("API_TOKEN_HA")))
     api_token_mcp: str = field(default_factory=lambda: _clean(os.getenv("API_TOKEN_MCP")))
+    # Extra Host header values /mcp will answer to, comma-separated, each
+    # WITH its port (the Host header carries one). The MCP SDK's DNS-rebinding
+    # protection allows 127.0.0.1 only by default, which 421s every LAN
+    # client -- and reaching this box from another machine is the entire
+    # point. Named explicitly rather than wildcarded: the guard stays on.
+    mcp_allowed_hosts: str = field(
+        default_factory=lambda: _clean(os.getenv("MCP_ALLOWED_HOSTS")))
 
     @property
     def api_base(self) -> str:

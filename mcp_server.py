@@ -29,12 +29,14 @@ from typing import Any
 # is the same shape the plan assumed: .tool(), .session_manager and
 # .streamable_http_app() all behave as before.
 from mcp.server import MCPServer
+from mcp.server.transport_security import TransportSecuritySettings
 
 import car_routes
 import green
 import ha_routes
 import solar
 import solar_routes
+from config import settings
 
 mcp = MCPServer("tesla")
 
@@ -300,8 +302,34 @@ async def wake_car() -> dict[str, Any]:
 CALLABLES["wake_car"] = wake_car
 
 
+def _allowed_hosts() -> list[str]:
+    """Host header values /mcp will answer to.
+
+    The SDK ships DNS-rebinding protection on, with an allow-list that in
+    practice means 127.0.0.1. A request from another machine arrives with
+    `Host: 192.168.x.y:8000` and is refused 421 Misdirected Request -- which
+    is exactly the case this endpoint exists for, Claude Desktop on a laptop
+    talking to the box that holds the data.
+
+    So the list is EXTENDED, never disabled: loopback plus whatever the owner
+    names in MCP_ALLOWED_HOSTS. The Host header includes the port, so each
+    entry needs one. A wildcard is deliberately not supported -- the token is
+    the primary defence, and this is the cheap second one.
+    """
+    port = settings.port
+    hosts = [f"127.0.0.1:{port}", f"localhost:{port}", "127.0.0.1", "localhost"]
+    for extra in settings.mcp_allowed_hosts.split(","):
+        extra = extra.strip()
+        if extra and extra not in hosts:
+            hosts.append(extra)
+    return hosts
+
+
 # Built once, at import, because app.py mounts it at import and the session
 # manager behind it may be run only once per instance. streamable_http_path
 # is "/" rather than the SDK's default "/mcp": the mount already supplies
 # that prefix, and leaving the default would serve the endpoint at /mcp/mcp.
-http_app = mcp.streamable_http_app(streamable_http_path="/")
+http_app = mcp.streamable_http_app(
+    streamable_http_path="/",
+    transport_security=TransportSecuritySettings(allowed_hosts=_allowed_hosts()),
+)
