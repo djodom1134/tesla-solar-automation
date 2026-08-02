@@ -18,6 +18,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
+import auth
 import car_routes
 import demo
 import energy
@@ -63,6 +64,7 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Tesla Energy Dashboard", lifespan=lifespan)
+auth.install(app)
 
 
 @app.exception_handler(TeslaAuthError)

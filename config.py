@@ -88,6 +88,13 @@ class Settings:
     )
     currency: str = field(default_factory=lambda: _clean(os.getenv("CURRENCY")) or "USD")
 
+    # Three separate secrets so each consumer rotates independently: the
+    # browser UI, Home Assistant, and the MCP endpoint. A leaked HA token
+    # must not also be an MCP credential.
+    api_token: str = field(default_factory=lambda: _clean(os.getenv("API_TOKEN")))
+    api_token_ha: str = field(default_factory=lambda: _clean(os.getenv("API_TOKEN_HA")))
+    api_token_mcp: str = field(default_factory=lambda: _clean(os.getenv("API_TOKEN_MCP")))
+
     @property
     def api_base(self) -> str:
         if self.region not in REGIONS:

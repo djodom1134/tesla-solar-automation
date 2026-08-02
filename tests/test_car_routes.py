@@ -1,10 +1,27 @@
+import pytest
 from fastapi.testclient import TestClient
 
 import app as app_module
+import auth
 import car_routes
 import demo
 import store
 from tesla import TeslaAuthError
+
+TEST_TOKEN = "test-token"
+
+
+@pytest.fixture(autouse=True)
+def _api_token(monkeypatch):
+    """auth.install() guards /api/* for any client that is not on loopback,
+    and starlette 0.41's TestClient reports its host as "testclient". The
+    `client=("127.0.0.1", …)` kwarg that would let us claim loopback does not
+    exist in this version, so these tests present the token instead."""
+    monkeypatch.setattr(auth.settings, "api_token", TEST_TOKEN)
+
+
+def _client(app):
+    return TestClient(app, headers={"X-Api-Key": TEST_TOKEN})
 
 
 class _FakeStore:
@@ -91,7 +108,7 @@ def test_ranges_cover_the_ui_options():
 
 
 def test_demo_state_is_live_and_shaped():
-    client = TestClient(app_module.app)
+    client = _client(app_module.app)
     body = client.get("/api/car/state").json()
     assert body["car_state"] == "online"
     assert body["source"] == "live"
@@ -100,7 +117,7 @@ def test_demo_state_is_live_and_shaped():
 
 
 def test_demo_history_has_rows_and_a_gap():
-    client = TestClient(app_module.app)
+    client = _client(app_module.app)
     body = client.get("/api/car/history?range=7d").json()
     assert len(body["rows"]) > 10
     assert any(r["gap"] for r in body["rows"]), "demo history must exercise sleep gaps"
@@ -108,7 +125,7 @@ def test_demo_history_has_rows_and_a_gap():
 
 
 def test_history_rejects_an_unknown_range():
-    client = TestClient(app_module.app)
+    client = _client(app_module.app)
     assert client.get("/api/car/history?range=nope").status_code == 400
 
 
@@ -120,7 +137,7 @@ def test_health_reports_not_authenticated_distinctly(monkeypatch):
     monkeypatch.setattr(car_routes, "_proxy_up", lambda: False)
     monkeypatch.setattr(car_routes, "_client", lambda: _FakeClientNotAuthenticated())
 
-    client = TestClient(app_module.app)
+    client = _client(app_module.app)
     body = client.get("/api/car/health").json()
     assert body["auth_error"] == "not_authenticated"
     assert body["scopes"] == []
@@ -135,7 +152,7 @@ def test_health_reports_scopes_decode_failure_distinctly(monkeypatch):
     monkeypatch.setattr(car_routes, "_proxy_up", lambda: False)
     monkeypatch.setattr(car_routes, "_client", lambda: _FakeClientBadToken())
 
-    client = TestClient(app_module.app)
+    client = _client(app_module.app)
     body = client.get("/api/car/health").json()
     assert body["auth_error"] == "scopes_decode_failed"
     assert body["scopes"] == []
@@ -152,7 +169,7 @@ def test_trigger_homelink_injects_lat_lon_from_the_snapshot(monkeypatch):
     fake_client = _FakeClientCommand()
     monkeypatch.setattr(car_routes, "_client", lambda: fake_client)
 
-    client = TestClient(app_module.app)
+    client = _client(app_module.app)
     resp = client.post("/api/car/command/trigger_homelink", json={})
 
     assert resp.status_code == 200
@@ -171,7 +188,7 @@ def test_trigger_homelink_refuses_with_no_snapshot(monkeypatch):
     fake_client = _FakeClientCommand()
     monkeypatch.setattr(car_routes, "_client", lambda: fake_client)
 
-    client = TestClient(app_module.app)
+    client = _client(app_module.app)
     resp = client.post("/api/car/command/trigger_homelink", json={})
 
     assert resp.status_code == 400
@@ -191,7 +208,7 @@ def test_trigger_homelink_refuses_when_lat_lon_are_none(monkeypatch):
     fake_client = _FakeClientCommand()
     monkeypatch.setattr(car_routes, "_client", lambda: fake_client)
 
-    client = TestClient(app_module.app)
+    client = _client(app_module.app)
     resp = client.post("/api/car/command/trigger_homelink", json={})
 
     assert resp.status_code == 400
@@ -219,10 +236,9 @@ def test_app_javascript_is_served_no_store():
     the server and the disk were byte-identical and correct while the page
     ran code from an earlier deploy.
     """
-    from fastapi.testclient import TestClient
     import app as app_module
 
-    with TestClient(app_module.app) as client:
+    with _client(app_module.app) as client:
         for path in ("/car.js", "/car.html", "/shared.js", "/styles.css"):
             r = client.get(path)
             assert r.status_code == 200, path
@@ -236,7 +252,6 @@ def test_vendored_assets_keep_normal_caching():
     the file changes, which is approximately never, and re-fetching them on
     every load would be waste for no benefit."""
     from pathlib import Path
-    from fastapi.testclient import TestClient
     import app as app_module
 
     vendor = Path(app_module.BASE_DIR) / "static" / "vendor"
@@ -244,7 +259,7 @@ def test_vendored_assets_keep_normal_caching():
     if not files:
         pytest.skip("no vendored assets on this install")
     rel = files[0].relative_to(vendor.parent)
-    with TestClient(app_module.app) as client:
+    with _client(app_module.app) as client:
         r = client.get("/" + str(rel))
         assert r.status_code == 200
         assert "no-store" not in r.headers.get("cache-control", "")
@@ -282,7 +297,7 @@ def test_history_costs_no_tesla_request(monkeypatch, tmp_path):
     monkeypatch.setattr(car_routes, "store", _HistoryStore)
     monkeypatch.setattr(car_routes.settings, "vin", "5YJSA00000F000000")
 
-    with TestClient(app_module.app) as client:
+    with _client(app_module.app) as client:
         r = client.get("/api/car/history?range=24h")
 
     assert r.status_code == 200
