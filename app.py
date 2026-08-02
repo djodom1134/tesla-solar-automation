@@ -23,6 +23,7 @@ import car_routes
 import demo
 import energy
 import ha_routes
+import mcp_server
 import solar
 import solar_routes
 from config import BASE_DIR, settings
@@ -59,7 +60,12 @@ def _new_state() -> str:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    yield
+    # The streamable-HTTP transport keeps per-session state that is created by
+    # ITS lifespan. Mounting the sub-app does not run it -- the parent owns
+    # startup -- so it must be entered here or every /mcp request fails with
+    # "session manager not initialized".
+    async with mcp_server.mcp.session_manager.run():
+        yield
     await client.aclose()
 
 
@@ -261,6 +267,19 @@ app.include_router(car_routes.router)
 app.include_router(solar_routes.router)
 # Above the static mount, like the others -- that mount is a catch-all.
 app.include_router(ha_routes.router)
+
+
+# Starlette's Mount only matches a path with something after the prefix, so a
+# bare POST /mcp falls through to the static catch-all below and comes back
+# 405 -- and /mcp with no slash is exactly what an MCP client is configured
+# with. 307 preserves both the method and the body, so the handshake survives
+# the hop. Must be declared BEFORE the mount or the mount wins.
+@app.api_route("/mcp", methods=["GET", "POST", "DELETE"], include_in_schema=False)
+async def _mcp_no_trailing_slash() -> RedirectResponse:
+    return RedirectResponse("/mcp/", status_code=307)
+
+
+app.mount("/mcp", mcp_server.http_app)
 
 class _NoStoreStatic(StaticFiles):
     """Serve the app's own files with no-store.

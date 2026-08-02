@@ -242,13 +242,16 @@ def test_app_javascript_is_served_no_store():
     """
     import app as app_module
 
-    with _client(app_module.app) as client:
-        for path in ("/car.js", "/car.html", "/shared.js", "/styles.css"):
-            r = client.get(path)
-            assert r.status_code == 200, path
-            assert "no-store" in r.headers.get("cache-control", ""), (
-                f"{path} must not be cached: a stale module is indistinguishable "
-                "from a broken deploy")
+    # No `with`: entering the app's lifespan starts the MCP session manager,
+    # which may be run only once per process, and serving a static file needs
+    # no startup at all.
+    client = _client(app_module.app)
+    for path in ("/car.js", "/car.html", "/shared.js", "/styles.css"):
+        r = client.get(path)
+        assert r.status_code == 200, path
+        assert "no-store" in r.headers.get("cache-control", ""), (
+            f"{path} must not be cached: a stale module is indistinguishable "
+            "from a broken deploy")
 
 
 def test_vendored_assets_keep_normal_caching():
@@ -263,10 +266,10 @@ def test_vendored_assets_keep_normal_caching():
     if not files:
         pytest.skip("no vendored assets on this install")
     rel = files[0].relative_to(vendor.parent)
-    with _client(app_module.app) as client:
-        r = client.get("/" + str(rel))
-        assert r.status_code == 200
-        assert "no-store" not in r.headers.get("cache-control", "")
+    client = _client(app_module.app)
+    r = client.get("/" + str(rel))
+    assert r.status_code == 200
+    assert "no-store" not in r.headers.get("cache-control", "")
 
 
 class _CountingVinClient:
@@ -301,8 +304,8 @@ def test_history_costs_no_tesla_request(monkeypatch, tmp_path):
     monkeypatch.setattr(car_routes, "store", _HistoryStore)
     monkeypatch.setattr(car_routes.settings, "vin", "5YJSA00000F000000")
 
-    with _client(app_module.app) as client:
-        r = client.get("/api/car/history?range=24h")
+    client = _client(app_module.app)
+    r = client.get("/api/car/history?range=24h")
 
     assert r.status_code == 200
     assert fake.resolve_calls == 0, (
