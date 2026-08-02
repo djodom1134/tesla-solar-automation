@@ -23,6 +23,8 @@ pick the right one.
 from __future__ import annotations
 
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Any
 
 # mcp 2.0 renamed FastMCP to MCPServer and moved it to mcp.server. The class
@@ -51,7 +53,7 @@ PERIODS = {
 }
 
 READ_TOOLS = ("get_car_status", "get_charging_summary", "get_solar_status",
-              "get_garage_status")
+              "get_home_energy", "get_garage_status")
 
 CALLABLES: dict[str, Any] = {}
 
@@ -194,13 +196,30 @@ async def get_solar_status() -> dict[str, Any]:
     # that it is history. Same principle as ha_routes.collector_running:
     # judged against the cadence in force, not a constant.
     stale = age_s is None or age_s > 3600 or not st.get("collector_running")
+    alive = bool(st.get("collector_running"))
+
+    def _why() -> str:
+        if age_s is None:
+            return "no tick has ever been recorded"
+        old = f"the last controller tick was {age_s // 3600}h {age_s % 3600 // 60}m ago"
+        if alive:
+            # The distinction that matters. Ticks are logged only while the
+            # controller is managing a charge; it stands down after dark and
+            # while the car sleeps, so an old tick overnight is NORMAL. Said
+            # plainly because a bare "stale" was read as "the collector is
+            # broken, go look at it" when it was beating perfectly.
+            return (f"{old}, but the collector IS running and beating "
+                    "normally. The controller logs ticks only while it is "
+                    "managing a charge and stands down after dark, so an old "
+                    "tick overnight is expected -- these readings are simply "
+                    "historical, not evidence of a fault")
+        return (f"{old} and the collector is NOT beating -- it may have "
+                "stopped. These readings are historical")
+
     return {
         "data_age_s": age_s,
         "stale": stale,
-        "stale_reason": None if not stale else (
-            "no tick has ever been recorded" if age_s is None else
-            f"the last controller tick was {age_s // 3600}h {age_s % 3600 // 60}m "
-            "ago; these are historical readings, not current ones"),
+        "stale_reason": None if not stale else _why(),
         "solar_w": st.get("solar_w"),
         "grid_import_w": st.get("grid_import_w"),
         "grid_export_w": st.get("grid_export_w"),
@@ -221,6 +240,101 @@ async def get_solar_status() -> dict[str, Any]:
 
 
 CALLABLES["get_solar_status"] = get_solar_status
+
+
+@mcp.tool()
+async def get_home_energy(period: str = "today") -> dict[str, Any]:
+    """WHOLE-HOUSE energy totals: solar produced, grid imported and exported,
+    and what the house consumed.
+
+    This is the tool for "how much power did the house use", "how much solar
+    did we make", "were we net positive". get_charging_summary covers only
+    the car; this covers the whole site, the car included.
+
+    `period` is "today" (calendar day so far) or "all" (since these meters
+    started -- NOT the site's lifetime, which predates them).
+    """
+    if period not in ("today", "all"):
+        raise ValueError("period must be 'today' or 'all'")
+
+    db = solar_routes.store()._db
+    now = time.time()
+    rows = {r["channel"]: r for r in db.execute(
+        "SELECT channel, cumulative_wh, closed_wh, updated_ts FROM meters")}
+
+    if not rows:
+        return {
+            "window": period, "solar_kwh": None, "grid_import_kwh": None,
+            "grid_export_kwh": None, "house_consumption_kwh": None,
+            "self_sufficiency_pct": None, "meter_day_is_today": None,
+            "meters_age_s": None,
+            "unknown_reason": (
+                "the site energy meters have never been written. They are "
+                "ingested hourly by the collector from the Powerwall's own "
+                "history; nothing has been measured yet."),
+        }
+
+    updated = max(int(r["updated_ts"] or 0) for r in rows.values())
+    # Is the stored partial-day actually TODAY's? cumulative minus closed is
+    # "today so far" only while the meter has been refreshed today. Ingest is
+    # hourly, so just after midnight the row still holds YESTERDAY's partial,
+    # and reporting it as today would be a full day's error stated with
+    # confidence. Compared by local calendar day, not by elapsed seconds.
+    tz = ZoneInfo(settings.timezone)
+    day_is_today = (datetime.fromtimestamp(updated, tz).date()
+                    == datetime.now(tz).date())
+
+    common = {
+        "window": "since local midnight" if period == "today" else
+                  "since these meters started",
+        "meter_day_is_today": day_is_today,
+        "meters_age_s": int(now - updated),
+    }
+
+    if period == "today" and not day_is_today:
+        stamp = datetime.fromtimestamp(updated, tz).strftime("%Y-%m-%d %H:%M")
+        return {
+            **common, "solar_kwh": None, "grid_import_kwh": None,
+            "grid_export_kwh": None, "house_consumption_kwh": None,
+            "self_sufficiency_pct": None,
+            "unknown_reason": (
+                f"the site meters were last refreshed {stamp}, which is not "
+                "today. The figures they hold are the previous day's partial "
+                "total and must not be reported as today's. The collector "
+                "refreshes them hourly."),
+        }
+
+    def _kwh(channel: str) -> float:
+        row = rows.get(channel)
+        if row is None:
+            return 0.0
+        wh = (row["cumulative_wh"] - row["closed_wh"]) if period == "today" \
+            else row["cumulative_wh"]
+        return round(max(0.0, wh) / 1000.0, 2)
+
+    solar_kwh = _kwh("site_solar")
+    import_kwh = _kwh("site_import")
+    export_kwh = _kwh("site_export")
+    # What the house made, plus what it bought, minus what it sold.
+    consumption = round(solar_kwh + import_kwh - export_kwh, 2)
+    self_used = solar_kwh - export_kwh
+    return {
+        **common,
+        "solar_kwh": solar_kwh,
+        "grid_import_kwh": import_kwh,
+        "grid_export_kwh": export_kwh,
+        "house_consumption_kwh": consumption,
+        "self_sufficiency_pct": (round(100 * self_used / consumption, 1)
+                                 if consumption > 0 else None),
+        # These counters RATCHET (see meters.py): they never move down, so a
+        # figure here is a high-water mark. Tesla revises the open bucket
+        # downward as data settles and the counter deliberately ignores that.
+        "figures_are_high_water_marks": True,
+        "unknown_reason": None,
+    }
+
+
+CALLABLES["get_home_energy"] = get_home_energy
 
 
 async def _garage_snapshot() -> dict[str, Any]:

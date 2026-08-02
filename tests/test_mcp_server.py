@@ -100,10 +100,14 @@ def test_the_dangerous_commands_are_not_exposed():
         assert forbidden not in names, forbidden
 
 
-def test_the_tool_list_is_exactly_the_seven_specified():
+def test_the_tool_list_is_exactly_what_is_specified():
+    """Eight now. get_home_energy was added after a live session asked about
+    whole-house usage and the model correctly reported that no tool covered
+    it -- the meters table had the data all along."""
     assert set(mcp_server.CALLABLES) == {
         "get_car_status", "get_charging_summary", "get_solar_status",
-        "get_garage_status", "set_charge_mode", "close_garage", "wake_car"}
+        "get_home_energy", "get_garage_status", "set_charge_mode",
+        "close_garage", "wake_car"}
 
 
 # --- staleness: absence of observation is not a measured zero --------------
@@ -142,8 +146,14 @@ async def test_a_real_zero_is_still_reported_as_zero(monkeypatch):
     don't know", or an honest quiet day becomes indistinguishable from a
     dead collector."""
     monkeypatch.setattr(solar_routes, "_vin", lambda: "VIN1")
+    # Clamped to today's midnight, not simply now-600: run in the first ten
+    # minutes after midnight, a tick "ten minutes ago" lands YESTERDAY and
+    # falls outside the window this test is asserting on. That is how this
+    # test failed at 00:05 having passed all evening.
+    midnight = solar_routes._midnight_ts()
     now = int(time.time())
-    _seed_ticks([(now - 600, 0.0, 300.0), (now - 480, 0.0, 310.0)])
+    _seed_ticks([(max(midnight, now - 600), 0.0, 300.0),
+                 (max(midnight + 1, now - 480), 0.0, 310.0)])
 
     out = await mcp_server.CALLABLES["get_charging_summary"](period="today")
     assert out["observed_ticks"] == 2
@@ -197,3 +207,73 @@ def test_extra_hosts_come_from_configuration_not_a_wildcard(monkeypatch):
     assert "192.168.87.56:8000" in hosts
     assert "mini.local:8000" in hosts
     assert "*" not in hosts
+
+
+# --- whole-house energy ----------------------------------------------------
+
+def _seed_meters(import_wh, export_wh, solar_wh, closed=0.0, updated=None):
+    import meters
+    db = solar_routes.store()._db
+    db.executescript(meters.SCHEMA)
+    for ch, wh in (("site_import", import_wh), ("site_export", export_wh),
+                   ("site_solar", solar_wh)):
+        db.execute(
+            "INSERT OR REPLACE INTO meters (channel, cumulative_wh, closed_wh,"
+            " last_closed_bucket, updated_ts) VALUES (?,?,?,?,?)",
+            (ch, wh, closed, 0, int(updated if updated else time.time())))
+    db.commit()
+
+
+@pytest.mark.asyncio
+async def test_house_energy_answers_the_question_the_car_tools_cannot():
+    """Asked for whole-house usage, the model correctly reported that no tool
+    existed -- only car charging. The data was there all along in the meters
+    table, free and local."""
+    _seed_meters(import_wh=37_050, export_wh=4_590, solar_wh=45_270)
+    out = await mcp_server.CALLABLES["get_home_energy"](period="today")
+
+    assert out["solar_kwh"] == 45.27
+    assert out["grid_import_kwh"] == 37.05
+    assert out["grid_export_kwh"] == 4.59
+    # The identity every energy dashboard uses: what the house consumed is
+    # what it made, plus what it bought, minus what it sold.
+    assert out["house_consumption_kwh"] == round(45.27 + 37.05 - 4.59, 2)
+    assert out["self_sufficiency_pct"] is not None
+
+
+@pytest.mark.asyncio
+async def test_yesterdays_partial_is_never_relabelled_today():
+    """THE subtle one. cumulative_wh minus closed_wh is 'today so far' only
+    while the meter has actually been refreshed today. The collector ingests
+    hourly, so just after midnight the row still holds YESTERDAY's partial --
+    and reporting that as today would be a whole day's error stated
+    confidently."""
+    yesterday_evening = time.time() - 8 * 3600
+    _seed_meters(37_050, 4_590, 45_270, updated=yesterday_evening)
+
+    out = await mcp_server.CALLABLES["get_home_energy"](period="today")
+    if out["meter_day_is_today"] is False:
+        assert out["solar_kwh"] is None
+        assert out["house_consumption_kwh"] is None
+        assert "today" in out["unknown_reason"].lower()
+
+
+@pytest.mark.asyncio
+async def test_house_energy_reports_nothing_rather_than_zero_when_unseeded():
+    """No meters row at all is 'never measured', not a house that used
+    nothing."""
+    out = await mcp_server.CALLABLES["get_home_energy"](period="today")
+    assert out["solar_kwh"] is None
+    assert out["unknown_reason"]
+
+
+@pytest.mark.asyncio
+async def test_a_quiet_controller_overnight_does_not_read_as_a_broken_collector():
+    """get_solar_status said 'stale' and the model concluded the collector
+    needed a look. It was running perfectly -- the controller simply logs no
+    ticks after dark. Staleness and brokenness are different claims."""
+    out = await mcp_server.CALLABLES["get_solar_status"]()
+    if out["stale"] and out.get("collector_running"):
+        assert "collector" in out["stale_reason"].lower()
+        assert "running" in out["stale_reason"].lower() or \
+               "alive" in out["stale_reason"].lower()
