@@ -90,7 +90,13 @@ CALLABLES["get_car_status"] = get_car_status
 
 @mcp.tool()
 async def get_charging_summary(period: str = "today") -> dict[str, Any]:
-    """How much energy and how many miles went into the car, split by source.
+    """Daily/weekly/lifetime TOTALS: energy and miles added to the car, split
+    into solar and grid.
+
+    This is the tool for "how much did we add today", "how many solar miles
+    did we add", "what share of this week's charging was solar". Use it for
+    anything cumulative -- get_solar_status is instantaneous only and cannot
+    answer a question about a period.
 
     `period` is "today" (calendar day), "week" (rolling 7 days) or "all".
     """
@@ -102,16 +108,51 @@ async def get_charging_summary(period: str = "today") -> dict[str, Any]:
     vin = solar_routes._vin()
 
     ticks = solar_routes._solar_ticks(db, vin, since_of(now))
+    last_ts = solar.last_tick_ts(db, vin) if vin else None
+    state = solar.load_state(db, vin) if vin else dict(solar.STATE_DEFAULTS)
+    conf = solar.load_config(db)
+
+    common = {
+        "window": label,
+        # How many controller ticks were actually LOGGED in this window. The
+        # denominator behind every figure below, exposed because zero of them
+        # and a quiet day are different claims that used to look identical.
+        "observed_ticks": len(ticks),
+        "collector_running": ha_routes.collector_running(state, now),
+        "last_tick_age_s": int(now - last_ts) if last_ts else None,
+        "charge_mode": solar.charge_mode(conf, now),
+    }
+
+    if not ticks:
+        # NOTHING WAS OBSERVED. Every energy figure here is derived from
+        # solar_ticks, so with no rows the honest answer is "unknown", not
+        # zero -- the collector being down and the car not charging produce
+        # an identical empty table, and only one of them is a real 0.0.
+        # Reporting 0.0 with basis "measured" is the exact failure this
+        # project refuses everywhere else.
+        stale = (f"; the last controller tick was {int((now - last_ts) / 3600)}h ago"
+                 if last_ts else "; no tick has ever been recorded")
+        return {
+            **common,
+            "solar_kwh": None, "grid_kwh": None, "total_kwh": None,
+            "solar_share_pct": None, "miles_added": None, "solar_miles": None,
+            "miles_basis": None,
+            "unknown_reason": (
+                f"no controller ticks were recorded {label}{stale}, so nothing "
+                "was measured in this window. This is not a zero -- an idle car "
+                "and a stopped collector leave the same empty record. Check "
+                "that the collector is running."),
+        }
+
     solar_kwh, grid_kwh = green.charged_split(ticks)
 
     sessions, segments = solar_routes._sessions_and_segments(db, vin)
     pack, _ = green.pack_kwh(sessions)
     mpk, sampled = green.miles_per_kwh(segments, pack)
 
-    conf = solar.load_config(db)
     total = solar_kwh + grid_kwh
     return {
-        "window": label,
+        **common,
         "solar_kwh": round(solar_kwh, 2),
         "grid_kwh": round(grid_kwh, 2),
         "total_kwh": round(total, 2),
@@ -122,10 +163,9 @@ async def get_charging_summary(period: str = "today") -> dict[str, Any]:
         # and the banked-miles basis disagree ~30% on this car, and a figure
         # resting on a guess must not sit beside one that does not.
         "miles_basis": "measured" if mpk else None,
-        "miles_unknown_reason": None if mpk else (
+        "unknown_reason": None if mpk else (
             f"only {sampled:.0f} miles sampled so far; need more driving "
             "history before energy can be converted to miles"),
-        "charge_mode": solar.charge_mode(conf, now),
     }
 
 
@@ -134,10 +174,31 @@ CALLABLES["get_charging_summary"] = get_charging_summary
 
 @mcp.tool()
 async def get_solar_status() -> dict[str, Any]:
-    """Live power at the house right now, and what the charge controller is
-    doing about it."""
+    """INSTANTANEOUS power at the house, as of the last controller tick.
+
+    A snapshot, never a total: this cannot answer "how much today" or
+    "how many miles" -- get_charging_summary does that.
+
+    Every reading here is only as current as `data_age_s`. When `stale` is
+    true the numbers are historical and must be reported with their age, not
+    as "right now" -- a stopped collector leaves the last tick sitting here
+    looking exactly like a live one.
+    """
     st = await ha_routes.ha_state()
+    now = time.time()
+    last_tick_ts = st.get("last_tick_ts")
+    age_s = int(now - last_tick_ts) if last_tick_ts else None
+    # Believe a reading for two of the collector's own slowest sleeps. Past
+    # that it is history. Same principle as ha_routes.collector_running:
+    # judged against the cadence in force, not a constant.
+    stale = age_s is None or age_s > 3600 or not st.get("collector_running")
     return {
+        "data_age_s": age_s,
+        "stale": stale,
+        "stale_reason": None if not stale else (
+            "no tick has ever been recorded" if age_s is None else
+            f"the last controller tick was {age_s // 3600}h {age_s % 3600 // 60}m "
+            "ago; these are historical readings, not current ones"),
         "solar_w": st.get("solar_w"),
         "grid_import_w": st.get("grid_import_w"),
         "grid_export_w": st.get("grid_export_w"),

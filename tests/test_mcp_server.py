@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import time
+
 import pytest
 
 import ha_routes
 import mcp_server
+import solar
 import solar_routes
 
 
@@ -54,7 +57,7 @@ async def test_charging_summary_reports_kwh_even_when_miles_are_unknown():
     assert "solar_kwh" in out and "grid_kwh" in out
     if out["miles_added"] is None:
         assert out["miles_basis"] is None
-        assert out["miles_unknown_reason"]
+        assert out["unknown_reason"]
 
 
 @pytest.mark.asyncio
@@ -101,3 +104,71 @@ def test_the_tool_list_is_exactly_the_seven_specified():
     assert set(mcp_server.CALLABLES) == {
         "get_car_status", "get_charging_summary", "get_solar_status",
         "get_garage_status", "set_charge_mode", "close_garage", "wake_car"}
+
+
+# --- staleness: absence of observation is not a measured zero --------------
+
+def _seed_ticks(rows):
+    """Put solar_ticks rows in the isolated db the fixture points at."""
+    db = solar_routes.store()._db
+    for ts, car_w, grid_w in rows:
+        solar.log_tick(db, "VIN1", ts=ts, state="charging", car_w=car_w,
+                       grid_w=grid_w, solar_w=0.0, period_s=120)
+
+
+@pytest.mark.asyncio
+async def test_a_window_with_no_ticks_reports_null_not_zero(monkeypatch):
+    """The failure this project says it never commits, reached through the
+    MCP surface: the collector stopped three days ago, so nothing was
+    OBSERVED today -- and the summary answered "0.0 solar miles, basis
+    measured". A confident zero is not the same claim as "no data", and the
+    owner acts differently on each."""
+    monkeypatch.setattr(solar_routes, "_vin", lambda: "VIN1")
+    out = await mcp_server.CALLABLES["get_charging_summary"](period="today")
+
+    assert out["solar_kwh"] is None, "no ticks observed, yet it reported a number"
+    assert out["grid_kwh"] is None
+    assert out["miles_added"] is None
+    assert out["solar_miles"] is None
+    assert out["miles_basis"] is None
+    assert out["observed_ticks"] == 0
+    assert out["unknown_reason"], "a null with no reason is not an answer"
+
+
+@pytest.mark.asyncio
+async def test_a_real_zero_is_still_reported_as_zero(monkeypatch):
+    """The other half. A day the collector ran and the car simply did not
+    charge is a genuine, measured 0.0 -- and must not be blurred into "we
+    don't know", or an honest quiet day becomes indistinguishable from a
+    dead collector."""
+    monkeypatch.setattr(solar_routes, "_vin", lambda: "VIN1")
+    now = int(time.time())
+    _seed_ticks([(now - 600, 0.0, 300.0), (now - 480, 0.0, 310.0)])
+
+    out = await mcp_server.CALLABLES["get_charging_summary"](period="today")
+    assert out["observed_ticks"] == 2
+    assert out["solar_kwh"] == 0.0, "a measured zero must stay a zero"
+    assert out["grid_kwh"] is not None
+    # Miles may still be unknown here (an empty test db has no driving
+    # history to measure efficiency from) -- but that is a statement about
+    # MILES, never about whether the window was watched.
+    assert "no controller ticks" not in (out["unknown_reason"] or "")
+
+
+@pytest.mark.asyncio
+async def test_the_summary_carries_its_own_freshness(monkeypatch):
+    """So a model never has to infer whether the window was actually watched."""
+    monkeypatch.setattr(solar_routes, "_vin", lambda: "VIN1")
+    out = await mcp_server.CALLABLES["get_charging_summary"](period="today")
+    for key in ("observed_ticks", "collector_running", "last_tick_age_s"):
+        assert key in out, key
+
+
+@pytest.mark.asyncio
+async def test_solar_status_states_how_old_its_numbers_are(monkeypatch):
+    """get_car_status carries data_age_s; get_solar_status carried only a raw
+    epoch, and a model reported a three-day-old tick as "right now" --
+    verbatim, watts and all. The age must be as legible as the value."""
+    out = await mcp_server.CALLABLES["get_solar_status"]()
+    assert "data_age_s" in out
+    assert "stale" in out, "the judgement itself, not just the raw seconds"
