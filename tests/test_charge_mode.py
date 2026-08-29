@@ -18,17 +18,21 @@ def _db():
 
 # --- mode derivation -------------------------------------------------------
 
+# No manual override outstanding. The mode's fourth value has its own file
+# (test_override_pause.py); these cases are about the other three.
+CLEAR: dict = {"override_amps": None}
+
 def test_mode_is_off_when_nothing_is_enabled():
-    assert solar.charge_mode({"enabled": 0, "force_charge_until": None}, 1000) == "off"
+    assert solar.charge_mode({"enabled": 0, "force_charge_until": None}, CLEAR, 1000) == "off"
 
 
 def test_mode_is_solar_when_enabled():
-    assert solar.charge_mode({"enabled": 1, "force_charge_until": None}, 1000) == "solar"
+    assert solar.charge_mode({"enabled": 1, "force_charge_until": None}, CLEAR, 1000) == "solar"
 
 
 def test_force_outranks_enabled_while_it_is_live():
     conf = {"enabled": 1, "force_charge_until": 2000}
-    assert solar.charge_mode(conf, 1000) == "now"
+    assert solar.charge_mode(conf, CLEAR, 1000) == "now"
 
 
 def test_an_expired_force_falls_back_to_the_underlying_mode():
@@ -36,8 +40,8 @@ def test_an_expired_force_falls_back_to_the_underlying_mode():
     collector, on its next tick. Every reader must therefore compare against
     the clock rather than trusting the column's presence."""
     conf = {"enabled": 1, "force_charge_until": 2000}
-    assert solar.charge_mode(conf, 2000) == "solar"
-    assert solar.charge_mode({"enabled": 0, "force_charge_until": 2000}, 2000) == "off"
+    assert solar.charge_mode(conf, CLEAR, 2000) == "solar"
+    assert solar.charge_mode({"enabled": 0, "force_charge_until": 2000}, CLEAR, 2000) == "off"
 
 
 def test_next_midnight_is_the_next_one_not_todays():

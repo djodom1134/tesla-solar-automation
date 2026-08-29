@@ -126,6 +126,11 @@ async def ha_state() -> dict[str, Any]:
 
         "state": st["state"],
         "enabled": bool(conf["enabled"]),
+        # Which of the four things is actually driving the car right now.
+        # `enabled` alone cannot say: it is true both while the controller is
+        # managing the charge and while it is standing aside because the
+        # owner set their own rate in the app (see solar.charge_mode).
+        "charge_mode": solar.charge_mode(conf, st, now),
         "raise_limit": bool(conf["raise_limit"]),
         "surplus_w": last["surplus_w"] if last else None,
         "amps": (last["amps_written"] or last["amps_before"]) if last else None,

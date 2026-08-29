@@ -448,6 +448,23 @@ async function loadSolar() {
     "The sun/grid split above is a proportion of the pack, not a physical "
     + "layer — electrons mix, and the car has no idea which is which.";
 
+  // WHO is driving, as its own pill. The mode and the machine's state are
+  // different questions, and the state alone cannot answer the first: it
+  // reads "idle" both while the controller waits for sun and while it stands
+  // aside because you set your own rate.
+  const mode = s.mode || (s.enabled ? s.state : "off");
+  const MODE_LABEL = {
+    solar: "solar", now: "charging now", manual: "manual", off: "off",
+  };
+  $("solar-mode").textContent = MODE_LABEL[mode] || mode;
+  $("solar-mode").className = "pill mode-" + mode;
+  $("solar-mode").title = {
+    solar: "Charge rate is following the sun.",
+    now: "Charging at full rate regardless of the sun, until midnight.",
+    manual: "You set the charge rate yourself; solar control is paused.",
+    off: "Solar charging is switched off in setup.",
+  }[mode] || "";
+
   // A disabled controller that has never run also reports state:"idle" --
   // identical to an enabled-but-quiet one. Showing "off" here is the only
   // thing that tells the two apart (spec 7.4: honesty over a working-looking
@@ -455,6 +472,23 @@ async function loadSolar() {
   const label = s.enabled ? s.state : "off";
   $("solar-state").textContent = label;
   $("solar-state").className = "pill state-" + label;
+
+  // The pause says what happened and offers the way out. Both halves matter:
+  // "manual" alone leaves the owner to guess what they did and how to undo
+  // it, which is how a safety feature turns into a mystery.
+  const ov = $("solar-override");
+  ov.hidden = mode !== "manual";
+  if (mode === "manual") {
+    const when = s.override_since
+      ? new Date(s.override_since * 1000)
+          .toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })
+      : null;
+    const rate = s.override_amps === null || s.override_amps === undefined
+      ? "the charge rate" : `${s.override_amps} A`;
+    $("solar-override-note").textContent =
+      `You set ${rate}${when ? " at " + when : ""}. Solar control is paused `
+      + "until charging is stopped and started again, or you resume it here.";
+  }
   $("solar-surplus").textContent =
     s.surplus_w === null ? "—" : (s.surplus_w / 1000).toFixed(2) + " kW surplus";
   $("solar-amps").textContent = s.amps === null ? "" : s.amps + " A";
@@ -672,6 +706,27 @@ async function main() {
       toast(err.message, false);
     } finally {
       $("wake").disabled = false;
+    }
+  });
+
+  // The "or automated control is re-enabled from the car page" half of the
+  // release condition. PUT /charge-mode already clears the latch, so there
+  // is no new route behind this button.
+  $("solar-resume").addEventListener("click", async () => {
+    const btn = $("solar-resume");
+    btn.disabled = true;
+    try {
+      await api("/api/car/charge-mode", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode: "solar" }),
+      });
+      toast("Solar control resumed", true);
+    } catch (err) {
+      toast(err.message, false);
+    } finally {
+      btn.disabled = false;
+      await loadSolar();
     }
   });
 

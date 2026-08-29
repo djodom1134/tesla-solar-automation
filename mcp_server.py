@@ -146,7 +146,7 @@ async def get_charging_summary(period: str = "today") -> dict[str, Any]:
         "observed_ticks": len(ticks),
         "collector_running": ha_routes.collector_running(state, now),
         "last_tick_age_s": int(now - last_ts) if last_ts else None,
-        "charge_mode": solar.charge_mode(conf, now),
+        "charge_mode": solar.charge_mode(conf, state, now),
     }
 
     if not ticks:
@@ -250,8 +250,7 @@ async def get_solar_status() -> dict[str, Any]:
         "surplus_w": st.get("surplus_w"),
         "controller_state": st.get("state"),
         "amps": st.get("amps"),
-        "charge_mode": solar.charge_mode(
-            solar.load_config(solar_routes.store()._db), time.time()),
+        "charge_mode": st.get("charge_mode"),
         "rate_limited": st.get("rate_limited"),
         "daily_cap_reached": st.get("capped"),
         "restore_pending": st.get("dirty"),

@@ -190,9 +190,49 @@ async def _restore(client: TeslaClient, db, vin: str, st: dict,
     if not ok:
         _log("restore refused; leaving dirty set to retry")
         return False, commanded
+    # The handshake goes with it. We have just written original_amps to the
+    # car, so the value it will report from here is ours and not the owner's;
+    # a commanded_amps left over from the engagement would let a later tick
+    # read that restore as an override and pause the feature over our own
+    # command.
     solar.save_state(db, vin, dirty=0, original_amps=None, original_limit=None,
-                     raised_to=None, engaged_at=None)
+                     raised_to=None, engaged_at=None,
+                     commanded_amps=None, commanded_ack=0)
     return True, commanded
+
+
+async def _release(client: TeslaClient, db, vin: str, st: dict,
+                   view: dict | None) -> None:
+    """Hand the car back to the owner after they overrode the charge rate.
+
+    A restore with the amps half deliberately removed. _restore() puts the
+    owner's ORIGINAL rate back, which is exactly wrong here: the rate they
+    just set in the app is their current wish, and rewriting the 48 A we
+    recorded at engagement would defeat them just as thoroughly as writing
+    our own solar target -- only wearing a more helpful face.
+
+    The charge LIMIT is different, and does get put back, under the same
+    condition _restore() applies: only when the controller actually raised it
+    and the car still holds the raised value. Undoing our own change is not
+    fighting the owner. Leaving it is -- a car left at a 90% limit keeps
+    charging past the 80% they chose, at the rate they just chose, which is
+    the one outcome nobody asked for.
+
+    Unlike _restore this never retries: `dirty` is cleared whether or not the
+    limit write succeeded. There is nothing left to retry FOR -- the amps are
+    already the owner's, and a failed limit write is a 10% overshoot, not a
+    car held at a rate it was never meant to have. Keeping dirty set would
+    instead arm the startup recovery path to write the stale original_amps
+    back over them on the next restart.
+    """
+    if (view is not None and st["original_limit"] is not None
+            and st["raised_to"] is not None
+            and view.get("limit") == st["raised_to"]):
+        await _command(client, vin, "set_charge_limit",
+                       percent=st["original_limit"])
+    solar.save_state(db, vin, dirty=0, original_amps=None, original_limit=None,
+                     raised_to=None, engaged_at=None,
+                     commanded_amps=None, commanded_ack=0)
 
 
 async def recover(client: TeslaClient, db, vin: str, st: dict, location: str,
@@ -382,7 +422,64 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
         plugged=view.get("charging_state") not in (None, "Disconnected"),
         car_charging=view.get("charging_state") in solar.LIVE_CHARGING_STATES,
         period_s=conf["period_s"])
-    if is_forcing:
+    # --- the manual-override pause ----------------------------------------
+    #
+    # Whether the owner has taken the charge rate back, and whether they have
+    # given it up again. Evaluated BEFORE the machine decides anything, so a
+    # paused tick never reaches advance() at all -- the same shape force mode
+    # uses, and for the same reason: a mode that "runs the machine but
+    # suppresses its writes" would keep advancing dwell counters against a
+    # car it is not driving and re-engage on some later tick out of nowhere.
+    #
+    # Force mode is excluded entirely. A force IS the owner asking for
+    # maximum rate; force_plan already owns that conversation, and pausing
+    # inside it would mean the feature fighting its own override.
+    paused = st["override_amps"] is not None
+    latched_now = False
+    fields: dict = {}
+    if conf["pause_on_override"] and not is_forcing:
+        if paused:
+            armed_next, cleared = solar.override_cleared(
+                bool(st["override_armed"]), view.get("charging_state"))
+            if cleared:
+                paused = False
+                fields = {"override_amps": None, "override_since": None,
+                          "override_armed": 0,
+                          "commanded_amps": None, "commanded_ack": 0}
+                _log("charging stopped and started again; solar control resumes")
+            elif armed_next != bool(st["override_armed"]):
+                fields = {"override_armed": int(armed_next)}
+        else:
+            ack, override_amps = solar.override_step(
+                st["commanded_amps"], bool(st["commanded_ack"]),
+                view.get("charge_amps"))
+            if override_amps is not None:
+                paused = latched_now = True
+                fields = {"override_amps": override_amps,
+                          "override_since": int(now_ts), "override_armed": 0,
+                          "commanded_amps": None, "commanded_ack": 0}
+                _log(f"charge rate set to {override_amps}A outside this "
+                     "controller; pausing solar control until charging is "
+                     "stopped and started again")
+            elif ack != bool(st["commanded_ack"]):
+                fields = {"commanded_ack": int(ack)}
+    if fields:
+        solar.save_state(db, vin, **fields)
+        st = solar.load_state(db, vin)
+
+    if paused:
+        # Hands off. The tick is still LOGGED below -- green.charged_split
+        # derives the whole solar/grid attribution from solar_ticks, and a
+        # manual charge that went unlogged would fill the pack with grid
+        # electrons the banked-solar ledger never accounted for.
+        machine, actions = solar.Machine(), []
+        if latched_now:
+            # The one command the pause may issue, and only on its first
+            # tick: putting back a charge limit we ourselves raised. See
+            # _release for why the amps are pointedly not restored with it.
+            await _release(client, db, vin, st, view)
+            st = solar.load_state(db, vin)
+    elif is_forcing:
         # The solar machine does not run at all while forcing -- it stays
         # idle, and force_plan decides. Note the tick is still LOGGED below:
         # green.charged_split derives the whole solar/grid attribution from
@@ -560,6 +657,16 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
             if await _command(client, vin, "set_charging_amps",
                               charging_amps=target):
                 written = target
+                # Open a fresh handshake on our own command (see
+                # solar.override_step). The acknowledgement resets with it:
+                # until the car is seen reporting THIS value, the rate it is
+                # still reporting is our previous one in transit, not the
+                # owner's decision -- and reading it as one would pause the
+                # feature on the controller's own write.
+                if st["commanded_amps"] != target or st["commanded_ack"]:
+                    solar.save_state(db, vin, commanded_amps=target,
+                                     commanded_ack=0)
+                    st = solar.load_state(db, vin)
 
     # --- charge-limit raise (spec 3.4) -------------------------------------
     target_limit, raise_hold = solar.raise_decision(

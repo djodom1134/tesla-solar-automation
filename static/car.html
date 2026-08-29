@@ -93,10 +93,20 @@
     </div>
     <p id="solar-tank-hint" class="hint"></p>
 
+    <!-- Two pills, not one. The mode is WHO is driving the car; the state is
+         where the solar machine itself has got to. One pill showing
+         `enabled ? state : "off"` conflated them, and could not say the one
+         thing that matters after an override: that the controller is
+         standing aside on purpose. -->
     <div class="solar-head">
+      <span id="solar-mode" class="pill" title="Which mode charging is in">solar</span>
       <span id="solar-state" class="pill">idle</span>
       <span id="solar-surplus" class="big">—</span>
       <span id="solar-amps" class="muted">—</span>
+    </div>
+    <div id="solar-override" class="override" hidden>
+      <p id="solar-override-note"></p>
+      <button id="solar-resume" class="btn" type="button">Resume solar control</button>
     </div>
     <p id="solar-limit-note" class="hint" hidden></p>
     <p id="solar-grace" class="hint"></p>

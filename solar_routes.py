@@ -313,6 +313,8 @@ CONFIG_BOUNDS = {
     # Floor of 60 s: the grid meter itself only refreshes that often,
     # so anything faster re-reads one value at double the billing.
     "watch_s": (60, 3600),
+    # The manual-override pause. 1 by default -- see solar.override_step.
+    "pause_on_override": (0, 1),
 }
 
 # Fields carrying real values rather than counts. int() would silently
@@ -349,16 +351,34 @@ async def put_solar_config(body: dict[str, Any] = Body(...)) -> dict[str, bool]:
         if not low <= number <= high:
             raise HTTPException(400, f"{key} must be between {low} and {high}")
         clean[key] = number
+
+    # Switching solar charging back ON is the owner saying, in the plainest
+    # available words, that they want this controller driving again -- so it
+    # releases a manual-override pause exactly as the car page's button does.
+    # Without this, an owner who paused, turned the feature off, and later
+    # turned it back on would land straight back in "manual" with no visible
+    # reason and the controller still standing aside.
+    #
+    # Only on a real 0 -> 1 TRANSITION, never on `enabled` merely being 1 in
+    # the body: the setup page posts the whole form on every save, so an
+    # unrelated tuning change would otherwise cancel a pause the owner never
+    # mentioned.
+    was_enabled = bool(solar.load_config(store()._db)["enabled"])
     solar.save_config(store()._db, **clean)
+    vin = _vin()
+    if vin and clean.get("enabled") == 1 and not was_enabled:
+        solar.save_state(store()._db, vin, override_amps=None,
+                         override_since=None, override_armed=0,
+                         commanded_amps=None, commanded_ack=0)
     return {"ok": True}
 
 
 CHARGE_MODES = ("solar", "now", "off")
 
 
-def _mode_payload(conf: dict, now: float) -> dict[str, Any]:
+def _mode_payload(conf: dict, st: dict | None, now: float) -> dict[str, Any]:
     return {
-        "mode": solar.charge_mode(conf, now),
+        "mode": solar.charge_mode(conf, st, now),
         # Only meaningful while forcing. Reported as null otherwise rather
         # than as a stale timestamp the caller has to interpret.
         "expires_ts": (conf["force_charge_until"]
@@ -367,9 +387,17 @@ def _mode_payload(conf: dict, now: float) -> dict[str, Any]:
     }
 
 
+def _mode_state() -> dict:
+    """The per-vehicle state the mode is derived from, or the defaults when
+    there is no vehicle row yet (a fresh install)."""
+    vin = _vin()
+    return solar.load_state(store()._db, vin) if vin else dict(solar.STATE_DEFAULTS)
+
+
 @router.get("/charge-mode")
 async def get_charge_mode() -> dict[str, Any]:
-    return _mode_payload(solar.load_config(store()._db), time.time())
+    return _mode_payload(solar.load_config(store()._db), _mode_state(),
+                         time.time())
 
 
 @router.put("/charge-mode")
@@ -396,7 +424,25 @@ async def put_charge_mode(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
     else:
         solar.save_config(store()._db, force_charge_until=None, enabled=0)
 
-    return _mode_payload(solar.load_config(store()._db), now)
+    # Every route through here is the owner stating, explicitly, who should
+    # be driving -- which is exactly what the manual-override pause was
+    # waiting to hear. This is the "or automated control is re-enabled from
+    # the car page" half of the release condition, and it is deliberately
+    # not limited to mode="solar": choosing "now" or "off" settles the
+    # question just as squarely, and leaving a stale latch behind would make
+    # the mode flip back to "manual" the moment the force expired.
+    #
+    # The whole handshake is cleared with it, not just the latch. Keeping a
+    # commanded_amps from before the override would let the very first tick
+    # after the resume compare the owner's rate against a stale command and
+    # latch all over again.
+    vin = _vin()
+    if vin:
+        solar.save_state(store()._db, vin, override_amps=None,
+                         override_since=None, override_armed=0,
+                         commanded_amps=None, commanded_ack=0)
+
+    return _mode_payload(solar.load_config(store()._db), _mode_state(), now)
 
 
 @router.get("/solar/status")
@@ -430,9 +476,19 @@ async def get_solar_status() -> dict[str, Any]:
         accrual, accrual_basis = green.accrual_mi_per_s(
             free_w, _g["mi_per_kwh"], view.get("soc"),
             view.get("range_mi"), _g["pack_kwh"])
+    conf = solar.load_config(db)
     return {
         "state": state["state"],
-        "enabled": bool(solar.load_config(db)["enabled"]),
+        "enabled": bool(conf["enabled"]),
+        # Which of the four things is driving the car, as one word. `state`
+        # is the solar machine's own position and cannot answer this: it
+        # reads "idle" both when the controller is waiting for sun and when
+        # it has stood aside because the owner set their own rate.
+        "mode": solar.charge_mode(conf, state, time.time()),
+        # Only meaningful in "manual". The rate the OWNER set, and when --
+        # the card says what happened rather than just that something did.
+        "override_amps": state["override_amps"],
+        "override_since": state["override_since"],
         "surplus_w": last["surplus_w"] if last else None,
         "accrual_mi_per_s": round(accrual, 8),
         "accrual_basis": accrual_basis,

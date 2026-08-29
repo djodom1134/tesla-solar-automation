@@ -410,11 +410,105 @@ def forcing(conf: dict, now: float) -> bool:
     return bool(until) and now < until
 
 
-def charge_mode(conf: dict, now: float) -> str:
-    """"now" | "solar" | "off"."""
+# --- the manual-override pause --------------------------------------------
+#
+# The owner and the controller both write charge_current_request, and until
+# now the controller always won: move the slider in the Tesla app or on the
+# car's own screen mid-engagement and the next tick wrote the solar-derived
+# rate straight back over it. These two functions are the whole detection
+# rule, and they are pure for the same reason advance() and force_plan() are
+# -- the one real hazard here is mistaking ordinary command-propagation lag
+# for an owner's decision, and that is a question about three values.
+
+
+def override_step(commanded_amps: int | None, commanded_ack: bool,
+                  charge_amps: int | None) -> tuple[bool, int | None]:
+    """One step of the acknowledge-then-diverge handshake. Returns
+    (ack_next, override_amps or None).
+
+    NOT "the car reports something other than what we wrote". That is
+    routinely true for a tick or two after every single write -- a command
+    takes time to reach vehicle_data, and between writes the view is only
+    refreshed every view_refresh_ticks (10 minutes at the defaults). Latching
+    on it would disable automation for the rest of the session over nothing,
+    which is far worse than the fight it was meant to end.
+
+    So an override is a car that had already ADOPTED our value and then moved
+    away from it::
+
+        write 12 A        commanded=12 ack=0
+        car reports 48    commanded=12 ack=0  -- not propagated yet, quiet
+        car reports 12    commanded=12 ack=1  -- the car has adopted it
+        car reports 32    commanded=12 ack=1  -- OVERRIDE, at 32 A
+
+    Nothing but an outside writer can produce that sequence. The rule needs
+    no clock, no dwell and no view timestamp: immunity to propagation lag is
+    a property of its shape rather than of a tolerance someone has to tune.
+
+    A controller rewrite resets the handshake at the call site (commanded_amps
+    changes, ack goes back to False), so the tick where the car still reports
+    the previous value cannot latch. A write the car never acknowledges never
+    arms the latch at all, which is correct: control was never established, so
+    there is nothing to take away.
+
+    charge_amps is None when the view carries no charge_current_request.
+    Absence is not evidence -- returning "no override" keeps a partial payload
+    from switching the feature off.
+    """
+    if commanded_amps is None or charge_amps is None:
+        return commanded_ack, None
+    if charge_amps == commanded_amps:
+        return True, None
+    if commanded_ack:
+        return True, charge_amps
+    return False, None
+
+
+def override_cleared(armed: bool, charging_state: str | None,
+                     ) -> tuple[bool, bool]:
+    """Whether a stop-and-start has released the pause. Returns
+    (armed_next, cleared).
+
+    Two observations, not one: charging must be seen to STOP (which arms
+    this) and then to START again (which clears the pause). A single
+    "charging" reading proves nothing -- the car was already charging when
+    the owner took it over, and treating that as a restart would clear the
+    pause on its very first tick.
+
+    Everything outside LIVE_CHARGING_STATES arms, so Complete, Stopped,
+    NoPower and Disconnected all count -- unplugging and plugging back in is
+    a stop and a start like any other, and the owner meant it the same way.
+
+    An unknown charging_state arms rather than clearing. Absence is not
+    evidence that the car is charging, and arming is the safe direction: it
+    can only delay a resume, never hand a car back to the controller while
+    the owner is still driving it manually.
+    """
+    if charging_state in LIVE_CHARGING_STATES:
+        return (False, True) if armed else (False, False)
+    return True, False
+
+
+def charge_mode(conf: dict, st: dict | None, now: float) -> str:
+    """"now" | "off" | "manual" | "solar".
+
+    Order is the argument. A live force outranks everything, because forcing
+    is the owner taking control back explicitly and PUT /charge-mode clears
+    the pause on its way past. "off" outranks "manual" next: the feature is
+    switched off, and that the owner also once moved a slider is not the
+    thing worth reporting.
+
+    `st` may be None for a caller that has only the config -- a fresh install
+    with no vehicle row yet. Mode stays derived, never stored: `enabled` keeps
+    its exact meaning, so the HA switch and the setup page stay correct.
+    """
     if forcing(conf, now):
         return "now"
-    return "solar" if conf["enabled"] else "off"
+    if not conf["enabled"]:
+        return "off"
+    if (st or {}).get("override_amps") is not None:
+        return "manual"
+    return "solar"
 
 
 def next_midnight_ts(tz: str, now: float) -> int:
@@ -524,6 +618,14 @@ CREATE TABLE IF NOT EXISTS solar_config (
   garage_ring_m       INTEGER NOT NULL DEFAULT 800,
   garage_close_hour   INTEGER,
   garage_close_warn_s INTEGER NOT NULL DEFAULT 8,
+  -- The owner and the controller both write charge_current_request. With
+  -- this set, the owner wins: a rate they set from the Tesla app or the
+  -- car's own screen pauses solar control until charging is stopped and
+  -- started again, or it is re-enabled from the car page. Default 1 --
+  -- whoever touched the car most recently and most deliberately should be
+  -- the one driving it. Set to 0 for the older behaviour, where the
+  -- controller writes its own rate straight back over theirs.
+  pause_on_override INTEGER NOT NULL DEFAULT 1,
   updated_at        INTEGER NOT NULL DEFAULT 0
 );
 
@@ -595,6 +697,26 @@ CREATE TABLE IF NOT EXISTS solar_state (
   tracked_miles     REAL    NOT NULL DEFAULT 0,
   ledger_odo        REAL,
   free_miles_since  INTEGER,
+  -- The manual-override pause (see override_step/override_cleared).
+  -- commanded_amps is the last rate the controller successfully wrote and
+  -- commanded_ack whether the car has been OBSERVED reporting it back; an
+  -- override is a divergence after acknowledgement, never a bare mismatch,
+  -- which is routine for a tick or two after every write.
+  --
+  -- override_amps IS the paused state -- NOT NULL means paused -- rather
+  -- than a boolean sitting beside the number. A separate flag could
+  -- disagree with the value it describes; this cannot. It carries the
+  -- owner's own rate, which is what the car page shows them.
+  --
+  -- override_armed is the first half of "stopped and started again":
+  -- charging seen to STOP arms it, charging seen to start again clears the
+  -- pause. One observation cannot do it -- the car was already charging
+  -- when the owner took it over.
+  commanded_amps  INTEGER,
+  commanded_ack   INTEGER NOT NULL DEFAULT 0,
+  override_amps   INTEGER,
+  override_since  INTEGER,
+  override_armed  INTEGER NOT NULL DEFAULT 0,
   updated_at      INTEGER NOT NULL DEFAULT 0
 );
 
@@ -624,6 +746,7 @@ CONFIG_DEFAULTS = {
     "garage_url": None, "garage_auto_open": 0, "garage_ring_m": 800,
     "garage_close_hour": None, "garage_close_warn_s": 8,
     "force_charge_until": None,
+    "pause_on_override": 1,
 }
 
 STATE_DEFAULTS = {
@@ -640,6 +763,8 @@ STATE_DEFAULTS = {
     "free_miles_driven": 0.0, "tracked_miles": 0.0, "ledger_odo": None,
     "free_miles_since": None,
     "heartbeat_ts": None, "heartbeat_sleep_s": None,
+    "commanded_amps": None, "commanded_ack": 0,
+    "override_amps": None, "override_since": None, "override_armed": 0,
 }
 
 # The Machine fields that must survive between ticks. Anything here that is
@@ -689,6 +814,14 @@ STATE_NEW_COLUMNS = (
     # charge_mode "now": the latch that stops the force expiring on its own
     # first tick -- see the SCHEMA comment above.
     ("force_started", "INTEGER NOT NULL DEFAULT 0"),
+    # The manual-override pause -- see the SCHEMA comment above. This is the
+    # only path onto the owner's live solar_state, whose CREATE TABLE was a
+    # no-op the moment the table first existed.
+    ("commanded_amps", "INTEGER"),
+    ("commanded_ack", "INTEGER NOT NULL DEFAULT 0"),
+    ("override_amps", "INTEGER"),
+    ("override_since", "INTEGER"),
+    ("override_armed", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 
@@ -722,6 +855,10 @@ CONFIG_NEW_COLUMNS = (
     ("watch_s", "INTEGER NOT NULL DEFAULT 300"),
     # charge_mode "now": when the force expires -- see the SCHEMA comment.
     ("force_charge_until", "INTEGER"),
+    # The manual-override pause. Defaults to 1, so an existing install gains
+    # the protection on upgrade without touching the setup page -- the
+    # behaviour it replaces is the one nobody asked for.
+    ("pause_on_override", "INTEGER NOT NULL DEFAULT 1"),
 )
 
 

@@ -84,6 +84,7 @@ async function loadSolar() {
   $("ceiling").value = c.soc_ceiling;
   $("ceiling-out").textContent = c.soc_ceiling + "%";
   $("raise-limit").checked = !!c.raise_limit;
+  $("pause-override").checked = !!c.pause_on_override;
   $("grace").value = Math.round(c.grace_s / 60);
   $("margin").value = c.margin_w;
   $("deadband").value = c.deadband_w;
@@ -113,6 +114,7 @@ $("save-solar").addEventListener("click", async () => {
         period_s: Number($("period").value),
         soc_ceiling: Number($("ceiling").value),
         raise_limit: $("raise-limit").checked ? 1 : 0,
+        pause_on_override: $("pause-override").checked ? 1 : 0,
         grace_s: Number($("grace").value) * 60,
         margin_w: Number($("margin").value),
         deadband_w: Number($("deadband").value),

@@ -370,6 +370,26 @@ th .key { vertical-align: middle; margin-right: .35rem; }
 #solar-card .pill.state-grace    { background: var(--warn, #f59e0b); color: #fff; }
 #garage-card .pill.state-closed  { background: var(--good, #22c55e); color: #fff; }
 #garage-card .pill.state-open    { background: var(--warn, #f59e0b); color: #fff; }
+/* Mode pills. The mode is WHO is driving the car, so each one is coloured
+   for what it means rather than for how alarming it is: solar reads as sun,
+   "charging now" as the deliberate grid draw it is, and manual as the plain
+   statement that this controller is not the one in charge. */
+#solar-card .pill.mode-solar  { background: var(--solar); color: #1a1a19; }
+#solar-card .pill.mode-now    { background: var(--import); color: #fff; }
+#solar-card .pill.mode-manual { background: var(--home); color: #fff; }
+#solar-card .pill.mode-off    { background: var(--chip, #33333322); color: var(--muted); }
+
+/* The override notice. Bordered rather than tinted: it is not a warning --
+   nothing is wrong, the owner did this on purpose -- but it does carry the
+   only control on the card, and it should be findable at a glance. */
+#solar-card .override {
+  display: flex; flex-wrap: wrap; align-items: center; gap: .75rem;
+  margin: .6rem 0; padding: .7rem .85rem;
+  border: 1px solid var(--border); border-left: 3px solid var(--home);
+  border-radius: var(--radius, 14px); background: var(--plane);
+}
+#solar-card .override p { margin: 0; flex: 1 1 18rem; font-size: .9rem; color: var(--ink-2); }
+
 #solar-card .warn, #garage-card .warn { color: var(--bad, #ef4444); }
 #solar-card .hint, #garage-card .hint { color: var(--muted, #888); font-size: .85rem; margin: .35rem 0 .6rem; }
 

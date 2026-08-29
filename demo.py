@@ -359,6 +359,9 @@ def solar_status() -> dict:
     return {
         "state": "charging",
         "enabled": True,
+        "mode": "solar",
+        "override_amps": None,
+        "override_since": None,
         "surplus_w": 6240.0,
         # 6.24 kW of sun at ~3.4 mi/kWh -- fast enough that the
         # thousandths digit visibly moves, which is the point.

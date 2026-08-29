@@ -58,6 +58,18 @@
       <label class="row"><input type="checkbox" id="raise-limit" checked>
         Allow raising the limit to capture more sun</label>
 
+      <h3>If you change the charge rate yourself</h3>
+      <label class="row"><input type="checkbox" id="pause-override" checked>
+        Pause solar control when I set the charge rate in the app or the car</label>
+      <p class="hint">You and this controller both write the same setting, and
+        without this the controller wins — move the slider in the Tesla app and
+        the next loop writes its own rate straight back over yours. With it, your
+        rate stands and solar control stands aside until you either stop and
+        restart charging, or turn it back on from the
+        <a href="/car.html">car page</a>. It only reacts to the charge
+        <em>rate</em> — changing the charge limit, or stopping the charge, is not
+        treated as taking over.</p>
+
       <div class="row">
         <label for="grace">Cloud grace</label>
         <input type="number" id="grace" min="0" max="20" step="1" value="3">

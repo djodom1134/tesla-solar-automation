@@ -538,3 +538,125 @@ def test_force_charge_until_is_not_writable_through_the_config_route(
                    json={"force_charge_until": 99999999999})
     assert r.status_code == 400
     assert "unknown fields" in r.json()["detail"]
+
+
+# --- the manual-override pause --------------------------------------------
+
+def _seeded_db():
+    """A connection of OUR OWN to the routes' database.
+
+    Never solar_routes.store()._db: TestClient runs the request in a
+    different thread, and a store first created from the test thread makes
+    every subsequent route call fail on sqlite's thread check. Same shape as
+    _saved_config above, for the same reason.
+    """
+    import sqlite3
+    from config import settings
+    db = sqlite3.connect(settings.db_file)
+    db.row_factory = sqlite3.Row
+    return db
+
+
+def _pause(client, monkeypatch, amps=32):
+    """Latch a pause on the VIN the routes will look at."""
+    from config import settings
+    monkeypatch.setattr(settings, "vin", "VIN1")
+    client.get("/api/car/charge-mode")     # creates the schema, in ITS thread
+    db = _seeded_db()
+    try:
+        solar.save_config(db, enabled=1)
+        solar.save_state(db, "VIN1", override_amps=amps, override_since=1000,
+                         commanded_amps=24, commanded_ack=1)
+    finally:
+        db.close()
+
+
+def _loaded_state():
+    db = _seeded_db()
+    try:
+        return solar.load_state(db, "VIN1")
+    finally:
+        db.close()
+
+
+def test_an_override_reports_the_manual_mode(client, monkeypatch):
+    monkeypatch.setattr(solar_routes, "DEMO", False)
+    _pause(client, monkeypatch)
+    body = client.get("/api/car/charge-mode").json()
+    assert body["mode"] == "manual"
+    # `enabled` deliberately stays true: the owner has not switched the
+    # feature off, it is standing aside. The HA switch and the setup
+    # checkbox both read this, and both would be wrong if it flipped.
+    assert body["enabled"] is True
+
+
+def test_the_status_card_gets_the_owners_own_rate(client, monkeypatch):
+    monkeypatch.setattr(solar_routes, "DEMO", False)
+    _pause(client, monkeypatch, amps=32)
+    body = client.get("/api/car/solar/status").json()
+    assert body["mode"] == "manual"
+    assert body["override_amps"] == 32
+    assert body["override_since"] == 1000
+
+
+def test_choosing_solar_from_the_car_page_clears_the_pause(client, monkeypatch):
+    """The second half of the release condition: re-enabling automated
+    control from the UI, without waiting for a stop and a start."""
+    monkeypatch.setattr(solar_routes, "DEMO", False)
+    _pause(client, monkeypatch)
+
+    body = client.put("/api/car/charge-mode", json={"mode": "solar"}).json()
+
+    assert body["mode"] == "solar"
+    st = _loaded_state()
+    assert st["override_amps"] is None
+    assert st["commanded_amps"] is None, (
+        "a stale command would let the next tick latch all over again")
+
+
+def test_forcing_from_the_car_page_also_clears_the_pause(client, monkeypatch):
+    """Not limited to mode=solar: choosing "now" settles who is driving just
+    as squarely, and a latch left behind would flip the mode back to manual
+    the moment the force expired at midnight."""
+    monkeypatch.setattr(solar_routes, "DEMO", False)
+    _pause(client, monkeypatch)
+
+    client.put("/api/car/charge-mode", json={"mode": "now"})
+
+    assert _loaded_state()["override_amps"] is None
+
+
+def test_the_pause_setting_round_trips(client, monkeypatch):
+    monkeypatch.setattr(solar_routes, "DEMO", False)
+    client.get("/api/car/solar/config")     # creates the schema, in ITS thread
+    assert _saved_config()["pause_on_override"] == 1     # on by default
+    r = client.put("/api/car/solar/config", json={"pause_on_override": 0})
+    assert r.status_code == 200
+    assert _saved_config()["pause_on_override"] == 0
+
+
+def test_switching_solar_back_on_releases_the_pause(client, monkeypatch):
+    """An owner who paused, turned the feature off, then turned it back on
+    would otherwise land straight back in "manual" with the controller still
+    standing aside and nothing on screen explaining why."""
+    monkeypatch.setattr(solar_routes, "DEMO", False)
+    _pause(client, monkeypatch)
+    client.put("/api/car/solar/config", json={"enabled": 0})
+
+    client.put("/api/car/solar/config", json={"enabled": 1})
+
+    assert _loaded_state()["override_amps"] is None
+
+
+def test_an_unrelated_save_does_not_cancel_the_pause(client, monkeypatch):
+    """The setup page posts the whole form on every save, `enabled` included.
+    Only a real off -> on transition means "resume"; adjusting the ramp does
+    not, and silently clearing the pause there would hand the car back
+    without the owner ever asking."""
+    monkeypatch.setattr(solar_routes, "DEMO", False)
+    _pause(client, monkeypatch)
+
+    r = client.put("/api/car/solar/config", json={"enabled": 1, "ramp_a": 6})
+
+    assert r.status_code == 200
+    assert _loaded_state()["override_amps"] == 32
