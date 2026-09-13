@@ -518,6 +518,60 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
         _log("charge_amps unknown; refusing to engage without a restorable original")
         machine, actions = solar.machine_from(st), []
 
+    # --- charge-limit raise (spec 3.4) -------------------------------------
+    # BEFORE the action loop, not after, and the ordering is load-bearing.
+    # charge_start's refusal path below returns early, so a raise evaluated
+    # after it is unreachable on precisely the ticks that need it: a car at
+    # its limit refuses charge_start with `complete`, the machine rolls back
+    # to "stopped", and the function returns before ever asking whether the
+    # limit should go up. That is the deadlock observed 2026-09-13 -- five
+    # days at an 85% limit with 4 kW exporting, every tick refusing.
+    #
+    # Running first also means the raise and the retry land in the SAME tick:
+    # set_charge_limit goes out, then charge_start follows against a limit
+    # the car has already accepted. If the car has not caught up yet the next
+    # tick gets it anyway, so this costs nothing and often saves two minutes.
+    target_limit, raise_hold = solar.raise_decision(
+        enabled=bool(conf["raise_limit"]),
+        state=machine.state,
+        soc=view.get("soc"),
+        limit=view.get("limit"),
+        ceiling=conf["soc_ceiling"],
+        grid_w=grid_w,
+        raised_to=st["raised_to"],
+        hold_elapsed_s=st["raise_hold_elapsed"],
+        raise_hold_s=conf["raise_hold_s"],
+        period_s=conf["period_s"],
+        # "Complete" is the car reporting no headroom, which is the one
+        # refusal a higher limit is the cure for. See raise_decision.
+        complete=view.get("charging_state") == "Complete",
+        plugged=tick.plugged,
+        location=location,
+    )
+    raised = st["raised_to"]
+    if target_limit is not None:
+        # Remember BEFORE we change it, exactly as charge_start does below.
+        # The raise can now fire from "stopped", which is AHEAD of the branch
+        # that normally records the originals -- so without this, a
+        # set_charge_limit that lands while the following charge_start is
+        # still being refused leaves original_limit unset. The next tick then
+        # records the RAISED value as the original, and _restore puts back 95
+        # instead of the owner's 85. dirty=1 goes with it, or restore never
+        # runs at all.
+        #
+        # original_amps is deliberately left alone: we have not touched amps,
+        # and _restore skips the amps write when it is None.
+        if st["original_limit"] is None:
+            solar.save_state(db, vin, dirty=1, original_limit=view.get("limit"),
+                             engaged_at=int(time.time()))
+            st = solar.load_state(db, vin)
+        if await _command(client, vin, "set_charge_limit", percent=target_limit):
+            raised = target_limit
+            _log(f"raised charge limit {view.get('limit')} -> {target_limit} "
+                 f"for solar")
+    solar.save_state(db, vin, raised_to=raised, raise_hold_elapsed=raise_hold)
+    st = solar.load_state(db, vin)
+
     # --- act ---------------------------------------------------------------
     written = None
     restored = False
@@ -667,27 +721,6 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
                     solar.save_state(db, vin, commanded_amps=target,
                                      commanded_ack=0)
                     st = solar.load_state(db, vin)
-
-    # --- charge-limit raise (spec 3.4) -------------------------------------
-    target_limit, raise_hold = solar.raise_decision(
-        enabled=bool(conf["raise_limit"]),
-        state=machine.state,
-        soc=view.get("soc"),
-        limit=view.get("limit"),
-        ceiling=conf["soc_ceiling"],
-        grid_w=grid_w,
-        raised_to=st["raised_to"],
-        hold_elapsed_s=st["raise_hold_elapsed"],
-        raise_hold_s=conf["raise_hold_s"],
-        period_s=conf["period_s"],
-    )
-    raised = st["raised_to"]
-    if target_limit is not None:
-        if await _command(client, vin, "set_charge_limit", percent=target_limit):
-            raised = target_limit
-            _log(f"raised charge limit {view.get('limit')} -> {target_limit} "
-                 f"for solar")
-    solar.save_state(db, vin, raised_to=raised, raise_hold_elapsed=raise_hold)
 
     # --- banked-solar ledger (Task 18) and lifetime free miles (Task 20) ----
     # last_tick_ts() must be read BEFORE log_tick() below writes this tick's

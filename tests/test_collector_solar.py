@@ -2776,3 +2776,125 @@ async def test_a_forced_charge_still_moves_the_attribution_ledger(
     assert solar_kwh == 0.0, (
         f"attributed {solar_kwh} kWh to the sun at 2 a.m. with solar_power=0")
     store_.close()
+
+
+# --------------------------------------------------------------------------
+# The "Complete" deadlock, observed live 2026-09-13 12:10:24:
+#
+#   command charge_start refused: car could not execute command: complete
+#   charge_start refused; rolling back to stopped
+#
+# A car 1% under its limit reports Complete, charge_start is refused, the
+# machine rolls back to "stopped" -- and that rollback RETURNS EARLY, so a
+# raise evaluated after the action loop never runs at all. The limit stayed
+# at 85% from 8 to 13 September with the array exporting 4 kW.
+# --------------------------------------------------------------------------
+
+class _CompleteRefusesStartClient:
+    """4 kW export, car full to its limit. charge_start is refused with
+    Tesla's own `complete` reason until the limit actually goes up."""
+
+    def __init__(self, limit: int = 85):
+        self.commands: list[tuple[str, dict]] = []
+        self.limit = limit
+        self.soc = 84
+
+    async def _get(self, path, ttl=0):
+        return {"grid_power": -4000.0, "solar_power": 5300.0}
+
+    async def command(self, vin, name, params):
+        self.commands.append((name, dict(params)))
+        if name == "charge_start" and self.soc >= self.limit - 1:
+            return 200, {"response": {"result": False, "reason": "complete"}}
+        if name == "set_charge_limit":
+            self.limit = params["percent"]
+        return 200, {"response": {"result": True}}
+
+    async def wake_up(self, vin):
+        return None
+
+
+def _complete_view(limit: int = 85) -> dict:
+    return {
+        "charging_state": "Complete", "amps_actual": 0, "amps_max": 48,
+        "volts": 240, "charge_amps": 22, "soc": 84, "limit": limit,
+        "lat": 40.0, "lon": -105.0,
+        "fast_charger_present": False, "fast_charger": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_car_complete_at_its_limit_still_gets_the_limit_raised(tmp_path):
+    """The regression that matters: stopped + Complete + exporting must reach
+    set_charge_limit. Before the fix this asserted zero limit commands across
+    any number of ticks, because charge_start's rollback returned first."""
+    store_ = Store(tmp_path / "car.db")
+    db = store_._db
+    solar.save_config(db, enabled=1, raise_limit=1, raise_hold_s=600,
+                      period_s=120, soc_ceiling=95, restart_hold_s=0)
+    home.save(db, 40.0, -105.0, 100)
+    solar.save_state(db, "VIN1", state="stopped")
+
+    client = _CompleteRefusesStartClient()
+    cfg = SimpleNamespace(timezone="America/Denver",
+                          proxy_url="https://localhost:4443")
+
+    for _ in range(8):
+        await collector.solar_tick(client, store_, "VIN1",
+                                   _complete_view(client.limit), cfg, site_id=1)
+
+    limit_commands = [c for c in client.commands if c[0] == "set_charge_limit"]
+    assert limit_commands == [("set_charge_limit", {"percent": 95})], (
+        f"expected exactly one raise to 95, got {client.commands}")
+    assert solar.load_state(db, "VIN1")["raised_to"] == 95
+    store_.close()
+
+
+@pytest.mark.asyncio
+async def test_the_raise_records_the_owners_limit_before_changing_it(tmp_path):
+    """original_limit must capture the owner's 85, not the raised 95. The
+    raise now runs ahead of the branch that normally records the originals,
+    so it has to record them itself -- otherwise _restore puts back the
+    controller's own value and the owner's setting is gone."""
+    store_ = Store(tmp_path / "car.db")
+    db = store_._db
+    solar.save_config(db, enabled=1, raise_limit=1, raise_hold_s=600,
+                      period_s=120, soc_ceiling=95, restart_hold_s=0)
+    home.save(db, 40.0, -105.0, 100)
+    solar.save_state(db, "VIN1", state="stopped")
+
+    client = _CompleteRefusesStartClient()
+    cfg = SimpleNamespace(timezone="America/Denver",
+                          proxy_url="https://localhost:4443")
+
+    for _ in range(8):
+        await collector.solar_tick(client, store_, "VIN1",
+                                   _complete_view(client.limit), cfg, site_id=1)
+
+    st = solar.load_state(db, "VIN1")
+    assert st["original_limit"] == 85, "the owner's limit must be recoverable"
+    assert st["dirty"] == 1, "a raise with nothing marked dirty never restores"
+    store_.close()
+
+
+@pytest.mark.asyncio
+async def test_a_complete_car_away_from_home_is_never_raised(tmp_path):
+    """The state gate used to guarantee plugged-in-at-home for free."""
+    store_ = Store(tmp_path / "car.db")
+    db = store_._db
+    solar.save_config(db, enabled=1, raise_limit=1, raise_hold_s=600,
+                      period_s=120, soc_ceiling=95, restart_hold_s=0)
+    home.save(db, 40.0, -105.0, 100)
+    solar.save_state(db, "VIN1", state="stopped")
+
+    client = _CompleteRefusesStartClient()
+    cfg = SimpleNamespace(timezone="America/Denver",
+                          proxy_url="https://localhost:4443")
+    view = _complete_view()
+    view["lat"], view["lon"] = 41.0, -106.0        # nowhere near home
+
+    for _ in range(8):
+        await collector.solar_tick(client, store_, "VIN1", view, cfg, site_id=1)
+
+    assert [c for c in client.commands if c[0] == "set_charge_limit"] == []
+    store_.close()

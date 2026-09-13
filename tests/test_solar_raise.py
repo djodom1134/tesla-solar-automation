@@ -4,7 +4,8 @@ import solar
 
 BASE = dict(enabled=True, state="charging", soc=79, limit=80, ceiling=90,
             grid_w=-3000.0, raised_to=None, hold_elapsed_s=600,
-            raise_hold_s=600, period_s=120)
+            raise_hold_s=600, period_s=120, complete=False, plugged=True,
+            location="home")
 
 
 def d(**over):
@@ -69,3 +70,60 @@ def test_never_raises_below_or_equal_to_the_current_limit():
 
 def test_the_ceiling_is_capped_at_one_hundred():
     assert d(ceiling=110, limit=95, soc=94)[0] == 100
+
+
+# --- the "Complete" deadlock (observed live 2026-09-13 12:10) --------------
+#
+# A car sitting at 84% against an 85% limit reports charging_state
+# "Complete", so charge_start comes back `car could not execute command:
+# complete` and collector.py rolls the machine back to "stopped". The state
+# gate above then refuses the raise -- and the raise is the only thing that
+# would have given the car somewhere to put the sun. The limit stayed at 85
+# from 8 to 13 September with the array exporting 4 kW.
+#
+# "Complete" is not "could not start yet" (a car still waking, which the
+# rollback exists for). It is the car reporting that there is nothing left to
+# charge INTO, which is a request for headroom, not a failure to act on.
+
+
+def test_raises_when_the_car_stopped_because_it_hit_its_limit():
+    assert d(state="stopped", complete=True)[0] == 90
+
+
+def test_complete_bypasses_the_state_gate_from_any_state():
+    for state in ("idle", "grace", "stopped"):
+        assert d(state=state, complete=True)[0] == 90, state
+
+
+def test_complete_never_bypasses_being_plugged_in_and_at_home():
+    """The state gate used to carry this implicitly: advance() only reaches
+    "charging" when the car is plugged in at home. Bypassing the state gate
+    drops that guarantee, so it has to be asserted explicitly -- or a car
+    finished charging somewhere else would have its limit raised from here."""
+    assert d(state="stopped", complete=True, plugged=False)[0] is None
+    assert d(state="stopped", complete=True, location="away")[0] is None
+    assert d(state="stopped", complete=True, location="unknown")[0] is None
+
+
+def test_an_ordinary_charge_still_requires_plugged_in_at_home():
+    assert d(plugged=False)[0] is None
+    assert d(location="away")[0] is None
+    assert d(location="unknown")[0] is None
+
+
+def test_complete_bypasses_only_the_state_gate_and_nothing_else():
+    """Every other reason to refuse still refuses."""
+    assert d(state="stopped", complete=True, enabled=False)[0] is None
+    assert d(state="stopped", complete=True, raised_to=90)[0] is None
+    assert d(state="stopped", complete=True, grid_w=+200.0)[0] is None
+    assert d(state="stopped", complete=True, soc=60)[0] is None
+    assert d(state="stopped", complete=True, soc=None)[0] is None
+    assert d(state="stopped", complete=True, ceiling=80)[0] is None
+
+
+def test_complete_still_waits_out_the_hold():
+    """A raise is a billed command against an NCA pack. Completion is not a
+    reason to skip the dwell that proves the export is real."""
+    target, hold = d(state="stopped", complete=True, hold_elapsed_s=0)
+    assert target is None
+    assert hold == 120

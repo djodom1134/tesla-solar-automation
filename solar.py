@@ -194,7 +194,8 @@ def backoff_seconds(consecutive_429s: int, period_s: int,
 def raise_decision(*, enabled: bool, state: str, soc: int | None,
                    limit: int | None, ceiling: int, grid_w: float,
                    raised_to: int | None, hold_elapsed_s: int,
-                   raise_hold_s: int, period_s: int) -> tuple[int | None, int]:
+                   raise_hold_s: int, period_s: int, complete: bool,
+                   plugged: bool, location: str) -> tuple[int | None, int]:
     """Whether to raise the charge limit, and the updated hold timer.
 
     Returns (limit_to_raise_to or None, new_hold_elapsed_s).
@@ -214,11 +215,36 @@ def raise_decision(*, enabled: bool, state: str, soc: int | None,
         tick would spend a billed write to assert a value the car holds.
       * UNKNOWN NEVER GUESSES -- a missing soc or limit returns None, matching
         the three-valued discipline used for location.
+      * PLUGGED IN, AT HOME -- see `complete` below for why this is stated
+        here rather than inherited from the state gate.
+
+    `complete` opens the one door the state gate has to leave open. A car
+    sitting just under its limit reports charging_state "Complete", so
+    charge_start returns `car could not execute command: complete` and
+    collector.py rolls the machine back to "stopped" -- a rollback that is
+    right for its original case, a car still coming out of sleep. But then
+    the state gate refuses the raise, and the raise is the only thing that
+    would have given the car somewhere to put the sun. Observed live on
+    2026-09-13: an 85% limit against 84% SoC held from 8 September while the
+    array exported 4 kW, because every tick refused in exactly this loop.
+
+    "Complete" is not "could not start yet". It is the car saying there is no
+    headroom left, which is a request for headroom rather than a failure to
+    act on -- so it bypasses the state gate and nothing else.
+
+    Bypassing that gate costs the guarantee it used to carry for free:
+    advance() only ever reaches "charging" with the car plugged in at home,
+    so those two conditions never needed stating. They do now, or a car that
+    finished charging somewhere else would have its limit raised from here.
 
     The hold is compared AS CARRIED IN, like start_hold_s, so the real wait is
     period_s * (ceil(raise_hold_s / period_s) + 1) -- never under two ticks.
     """
-    if not enabled or state != "charging" or raised_to is not None:
+    if not enabled or raised_to is not None:
+        return None, 0
+    if not plugged or location != "home":
+        return None, 0
+    if state != "charging" and not complete:
         return None, 0
     if soc is None or limit is None:
         return None, 0
