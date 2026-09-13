@@ -737,25 +737,50 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
     # real headroom above that or ordinary overnight sleep trips it on
     # nothing. Doubled for margin against scheduler jitter, floored at 1h so
     # a very fast poll cadence can't make the threshold silly-small.
+    # ONE timestamp for this tick, shared by the ledger bookmark below and
+    # log_tick at the end. Two separate time.time() calls can straddle a
+    # second boundary, and a ledger_since_ts one second behind this tick's
+    # logged ts makes `ts > since_ts` include the tick that has just been
+    # credited -- counting its energy again toward the next point.
+    tick_ts = int(time.time())
     ledger_fields: dict = {}
     soc_now = view.get("soc")
     if soc_now is not None:
         prev_tick_ts = solar.last_tick_ts(db, vin)
-        gap_s = int(time.time()) - prev_tick_ts if prev_tick_ts is not None else 0
+        gap_s = tick_ts - prev_tick_ts if prev_tick_ts is not None else 0
         gap_threshold_s = max(2 * getattr(cfg, "poll_asleep", 1800), 3600)
         # PROPORTIONAL attribution, not all-or-nothing. This used to pass a
         # boolean -- engaged, and any solar at all -- which banked the WHOLE
         # SoC rise as sun. A car drawing 2,000 W against 1,900 W of surplus
         # is 5% utility-powered, and recording that as 100% solar makes the
         # ledger flattering rather than true.
-        engaged_now = machine.state in green.ENGAGED_STATES
-        fraction = (green.tick_solar_fraction(car_w, grid_w)
-                    if engaged_now else 0.0)
+        #
+        # INTEGRATED over the whole percentage point, not sampled at the tick
+        # that crossed it. SoC is an integer: a point is ~0.82 kWh on this
+        # pack, thirteen minutes at 3.6 kW, about seven ticks. Reading the
+        # split off tick seven alone threw away the other six -- observed
+        # 2026-09-13, where a cloud at the boundary booked a point as pure
+        # grid though half of it went in under full sun two minutes earlier.
+        # See green.interval_solar_fraction.
+        #
+        # This tick's own row is not in the log yet (log_tick runs below), so
+        # it is appended by hand -- it is the tick that closes the interval
+        # and carries as much weight as any other.
+        since_ts = st["ledger_since_ts"]
+        span = solar.ticks_since(db, vin, since_ts) if since_ts is not None else []
+        span.append({"state": machine.state, "car_w": car_w, "grid_w": grid_w,
+                     "period_s": conf["period_s"]})
+        fraction = green.interval_solar_fraction(span)
         new_solar_soc, ledger_stale = green.ledger_step(
             st["solar_soc"], st["ledger_soc"], int(soc_now), fraction,
             gap_s, gap_threshold_s)
         ledger_fields = {"solar_soc": new_solar_soc, "ledger_soc": int(soc_now),
                          "ledger_stale": 1 if ledger_stale else 0}
+        # The bookmark moves only when the SoC actually moved. While it sits
+        # still the span keeps widening, which is the whole point: the next
+        # point to land gets credited from every tick that fed it.
+        if st["ledger_soc"] is None or int(soc_now) != st["ledger_soc"]:
+            ledger_fields["ledger_since_ts"] = tick_ts
 
         # Lifetime solar/grid energy into the car is NOT accumulated here.
         # It is derived from the tick log on read (green.solar_kwh /
@@ -785,7 +810,7 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
                 ledger_fields["free_miles_since"] = int(time.time())
 
     solar.save_state(db, vin, **solar.machine_fields(machine), **ledger_fields)
-    solar.log_tick(db, vin, ts=int(time.time()), state=machine.state,
+    solar.log_tick(db, vin, ts=tick_ts, state=machine.state,
                    grid_w=grid_w, solar_w=live.get("solar_power"), car_w=car_w,
                    surplus_w=surplus_w, error_w=decision.error_w,
                    amps_before=int(current_a), amps_target=decision.target_a,

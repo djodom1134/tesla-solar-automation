@@ -533,3 +533,69 @@ def test_charged_split_counts_manual_grid_charging_too():
 def test_charged_split_ignores_ticks_where_the_car_drew_nothing():
     assert green.charged_split(
         [{"state": "idle", "car_w": 0, "grid_w": 5000, "period_s": 3600}]) == (0.0, 0.0)
+
+
+# --------------------------------------------------------------------------
+# interval_solar_fraction: the banked ledger's attribution, integrated over a
+# whole SoC step instead of sampled at the instant the step happened to land.
+#
+# Observed live 2026-09-13. An 81.6 kWh pack gains 1% in ~13 minutes at
+# 3.6 kW, against a 120 s tick -- so a percentage point is roughly seven
+# ticks wide, and ledger_step was crediting all of it from whichever single
+# tick happened to cross the integer boundary:
+#
+#   12:17:27  grid -385 W (export)  car 3630 W  fraction 1.0   soc 84
+#   12:19:28  grid +3996 W (import) car 3856 W  fraction 0.0   soc 84 -> 85
+#
+# A cloud at 12:19 booked the entire point as grid, though half of it went in
+# under full sun two minutes earlier. On a partly cloudy day that is close to
+# a coin flip, which is why banked_pct sat at 1.0% against 48.79 kWh of
+# lifetime solar actually delivered.
+# --------------------------------------------------------------------------
+
+def _t(car_w, grid_w, period_s=120, state="charging"):
+    return {"state": state, "car_w": car_w, "grid_w": grid_w,
+            "period_s": period_s}
+
+
+def test_interval_fraction_of_nothing_is_zero():
+    """No ticks, or ticks where the car drew nothing, bank nothing -- rather
+    than dividing by zero or guessing a half."""
+    assert green.interval_solar_fraction([]) == 0.0
+    assert green.interval_solar_fraction([_t(0, -4000)]) == 0.0
+
+
+def test_interval_fraction_of_a_single_tick_matches_the_instant_formula():
+    """One tick wide, this must agree with tick_solar_fraction exactly, or
+    the fix would quietly change the easy case as well as the hard one."""
+    for car_w, grid_w in ((3630, -385), (3856, 3996), (2000, 1000)):
+        assert green.interval_solar_fraction([_t(car_w, grid_w)]) == pytest.approx(
+            green.tick_solar_fraction(car_w, grid_w))
+
+
+def test_the_regression_a_cloud_at_the_boundary_no_longer_erases_the_step():
+    """The live 2026-09-13 pair. Sampling the last tick alone gives 0.0;
+    integrating over both gives roughly half, which is what actually went in."""
+    ticks = [_t(3630, -385), _t(3856, 3996)]
+    assert green.tick_solar_fraction(3856, 3996) == 0.0      # what it used to see
+    assert green.interval_solar_fraction(ticks) == pytest.approx(0.485, abs=0.01)
+
+
+def test_interval_fraction_weights_by_energy_not_by_tick_count():
+    """A long sunny tick outweighs a short cloudy one. Counting ticks rather
+    than watt-hours would call this an even split."""
+    ticks = [_t(4000, -4000, period_s=600), _t(4000, 4000, period_s=120)]
+    assert green.interval_solar_fraction(ticks) == pytest.approx(600 / 720, abs=0.01)
+
+
+def test_interval_fraction_is_bounded_to_the_unit_interval():
+    assert green.interval_solar_fraction([_t(4000, -9000)]) == 1.0
+    assert green.interval_solar_fraction([_t(4000, 9000)]) == 0.0
+
+
+def test_interval_fraction_counts_charges_the_controller_did_not_drive():
+    """Same reasoning as charged_split: a session the owner started at full
+    rate from the grid still dilutes the bank, so it must not be filtered out
+    of the denominator the way solar_kwh filters it out of a total."""
+    ticks = [_t(7000, 7000, state="idle")]
+    assert green.interval_solar_fraction(ticks) == 0.0

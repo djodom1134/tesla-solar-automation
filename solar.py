@@ -712,6 +712,11 @@ CREATE TABLE IF NOT EXISTS solar_state (
   solar_soc       REAL    NOT NULL DEFAULT 0,
   ledger_soc      INTEGER,
   ledger_stale    INTEGER NOT NULL DEFAULT 0,
+  -- When ledger_soc last CHANGED. A percentage point of an 81.6 kWh pack is
+  -- ~13 minutes of charging against a 120 s tick, so the sun/grid split has
+  -- to be integrated across that whole span rather than read off whichever
+  -- tick crossed the integer -- see green.interval_solar_fraction.
+  ledger_since_ts INTEGER,
   -- Task 20: lifetime free miles driven (see green.free_miles_step). A
   -- running total, never reset -- ledger_odo is the odometer as of the last
   -- observation (NULL until this ledger has watched its own first tick,
@@ -786,6 +791,7 @@ STATE_DEFAULTS = {
     "garage_armed": 0, "garage_last_close_day": None,
     "force_started": 0,
     "solar_soc": 0.0, "ledger_soc": None, "ledger_stale": 0,
+    "ledger_since_ts": None,
     "free_miles_driven": 0.0, "tracked_miles": 0.0, "ledger_odo": None,
     "free_miles_since": None,
     "heartbeat_ts": None, "heartbeat_sleep_s": None,
@@ -823,6 +829,12 @@ STATE_NEW_COLUMNS = (
     ("solar_soc", "REAL NOT NULL DEFAULT 0"),
     ("ledger_soc", "INTEGER"),
     ("ledger_stale", "INTEGER NOT NULL DEFAULT 0"),
+    # When ledger_soc last CHANGED, so the attribution can be integrated
+    # across the whole percentage point rather than sampled at whichever
+    # tick crossed it -- see green.interval_solar_fraction. A bookmark like
+    # ledger_soc and ledger_odo, not a counter: nothing accumulates in it,
+    # so it cannot drift away from the tick log the way a stored total can.
+    ("ledger_since_ts", "INTEGER"),
     # Task 20: lifetime free miles driven -- see the SCHEMA comment above.
     ("free_miles_driven", "REAL NOT NULL DEFAULT 0"),
     ("tracked_miles", "REAL NOT NULL DEFAULT 0"),
@@ -1179,6 +1191,27 @@ def recent_grid_w(db: sqlite3.Connection, vin: str, limit: int) -> list[float]:
         (vin, limit),
     ).fetchall()
     return [row["grid_w"] for row in rows]
+
+
+def ticks_since(db: sqlite3.Connection, vin: str,
+                since_ts: int) -> list[dict]:
+    """Every logged tick for vin strictly after since_ts, oldest first.
+
+    Feeds green.interval_solar_fraction, which needs the whole span a
+    percentage point of SoC accumulated over rather than the single tick
+    that happened to cross the integer. Selects only the four columns that
+    attribution reads, the same set solar_routes._solar_ticks uses, so the
+    two can never disagree about what a tick is.
+
+    Strictly after, not on or after: since_ts is the moment the SoC last
+    changed, and the tick that produced that change was already credited to
+    the previous point. Including it would count it twice.
+    """
+    rows = db.execute(
+        "SELECT state, car_w, grid_w, period_s FROM solar_ticks"
+        " WHERE vin = ? AND ts > ? ORDER BY ts", (vin, since_ts),
+    ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def last_tick_ts(db: sqlite3.Connection, vin: str) -> int | None:

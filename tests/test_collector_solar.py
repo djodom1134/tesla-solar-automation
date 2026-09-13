@@ -2898,3 +2898,100 @@ async def test_a_complete_car_away_from_home_is_never_raised(tmp_path):
 
     assert [c for c in client.commands if c[0] == "set_charge_limit"] == []
     store_.close()
+
+
+class _Clock:
+    """A tick every period_s, as the real loop runs. The ledger span is keyed
+    on timestamps, so tests that fire every tick inside one wall-clock second
+    describe a cadence the collector never has."""
+
+    def __init__(self, start: float = 1_700_000_000.0, step: float = 120.0):
+        self.now, self.step = start, step
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self) -> None:
+        self.now += self.step
+
+
+@pytest.mark.asyncio
+async def test_a_percentage_point_is_credited_from_every_tick_that_fed_it(
+        tmp_path, monkeypatch):
+    """The 2026-09-13 regression, end to end.
+
+    A point of SoC takes many ticks to accumulate. Sun for three of them,
+    then a cloud on the tick that happens to cross the integer boundary --
+    which used to book the entire point as grid, because attribution read
+    only the crossing tick. It must now come out near three quarters solar.
+    """
+    store_ = Store(tmp_path / "car.db")
+    db = store_._db
+    solar.save_config(db, enabled=1, period_s=120)
+    home.save(db, 40.0, -105.0, 100)
+    solar.save_state(db, "VIN1", state="idle", hold_s=10_000)
+
+    clock = _Clock()
+    monkeypatch.setattr(time, "time", clock)
+
+    client = _ControllableGridClient(grid_w=-6000.0)
+    cfg = SimpleNamespace(timezone="America/Denver",
+                          proxy_url="https://localhost:4443")
+
+    # Engage, and pin the bookmark at a known SoC.
+    await collector.solar_tick(client, store_, "VIN1", _ledger_view(55), cfg, site_id=1)
+    assert solar.load_state(db, "VIN1")["state"] == "charging"
+
+    # Three ticks of real export with SoC not yet ticking over.
+    for _ in range(3):
+        clock.advance()
+        await collector.solar_tick(client, store_, "VIN1", _ledger_view(55),
+                                   cfg, site_id=1)
+    assert solar.load_state(db, "VIN1")["solar_soc"] == 0, "premise: nothing banked yet"
+
+    # A cloud lands on the very tick the point turns over.
+    clock.advance()
+    client.grid_w = 9000.0
+    await collector.solar_tick(client, store_, "VIN1", _ledger_view(56), cfg, site_id=1)
+
+    st = solar.load_state(db, "VIN1")
+    assert st["ledger_soc"] == 56
+    assert st["solar_soc"] > 0.5, (
+        "the sunny ticks that actually filled this point were thrown away; "
+        f"banked {st['solar_soc']}")
+    assert st["solar_soc"] == pytest.approx(0.75, abs=0.1)
+    store_.close()
+
+
+@pytest.mark.asyncio
+async def test_the_ledger_bookmark_only_moves_when_the_soc_does(
+        tmp_path, monkeypatch):
+    """While SoC sits still the span must keep widening, or the next point
+    would again be credited from a single tick."""
+    store_ = Store(tmp_path / "car.db")
+    db = store_._db
+    solar.save_config(db, enabled=1, period_s=120)
+    home.save(db, 40.0, -105.0, 100)
+    solar.save_state(db, "VIN1", state="idle", hold_s=10_000)
+
+    clock = _Clock()
+    monkeypatch.setattr(time, "time", clock)
+
+    client = _ControllableGridClient(grid_w=-6000.0)
+    cfg = SimpleNamespace(timezone="America/Denver",
+                          proxy_url="https://localhost:4443")
+
+    await collector.solar_tick(client, store_, "VIN1", _ledger_view(55), cfg, site_id=1)
+    pinned = solar.load_state(db, "VIN1")["ledger_since_ts"]
+    assert pinned is not None
+
+    for _ in range(3):
+        clock.advance()
+        await collector.solar_tick(client, store_, "VIN1", _ledger_view(55),
+                                   cfg, site_id=1)
+        assert solar.load_state(db, "VIN1")["ledger_since_ts"] == pinned
+
+    clock.advance()
+    await collector.solar_tick(client, store_, "VIN1", _ledger_view(56), cfg, site_id=1)
+    assert solar.load_state(db, "VIN1")["ledger_since_ts"] != pinned
+    store_.close()

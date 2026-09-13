@@ -57,8 +57,9 @@ def tick_solar_w(car_w: float, grid_w: float) -> float:
     wrong for a number whose entire purpose is to be trustworthy.
 
     Shared by solar_kwh (which sums this over a tick log) and the
-    banked-solar ledger (which only needs to know whether THIS tick was
-    positive) -- one formula, so the two can never quietly drift apart.
+    banked-solar ledger (which integrates it across a SoC step, via
+    interval_solar_fraction) -- one formula, so the two can never quietly
+    drift apart.
     """
     return max(0.0, car_w - max(grid_w, 0.0))
 
@@ -232,6 +233,48 @@ def tick_solar_fraction(car_w: float, grid_w: float) -> float:
     if car_w <= 0:
         return 0.0
     return tick_solar_w(car_w, grid_w) / car_w
+
+
+def interval_solar_fraction(ticks: list[dict[str, Any]]) -> float:
+    """The solar share of everything the car drew across a SPAN of ticks,
+    weighted by energy. In [0, 1]; 0.0 when the car drew nothing at all.
+
+    This is tick_solar_fraction's answer for a window rather than an instant,
+    and the ledger needs the window one. SoC is an integer percentage: on an
+    81.6 kWh pack a single point is ~0.82 kWh, about thirteen minutes at
+    3.6 kW, or roughly seven ticks at a 120 s period. Crediting all seven
+    ticks' worth of energy using only the tick that happened to cross the
+    integer boundary samples one moment in seven and calls it the whole step.
+
+    Observed live 2026-09-13 -- the array exporting at 12:17 and a cloud
+    importing 4 kW at 12:19, with the boundary landing on the cloud, so an
+    entire percentage point was booked as grid though half of it went in
+    under full sun. Over a partly cloudy day the error does not average out
+    in any useful way; it just adds noise with a bias toward whichever
+    condition is more common at boundary-crossing time.
+
+    Built on tick_solar_w/tick_grid_w for the same reason everything else
+    here is: one formula, so the ledger, the daily total and the lifetime
+    split can never quietly disagree about the same tick.
+
+    Deliberately NOT filtered by ENGAGED_STATES, matching charged_split
+    rather than solar_kwh. A charge the owner started themselves at full rate
+    from the grid still dilutes the bank -- that is the whole meaning of
+    "grid electrons dilute the sun already banked" -- so those ticks belong
+    in the denominator. Filtering them out is exactly how the card once read
+    61% solar against a true 29%.
+    """
+    solar_wh = grid_wh = 0.0
+    for tick in ticks:
+        car_w = float(tick.get("car_w") or 0)
+        grid_w = float(tick.get("grid_w") or 0)
+        period_s = float(tick.get("period_s") or 0)
+        solar_wh += tick_solar_w(car_w, grid_w) * period_s / 3600
+        grid_wh += tick_grid_w(car_w, grid_w) * period_s / 3600
+    total = solar_wh + grid_wh
+    if total <= 0:
+        return 0.0
+    return solar_wh / total
 
 
 def ledger_step(solar_soc: float, soc_before: int | None, soc_now: int,
