@@ -256,6 +256,37 @@ def raise_decision(*, enabled: bool, state: str, soc: int | None,
     return None, hold_elapsed_s + period_s
 
 
+def should_plug_in(*, plugged: bool, location: str, soc: int | None,
+                   ceiling: int, surplus_w: float | None,
+                   tun: Tunables) -> bool:
+    """Whether the owner is leaving sunshine on the table for want of a cable.
+
+    Every other feature here can act on its own. This one cannot -- nothing
+    in the Fleet API plugs a car in -- so it exists purely to be reported,
+    and ha_routes carries it to Home Assistant, which owns the notifying.
+
+    The bar is start_watts, the same threshold advance() itself requires
+    before starting a charge, deliberately rather than a round number. A
+    reminder that fires below it is a reminder to plug in for a charge that
+    would never start; and stating it here rather than in an HA template
+    means it keeps tracking min_a and margin_w instead of quietly going
+    wrong the first time either changes.
+
+    At or above the ceiling there is nowhere to put the energy, so there is
+    nothing to be reminded about. Unknowns refuse rather than guess, and
+    location is three-valued for the usual reason -- Tesla omits the keys
+    rather than nulling them, so "away" and "we cannot tell" are different
+    claims and neither is "home".
+    """
+    if plugged or location != "home":
+        return False
+    if soc is None or surplus_w is None:
+        return False
+    if soc >= ceiling:
+        return False
+    return surplus_w >= start_watts(tun)
+
+
 STATES = frozenset({"idle", "charging", "grace", "stopped"})
 
 

@@ -5,6 +5,7 @@ import time
 import pytest
 
 import ha_routes
+import home
 import solar
 from store import Store
 
@@ -171,3 +172,77 @@ async def test_live_power_comes_from_the_tick_log_not_a_billed_call(tmp_path, mo
     # template rather than an endpoint change.
     assert body["car"]["soc"] == 60
     st.close()
+
+
+# --------------------------------------------------------------------------
+# should_plug_in: sunshine going to the grid for want of a cable. Nothing
+# here can plug a car in, so the endpoint reports it and a Home Assistant
+# automation does the notifying.
+# --------------------------------------------------------------------------
+
+def _plug_in_store(tmp_path, *, soc, charging_state, lat=40.0, lon=-105.0,
+                   surplus_w=4000.0):
+    st = Store(tmp_path / "car.db")
+    solar.save_config(st._db, enabled=1, soc_ceiling=95)
+    home.save(st._db, 40.0, -105.0, 100)
+    solar.save_state(st._db, "VIN1", heartbeat_ts=int(time.time()),
+                     heartbeat_sleep_s=120)
+    st.record({"vin": "VIN1", "soc": soc, "limit": 80,
+               "sampled_at": int(time.time()), "charging_state": charging_state,
+               "amps_actual": 0, "charging": 0, "lat": lat, "lon": lon},
+              at_home=True)
+    solar.log_tick(st._db, "VIN1", ts=int(time.time()), state="idle",
+                   grid_w=-surplus_w, solar_w=surplus_w, car_w=0.0,
+                   surplus_w=surplus_w, error_w=0.0, amps_before=0,
+                   amps_target=0, amps_written=None, soc=soc, import_w=0.0,
+                   period_s=120)
+    return st
+
+
+async def _plug_in_body(tmp_path, monkeypatch, **kw):
+    st = _plug_in_store(tmp_path, **kw)
+    monkeypatch.setattr(ha_routes, "DEMO", False)
+    monkeypatch.setattr(ha_routes, "store", lambda: st)
+    monkeypatch.setattr(ha_routes.settings, "vin", "VIN1")
+    try:
+        return await ha_routes.ha_state()
+    finally:
+        st.close()
+
+
+@pytest.mark.asyncio
+async def test_state_flags_an_unplugged_car_wasting_sunshine(tmp_path, monkeypatch):
+    body = await _plug_in_body(tmp_path, monkeypatch, soc=60,
+                               charging_state="Disconnected")
+    assert body["should_plug_in"] is True
+
+
+@pytest.mark.asyncio
+async def test_state_does_not_nag_about_a_car_already_plugged_in(tmp_path, monkeypatch):
+    body = await _plug_in_body(tmp_path, monkeypatch, soc=60,
+                               charging_state="Stopped")
+    assert body["plugged_in"] is True
+    assert body["should_plug_in"] is False
+
+
+@pytest.mark.asyncio
+async def test_state_does_not_nag_about_a_car_that_is_elsewhere(tmp_path, monkeypatch):
+    body = await _plug_in_body(tmp_path, monkeypatch, soc=60,
+                               charging_state="Disconnected",
+                               lat=41.0, lon=-106.0)
+    assert body["location"] == "away"
+    assert body["should_plug_in"] is False
+
+
+@pytest.mark.asyncio
+async def test_state_does_not_nag_when_there_is_no_sun(tmp_path, monkeypatch):
+    body = await _plug_in_body(tmp_path, monkeypatch, soc=60,
+                               charging_state="Disconnected", surplus_w=200.0)
+    assert body["should_plug_in"] is False
+
+
+@pytest.mark.asyncio
+async def test_state_does_not_nag_about_a_car_at_the_ceiling(tmp_path, monkeypatch):
+    body = await _plug_in_body(tmp_path, monkeypatch, soc=96,
+                               charging_state="Disconnected")
+    assert body["should_plug_in"] is False

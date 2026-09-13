@@ -39,6 +39,14 @@ from store import Store
 
 DEMO = os.getenv("DEMO", "").strip() in {"1", "true", "yes"}
 
+# Stays 1 across additive changes on purpose. `schema` is a SENTINEL, not a
+# version counter: the consumer checks `schema == 1` to tell our payload from
+# an error body (the rest platform never raise_for_status()es, so a 401 lands
+# as parseable JSON). Every rest sensor gates availability on that equality,
+# so bumping it for a new field like should_plug_in would silently mark every
+# one of them unavailable -- a consumer reads a new field by asking for the
+# key, never by the version number. Bump only on a BREAKING change to an
+# existing field, and update the consumer in the same breath.
 SCHEMA = 1
 
 router = APIRouter(prefix="/api/ha")
@@ -106,6 +114,13 @@ async def ha_state() -> dict[str, Any]:
     # nothing. The price is freshness -- as recent as the last tick, which is
     # 120 s while engaged and up to 1800 s after dark -- and the HA templates
     # gate on exactly that rather than presenting a stale number as live.
+    # Reported, never acted on: nothing in the Fleet API plugs a car in, so
+    # the reminder exists to be carried to Home Assistant, which owns the
+    # notifying (and the quiet hours, and which phone). Both values are
+    # needed twice below, so they are computed once here.
+    plugged_in = view.get("charging_state") not in (None, "Disconnected")
+    location = home.classify(view, home.load(db)) if view else "unknown"
+
     solar_w = last["solar_w"] if last else None
     grid_w = last["grid_w"] if last else None
     car_w = last["car_w"] if last else None
@@ -149,7 +164,7 @@ async def ha_state() -> dict[str, Any]:
         "limit": view.get("limit"),
         "range_mi": view.get("range_mi"),
         "odometer_mi": view.get("odometer_mi"),
-        "plugged_in": view.get("charging_state") not in (None, "Disconnected"),
+        "plugged_in": plugged_in,
         "charging": view.get("charging_state") in solar.LIVE_CHARGING_STATES,
         "charging_state": view.get("charging_state"),
         # Three-valued on purpose: Tesla OMITS location keys rather than
@@ -157,7 +172,20 @@ async def ha_state() -> dict[str, Any]:
         # elsewhere" are indistinguishable. HA maps unknown to unavailable
         # rather than to not_home, or every "car left" automation fires each
         # time the car falls asleep in the garage.
-        "location": home.classify(view, home.load(db)) if view else "unknown",
+        "location": location,
+
+        # Sunshine going to the grid for want of a cable -- see
+        # solar.should_plug_in. The threshold is the controller's own
+        # start_watts rather than a number repeated in a template, so it
+        # tracks min_a and margin_w instead of drifting from them.
+        "should_plug_in": solar.should_plug_in(
+            plugged=plugged_in,
+            location=location,
+            soc=view.get("soc"),
+            ceiling=conf["soc_ceiling"],
+            surplus_w=last["surplus_w"] if last else None,
+            tun=solar.tunables_from(conf, view.get("amps_max"),
+                                    view.get("volts"))),
 
         # Tunables HA may display and write.
         "margin_w": conf["margin_w"],
