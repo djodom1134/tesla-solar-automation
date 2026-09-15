@@ -96,10 +96,17 @@ async def poll_once(client: TeslaClient, store: Store, vin: str, cfg):
     return car_state, view
 
 
-# How stale the stored snapshot may be and still justify waking a car for
-# sunshine. Six hours spans a working day: long enough that a car parked
-# and asleep since breakfast is still actionable at noon, short enough
+# How long we may go without knowing where a car is and still justify waking
+# it for sunshine. Six hours spans a working day: long enough that a car
+# parked and asleep since breakfast is still actionable at noon, short enough
 # that a car driven away yesterday never is.
+#
+# Judged against solar.knowledge_age_s, NOT against the snapshot's own age.
+# The two are the same only for a car nobody was watching; for one this loop
+# has watched sleep without a break, the snapshot stays actionable however
+# old it is, because a sleeping car has not been driven anywhere. See
+# solar.asleep_confirmed -- measuring the snapshot instead switched the whole
+# feature off six hours into every overnight sleep.
 SNAPSHOT_MAX_AGE_S = 6 * 3600
 
 # Refusals that mean "already in the state you asked for", keyed by the
@@ -301,8 +308,14 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
         if st["state"] not in ("idle", "stopped"):
             return st["state"], False
         snap = store_.snapshot(vin)
-        age_s = (time.time() - snap["ts"]) if snap else None
         shadow = snap["view"] if snap else None
+        # Age from the last moment we KNEW where this car was, which for a
+        # car we have watched sleep without a break is this tick -- not from
+        # the snapshot, whose age a sleeping car can only ever add to. See
+        # solar.asleep_confirmed for the seventeen hours that cost.
+        age_s = solar.knowledge_age_s(time.time(),
+                                      snap["ts"] if snap else None,
+                                      st["asleep_confirmed_ts"])
         if not solar.sleeping_candidate(shadow, age_s, SNAPSHOT_MAX_AGE_S):
             return st["state"], False
         view = shadow
@@ -1106,8 +1119,44 @@ async def run(once: bool = False) -> int:
             # cap tripped, recovery pending, auth lost -- and a heartbeat
             # written only on the happy path would report a working collector
             # as dead precisely when something is wrong.
-            solar.save_state(store._db, vin, heartbeat_ts=int(time.time()),
-                             heartbeat_sleep_s=int(last_sleep_s))
+            #
+            # THE UNBROKEN WATCH goes with it, and for a closely related
+            # reason: both are statements about our own attendance, and both
+            # are only honest if they are written on every pass rather than
+            # the happy ones. A car seen still asleep one cadence after we
+            # last looked has not been driven anywhere, so this is what keeps
+            # its snapshot actionable through a night and a morning -- see
+            # solar.asleep_confirmed. car_state is the previous pass's
+            # reading, which is exactly the claim being extended.
+            #
+            # The gap tolerance mirrors ha_routes.collector_running: two
+            # cadences plus a minute, floored at 300 s. The wider of two
+            # cadences, because two different observers are involved.
+            # last_sleep_s is the sleep THIS process just completed and is
+            # the gap inside a running loop; on the first pass after a
+            # restart it is still the 60 s default, while the gap is whatever
+            # the previous process was sleeping -- 1800 s after dark -- so
+            # its recorded heartbeat_sleep_s has to be allowed to speak for
+            # it. Without that, every restart breaks a chain that nothing was
+            # actually wrong with. A hole wider than either explains -- a
+            # long outage, a suspended Mac -- still breaks it, which is the
+            # point.
+            now_beat = time.time()
+            snap = store.snapshot(vin)
+            if car_state == "online":
+                # A fresh view is the snapshot's own answer; nothing to carry.
+                confirmed = None
+            else:
+                confirmed = solar.asleep_confirmed(
+                    now=now_beat,
+                    snapshot_ts=snap["ts"] if snap else None,
+                    confirmed_ts=st["asleep_confirmed_ts"],
+                    max_gap_s=max(300, 2 * max(
+                        last_sleep_s, st["heartbeat_sleep_s"] or 0) + 60))
+            solar.save_state(store._db, vin, heartbeat_ts=int(now_beat),
+                             heartbeat_sleep_s=int(last_sleep_s),
+                             asleep_confirmed_ts=None if confirmed is None
+                             else int(confirmed))
 
             # METER-ONLY WATCH. A plugged-in, hungry car that is asleep
             # needs no vehicle request at all: only the SITE meter can say
@@ -1127,10 +1176,11 @@ async def run(once: bool = False) -> int:
                     and not solar.forcing(conf, time.time())
                     and site_id is not None
                     and st["state"] in ("idle", "stopped")):
-                snap = store.snapshot(vin)
                 watching = solar.sleeping_candidate(
                     snap["view"] if snap else None,
-                    (time.time() - snap["ts"]) if snap else None,
+                    solar.knowledge_age_s(now_beat,
+                                          snap["ts"] if snap else None,
+                                          confirmed),
                     SNAPSHOT_MAX_AGE_S)
 
             try:

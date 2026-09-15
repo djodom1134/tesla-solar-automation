@@ -158,8 +158,15 @@ def sleeping_candidate(view: dict | None, age_s: float | None,
       plugged   -- waking an unplugged car buys nothing and cannot charge
       headroom  -- at or within a point of its limit there is nowhere to put
                    the energy
-      fresh     -- an old snapshot may describe a car that has since been
-                   driven away; acting on it would wake a car somewhere else
+      fresh     -- a car we have not been watching may have been driven away
+                   since; acting on it would wake a car somewhere else
+
+    `age_s` is time since we last KNEW where the car was, which is not the
+    same as the snapshot's age and must not be passed as one -- see
+    asleep_confirmed and knowledge_age_s, and the seventeen hours of sunshine
+    that distinction cost on 2026-09-14. An unbroken watch answers with this
+    tick however old the view is; only a car nobody was watching is judged on
+    the age of the view itself.
 
     Missing data is never an invitation to command a car, so every unknown
     returns False rather than being treated as permissive.
@@ -172,6 +179,70 @@ def sleeping_candidate(view: dict | None, age_s: float | None,
     if soc is None or limit is None:
         return False
     return soc < limit - 1
+
+
+def asleep_confirmed(*, now: float, snapshot_ts: float | None,
+                     confirmed_ts: float | None, max_gap_s: float,
+                     ) -> float | None:
+    """The moment we last KNEW where a sleeping car was, carried forward by
+    one more observation that it is still asleep. None when the chain is
+    broken and only the snapshot's own age can answer.
+
+    sleeping_candidate's freshness clause stands in for "the car may have
+    been driven away since", and against a sleeping car it cannot do that
+    job: the one thing that refreshes a snapshot is a wake, which is the
+    thing the clause blocks, so its age only ever grows. Observed live
+    2026-09-14 -- the last view was taken at 20:16, the watch died at 02:16
+    exactly SNAPSHOT_MAX_AGE_S later, and the car then sat plugged in at 84%
+    against a 99% limit through a 24.2 kWh solar day, 10.0 kWh of which was
+    exported. Seventeen hours, no tick logged. Every overnight sleep disarmed
+    the feature before sunrise; the case it was written for, a car asleep
+    since breakfast, is the only one it could ever serve.
+
+    Attendance is the better question, and it is free. A car cannot be driven
+    away while asleep -- moving it wakes it, and the loop's cheap state check
+    sees that on its next pass. So while our observations are UNBROKEN, "the
+    car is still asleep" is a live statement about where it is now, not a
+    stale one about where it was, and the snapshot may be believed however
+    old it is.
+
+    "Asleep" here means anything that is not online, which is the same test
+    the meter-only watch itself uses. Tesla settles a parked car from asleep
+    into offline after a while and the distinction says nothing about
+    movement: the collector log for 2026-09-14 carries six `asleep` lines and
+    199 `offline` ones for the same motionless car in the same garage.
+    Narrowing this to the literal "asleep" would put that entire day back.
+
+    Unbroken means the gap since the last observation is within max_gap_s --
+    the caller's own cadence plus slack, the same shape ha_routes.py judges
+    the heartbeat by. A collector restarted, a Mac mini suspended, or an
+    outage of any kind leaves a hole we cannot vouch across, and the chain
+    breaks rather than papering over it. Breaking hands the question back to
+    SNAPSHOT_MAX_AGE_S, which was always the right conservative answer for a
+    car nobody was watching.
+
+    The first link is the snapshot itself, judged by the same gap rule: a car
+    seen one poll ago is one we are still watching. A car never seen at all
+    has nothing to vouch for it.
+    """
+    last = confirmed_ts if confirmed_ts is not None else snapshot_ts
+    if last is None or now - last > max_gap_s:
+        return None
+    return now
+
+
+def knowledge_age_s(now: float, snapshot_ts: float | None,
+                    confirmed_ts: float | None) -> float | None:
+    """How long since we last knew where this car was -- what
+    sleeping_candidate's `age_s` actually means, and what its cap judges.
+
+    An unbroken watch (see asleep_confirmed) answers with this tick, so the
+    age is a poll interval at most. A broken one answers with the snapshot,
+    which is the only thing left that knows anything.
+    """
+    if confirmed_ts is not None:
+        return now - confirmed_ts
+    return None if snapshot_ts is None else now - snapshot_ts
 
 
 def backoff_seconds(consecutive_429s: int, period_s: int,
@@ -254,6 +325,53 @@ def raise_decision(*, enabled: bool, state: str, soc: int | None,
         target = min(int(ceiling), 100)
         return (target if target > limit else None), hold_elapsed_s
     return None, hold_elapsed_s + period_s
+
+
+def controller_blind(*, enabled: bool, running: bool, capped: bool,
+                     last_tick_ts: float | None, now: float,
+                     plugged: bool, location: str, soc: int | None,
+                     limit: int | None, stale_after_s: float) -> bool:
+    """Whether the controller has stopped looking at the meter while there
+    was every reason to be watching it.
+
+    Reported, never acted on -- ha_routes carries it to Home Assistant, which
+    owns the notifying, exactly as should_plug_in is.
+
+    THE DAY THIS EXISTS FOR, 2026-09-14. The meter-only watch disarmed itself
+    at 02:16 (see asleep_confirmed) and the loop logged no tick for the next
+    seventeen hours, through a 24.2 kWh solar day, with the car plugged in at
+    84% against a 99% limit. Nothing anywhere said so. The heartbeat was
+    written on every one of those passes -- correctly, because the process
+    was alive and every quiet path it took is a legitimate one -- so
+    collector_running answered `true` all day and every signal built on it
+    agreed. The owner found out by walking out to the car.
+
+    Liveness and usefulness are different questions, and only the first had
+    an answer. This is the second: a car to charge, a controller to charge it
+    with, and no tick in longer than any cadence that controller uses can
+    explain.
+
+    The exclusions are the design. Each names a condition that produces no
+    ticks and SHOULD produce none, and each already has its own signal where
+    the owner would want one -- a switched-off feature, a dead process
+    (collector_running), a spent daily budget (capped). The one that is not
+    an alarm at all is a car with no headroom: sleeping_candidate refuses to
+    watch on its behalf deliberately, so silence there is the system working.
+    An alarm that fires on any of these is one the owner learns to ignore,
+    and silence cost a single day where noise would cost every day after it.
+
+    stale_after_s belongs to the caller because only the caller knows the
+    cadence actually in force -- 120 s engaged, 1800 s after dark.
+    """
+    if not enabled or not running or capped:
+        return False
+    if not plugged or location != "home":
+        return False
+    if soc is None or limit is None or soc >= limit - 1:
+        return False
+    if last_tick_ts is None:
+        return True
+    return (now - last_tick_ts) > stale_after_s
 
 
 def should_plug_in(*, plugged: bool, location: str, soc: int | None,
@@ -704,6 +822,9 @@ CREATE TABLE IF NOT EXISTS solar_state (
   -- decided; see STATE_NEW_COLUMNS for why tick age cannot answer this.
   heartbeat_ts      INTEGER,
   heartbeat_sleep_s INTEGER,
+  -- The unbroken-watch anchor: when we last saw, without a gap, that this
+  -- car was still asleep. See solar.asleep_confirmed.
+  asleep_confirmed_ts INTEGER,
   dirty           INTEGER NOT NULL DEFAULT 0,
   original_amps   INTEGER,
   original_limit  INTEGER,
@@ -826,6 +947,7 @@ STATE_DEFAULTS = {
     "free_miles_driven": 0.0, "tracked_miles": 0.0, "ledger_odo": None,
     "free_miles_since": None,
     "heartbeat_ts": None, "heartbeat_sleep_s": None,
+    "asleep_confirmed_ts": None,
     "commanded_amps": None, "commanded_ack": 0,
     "override_amps": None, "override_since": None, "override_armed": 0,
 }
@@ -880,6 +1002,10 @@ STATE_NEW_COLUMNS = (
     # age would report the collector dead every night.
     ("heartbeat_ts", "INTEGER"),
     ("heartbeat_sleep_s", "INTEGER"),
+    # The unbroken-watch anchor. NULL on every existing install, which is the
+    # correct starting point: a chain nobody has built yet is a chain we
+    # cannot claim, so the snapshot cap governs until the car next wakes.
+    ("asleep_confirmed_ts", "INTEGER"),
     # charge_mode "now": the latch that stops the force expiring on its own
     # first tick -- see the SCHEMA comment above.
     ("force_started", "INTEGER NOT NULL DEFAULT 0"),

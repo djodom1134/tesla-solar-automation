@@ -282,3 +282,125 @@ def test_too_little_history_keeps_watching():
     morning costs the whole feature."""
     assert not solar.is_dark([])
     assert not solar.is_dark([None, None, None])
+
+
+def test_watching_a_car_sleep_keeps_its_snapshot_actionable():
+    """Observed live 2026-09-14: the car's last view was taken at 20:16, it
+    slept, and at 02:16 -- SNAPSHOT_MAX_AGE_S to the minute -- the meter-only
+    watch refused to look at the meter again. It stayed refused through a
+    24.2 kWh solar day, 10.0 kWh of which went to the grid while the car sat
+    plugged in at 84% against a 99% limit, and the controller logged no tick
+    at all for the next seventeen hours.
+
+    The gate could not do anything else. A sleeping car's snapshot is
+    refreshed by exactly one thing -- a wake -- which is the thing the gate
+    was blocking, so its age could only ever grow. Six hours after a car fell
+    asleep the feature switched itself off and no amount of sunshine could
+    switch it back on. The overnight case, which is every case that matters,
+    was the one it could never serve.
+
+    What the age was standing in for is "the car may have been driven away
+    since". A car cannot be driven away while asleep -- moving it wakes it,
+    and a wake is something the loop SEES on its next cheap state check. So
+    an unbroken chain of observations that the car is still asleep is a
+    stronger statement than any freshness cap, and it is free.
+    """
+    now = 1_760_000_000.0
+    overnight = now - 17 * 3600          # last view seventeen hours ago
+    one_poll_ago = now - 1800
+
+    assert solar.asleep_confirmed(
+        now=now, snapshot_ts=overnight, confirmed_ts=one_poll_ago,
+        max_gap_s=3660) == now, (
+        "an unbroken watch must carry the snapshot forward, however old it is")
+
+    assert solar.knowledge_age_s(now, snapshot_ts=overnight,
+                                 confirmed_ts=now) == 0.0
+
+
+def test_a_gap_in_our_own_watching_falls_back_to_the_snapshot():
+    """The chain is only as good as our own attendance. A collector that was
+    restarted, or a Mac mini that suspended, did not see the car for that
+    window -- and a car it did not see is a car that may have moved. Breaking
+    the chain hands the question back to SNAPSHOT_MAX_AGE_S, which is the
+    conservative answer it was always right about.
+    """
+    now = 1_760_000_000.0
+    overnight = now - 17 * 3600
+
+    assert solar.asleep_confirmed(
+        now=now, snapshot_ts=overnight, confirmed_ts=now - 7200,
+        max_gap_s=3660) is None, "two hours unwatched is not a chain"
+
+    # And a broken chain means the age the cap actually judges is the
+    # snapshot's own, so a seventeen-hour-old view is refused as before.
+    assert solar.knowledge_age_s(now, snapshot_ts=overnight,
+                                 confirmed_ts=None) == 17 * 3600
+    assert not solar.sleeping_candidate(
+        {"charging_state": "Stopped", "soc": 38, "limit": 91},
+        age_s=17 * 3600, max_age_s=21600)
+
+
+def test_the_chain_can_only_start_from_a_snapshot_still_in_its_own_cap():
+    """First link. With nothing confirmed yet the snapshot has to vouch for
+    itself, and it does that under the ordinary gap rule -- a car seen one
+    poll ago is a car we are still watching; one last seen this morning is a
+    chain we never had.
+    """
+    now = 1_760_000_000.0
+    assert solar.asleep_confirmed(
+        now=now, snapshot_ts=now - 1800, confirmed_ts=None,
+        max_gap_s=3660) == now
+    assert solar.asleep_confirmed(
+        now=now, snapshot_ts=now - 6 * 3600, confirmed_ts=None,
+        max_gap_s=3660) is None
+    # Nothing to vouch for at all: a car this collector has never seen.
+    assert solar.asleep_confirmed(
+        now=now, snapshot_ts=None, confirmed_ts=None, max_gap_s=3660) is None
+
+
+def _blind(**over):
+    now = 1_760_000_000.0
+    base = dict(enabled=True, running=True, capped=False,
+                last_tick_ts=now - 17 * 3600, now=now, plugged=True,
+                location="home", soc=84, limit=99, stale_after_s=3660)
+    return solar.controller_blind(**{**base, **over})
+
+
+def test_a_controller_that_has_stopped_looking_is_reported():
+    """Nothing told the owner on 2026-09-14. The collector wrote its
+    heartbeat on every one of the seventeen blind passes -- correctly, since
+    the process was alive and the quiet paths are legitimate -- so
+    collector_running said `true` all day and every alarm built on it stayed
+    silent. The car sat plugged in with fifteen points of headroom under a
+    24.2 kWh sky and the first anyone knew was the owner walking out to it.
+
+    Liveness and usefulness are different questions. This one asks the
+    second: there is a car to charge, there is a controller to charge it,
+    and the controller has not looked at the meter in longer than any
+    cadence it uses can explain.
+    """
+    assert _blind(), "seventeen hours without a tick must be reported"
+    assert not _blind(last_tick_ts=1_760_000_000.0 - 1800), (
+        "a tick one asleep-cadence ago is a working loop, not a blind one")
+    # Never ticked at all, with every reason to have done so.
+    assert _blind(last_tick_ts=None)
+
+
+def test_the_legitimate_quiet_paths_are_not_mistaken_for_blindness():
+    """Every one of these produces no ticks and SHOULD produce none. An
+    alarm that fires on them is an alarm the owner learns to ignore, which
+    is worse than no alarm at all -- it was silence that cost the day, but
+    noise would have cost every day after it.
+    """
+    assert not _blind(enabled=False), "switched off is not blind"
+    assert not _blind(running=False), "collector_offline owns a dead process"
+    assert not _blind(capped=True), "api_cap_reached owns the daily cap"
+    assert not _blind(plugged=False), "nothing to charge"
+    assert not _blind(location="away"), "not our meter to watch"
+    assert not _blind(location="unknown"), "unknown never accuses"
+    # No headroom: sleeping_candidate refuses this car on purpose, so the
+    # absence of ticks is the system working exactly as designed.
+    assert not _blind(soc=98, limit=99)
+    assert not _blind(soc=None)
+    assert not _blind(limit=None)

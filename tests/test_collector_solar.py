@@ -2995,3 +2995,203 @@ async def test_the_ledger_bookmark_only_moves_when_the_soc_does(
     await collector.solar_tick(client, store_, "VIN1", _ledger_view(56), cfg, site_id=1)
     assert solar.load_state(db, "VIN1")["ledger_since_ts"] != pinned
     store_.close()
+
+
+# --------------------------------------------------------------------------
+# The overnight watch: observed live 2026-09-14. See solar.asleep_confirmed.
+# --------------------------------------------------------------------------
+
+def _overnight_snapshot(store_, hours_ago: float, soc: int = 84,
+                        limit: int = 99) -> None:
+    store_.record({"charging_state": "Stopped", "amps_actual": 0, "charging": 0,
+                   "charge_amps": 48, "amps_max": 48, "volts": 240,
+                   "soc": soc, "limit": limit, "lat": 40.0, "lon": -105.0,
+                   "fast_charger_present": False, "fast_charger": None,
+                   "vin": "VIN1",
+                   "sampled_at": int(time.time() - hours_ago * 3600)},
+                  at_home=True)
+
+
+@pytest.mark.asyncio
+async def test_a_car_watched_all_night_is_woken_for_the_afternoon_sun(
+        tmp_path, monkeypatch):
+    """The day observed live on 2026-09-14.
+
+    Last view 20:16, car asleep, plugged in at 84% against a 99% limit. At
+    02:16 -- SNAPSHOT_MAX_AGE_S to the minute -- the watch refused to look at
+    the meter again, and stayed refused through a 24.2 kWh solar day that
+    exported 10.0 kWh to the grid. Seventeen hours, no tick logged, nothing
+    charged. The owner found a car that had been plugged in all day with an
+    empty fifteen points of headroom and full sun on the roof.
+
+    Nothing about that car was unknown. The loop had watched it sleep, poll
+    after poll, all night and all day -- and a car that is asleep now cannot
+    have been driven away since.
+    """
+    store_ = Store(tmp_path / "car.db")
+    db = store_._db
+    solar.save_config(db, enabled=1)
+    home.save(db, 40.0, -105.0, 100)
+    _overnight_snapshot(store_, hours_ago=17)
+    solar.save_state(db, "VIN1", state="stopped", hold_s=0,
+                     asleep_confirmed_ts=int(time.time()) - 1800)
+
+    client = _AsleepCarClient(house_w=1400.0, solar_w=7000.0)   # 5.6 kW spare
+    cfg = SimpleNamespace(timezone="America/Denver",
+                          proxy_url="https://localhost:4443")
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+
+    for _ in range(8):
+        if ("wake_up", {}) in client.commands:
+            break
+        await collector.solar_tick(client, store_, "VIN1", None, cfg, site_id=1)
+
+    assert ("wake_up", {}) in client.commands, (
+        "REGRESSION: seventeen hours of sun ignored because the snapshot of a "
+        f"car we watched sleep all night aged past six hours: {client.commands}")
+    store_.close()
+
+
+@pytest.mark.asyncio
+async def test_a_car_nobody_was_watching_is_still_left_alone(tmp_path, monkeypatch):
+    """The discriminating half, and the whole reason the cap exists. Same
+    seventeen-hour-old snapshot, same sun -- but no chain of observations
+    behind it, so this car may have been driven away and parked anywhere.
+    Waking it would be commanding a car we cannot place.
+    """
+    store_ = Store(tmp_path / "car.db")
+    db = store_._db
+    solar.save_config(db, enabled=1)
+    home.save(db, 40.0, -105.0, 100)
+    _overnight_snapshot(store_, hours_ago=17)
+    solar.save_state(db, "VIN1", state="stopped", hold_s=0,
+                     asleep_confirmed_ts=None)
+
+    client = _AsleepCarClient(house_w=1400.0, solar_w=7000.0)
+    cfg = SimpleNamespace(timezone="America/Denver",
+                          proxy_url="https://localhost:4443")
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+
+    for _ in range(8):
+        await collector.solar_tick(client, store_, "VIN1", None, cfg, site_id=1)
+
+    assert not client.commands, (
+        f"a car we cannot place must never be commanded: {client.commands}")
+    store_.close()
+
+
+class _NeverWakesLoopClient:
+    """A car that never wakes, for driving run() itself.
+
+    Reports "offline" rather than "asleep" because that is what the real car
+    did: the collector log for 2026-09-14 carries 199 `offline` lines and six
+    `asleep` ones. Tesla moves a car from asleep to offline as it settles, and
+    both mean the same thing to this loop -- not online, therefore not moving.
+    """
+
+    def __init__(self, state: str = "offline"):
+        self.calls: list[str] = []
+        self.state = state
+
+    async def resolve_vin(self):
+        return "VIN1"
+
+    async def energy_sites(self):
+        return [{"energy_site_id": 1}]
+
+    async def vehicle(self, vin):
+        self.calls.append("state")
+        return {"state": self.state}
+
+    async def vehicle_data(self, vin, *a, **k):
+        raise AssertionError("must not pay for vehicle_data while asleep")
+
+    async def aclose(self):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_the_loop_carries_the_watch_forward_while_the_car_sleeps(
+        monkeypatch, tmp_path):
+    """The chain is only real if something extends it. Every pass that sees
+    the car still asleep is one more observation that it has not moved, and
+    the loop is the only place that knows -- solar_tick is handed view=None
+    for a failed read exactly as it is for a sleeping car.
+    """
+    db_path = tmp_path / "car.db"
+    seed = Store(db_path)
+    solar.save_config(seed._db, enabled=1)
+    _overnight_snapshot(seed, hours_ago=17)
+    # The state a real sleeping collector is in: last pass one asleep-cadence
+    # ago, and the cadence it was using recorded alongside it.
+    started = int(time.time()) - 1800
+    solar.save_state(seed._db, "VIN1", state="stopped",
+                     asleep_confirmed_ts=started, heartbeat_ts=started,
+                     heartbeat_sleep_s=1800)
+    seed.close()
+
+    monkeypatch.setattr(collector.settings, "db_file", db_path)
+    client = _NeverWakesLoopClient()
+    monkeypatch.setattr(collector, "TeslaClient", lambda settings: client)
+
+    async def fake_solar_tick(client, store_, vin, view, cfg, site_id):
+        return "stopped", False
+    monkeypatch.setattr(collector, "solar_tick", fake_solar_tick)
+
+    sleeps = 0
+
+    async def fake_sleep(seconds):
+        nonlocal sleeps
+        sleeps += 1
+        if sleeps >= 3:
+            raise StopTest()
+    monkeypatch.setattr(collector.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(StopTest):
+        await collector.run()
+
+    check = Store(db_path)
+    st = solar.load_state(check._db, "VIN1")
+    check.close()
+    assert st["asleep_confirmed_ts"] > started, (
+        "each pass that sees the car still asleep must carry the watch "
+        f"forward, not leave it at {started}")
+
+
+@pytest.mark.asyncio
+async def test_a_real_outage_breaks_the_watch_rather_than_papering_over_it(
+        monkeypatch, tmp_path):
+    """Four hours unobserved is not a chain, whatever the column says. The
+    car could have been driven anywhere in that window, and the snapshot --
+    now judged on its own seventeen-hour age -- is what refuses.
+    """
+    db_path = tmp_path / "car.db"
+    seed = Store(db_path)
+    solar.save_config(seed._db, enabled=1)
+    _overnight_snapshot(seed, hours_ago=17)
+    solar.save_state(seed._db, "VIN1", state="stopped",
+                     asleep_confirmed_ts=int(time.time()) - 4 * 3600,
+                     heartbeat_ts=int(time.time()) - 4 * 3600,
+                     heartbeat_sleep_s=1800)
+    seed.close()
+
+    monkeypatch.setattr(collector.settings, "db_file", db_path)
+    monkeypatch.setattr(collector, "TeslaClient",
+                        lambda settings: _NeverWakesLoopClient())
+
+    async def fake_solar_tick(client, store_, vin, view, cfg, site_id):
+        return "stopped", False
+    monkeypatch.setattr(collector, "solar_tick", fake_solar_tick)
+
+    async def fake_sleep(seconds):
+        raise StopTest()
+    monkeypatch.setattr(collector.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(StopTest):
+        await collector.run()
+
+    check = Store(db_path)
+    st = solar.load_state(check._db, "VIN1")
+    check.close()
+    assert st["asleep_confirmed_ts"] is None, (
+        "a hole we cannot vouch across must break the chain, not extend it")

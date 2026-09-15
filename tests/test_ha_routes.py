@@ -246,3 +246,66 @@ async def test_state_does_not_nag_about_a_car_at_the_ceiling(tmp_path, monkeypat
     body = await _plug_in_body(tmp_path, monkeypatch, soc=96,
                                charging_state="Disconnected")
     assert body["should_plug_in"] is False
+
+
+# --------------------------------------------------------------------------
+# The blind controller -- see solar.controller_blind and the day of
+# 2026-09-14 that it exists for.
+# --------------------------------------------------------------------------
+
+def _blind_store(tmp_path, *, tick_age_s, soc=84, limit=99):
+    st = Store(tmp_path / "car.db")
+    solar.save_config(st._db, enabled=1)
+    home.save(st._db, 40.0, -105.0, 100)
+    # Alive and beating on its asleep cadence -- which is exactly how the
+    # real thing looked all day while it saw nothing.
+    solar.save_state(st._db, "VIN1", heartbeat_ts=int(time.time()),
+                     heartbeat_sleep_s=1800)
+    st.record({"vin": "VIN1", "soc": soc, "limit": limit,
+               "sampled_at": int(time.time()) - tick_age_s,
+               "charging_state": "Stopped", "amps_actual": 0, "charging": 0,
+               "lat": 40.0, "lon": -105.0}, at_home=True)
+    solar.log_tick(st._db, "VIN1", ts=int(time.time()) - tick_age_s,
+                   state="stopped", grid_w=-4000.0, solar_w=4000.0, car_w=0.0,
+                   surplus_w=4000.0, error_w=0.0, amps_before=0, amps_target=0,
+                   amps_written=None, soc=soc, import_w=0.0, period_s=1800)
+    return st
+
+
+async def _blind_body(tmp_path, monkeypatch, **kw):
+    st = _blind_store(tmp_path, **kw)
+    monkeypatch.setattr(ha_routes, "DEMO", False)
+    monkeypatch.setattr(ha_routes, "store", lambda: st)
+    monkeypatch.setattr(ha_routes.settings, "vin", "VIN1")
+    try:
+        return await ha_routes.ha_state()
+    finally:
+        st.close()
+
+
+@pytest.mark.asyncio
+async def test_state_reports_a_controller_that_has_stopped_looking(
+        tmp_path, monkeypatch):
+    """Seventeen hours without a tick, against a live heartbeat. This is the
+    signal that was missing on 2026-09-14."""
+    body = await _blind_body(tmp_path, monkeypatch, tick_age_s=17 * 3600)
+    assert body["collector_running"] is True, (
+        "the process really was alive -- that is the whole problem")
+    assert body["controller_blind"] is True
+
+
+@pytest.mark.asyncio
+async def test_state_does_not_cry_blind_over_an_ordinary_asleep_cadence(
+        tmp_path, monkeypatch):
+    """One tick per 1800 s is a healthy night, not a blind one."""
+    body = await _blind_body(tmp_path, monkeypatch, tick_age_s=1800)
+    assert body["controller_blind"] is False
+
+
+@pytest.mark.asyncio
+async def test_state_does_not_cry_blind_over_a_car_with_no_headroom(
+        tmp_path, monkeypatch):
+    """A car at its limit is one the watch refuses on purpose."""
+    body = await _blind_body(tmp_path, monkeypatch, tick_age_s=17 * 3600,
+                             soc=99, limit=99)
+    assert body["controller_blind"] is False

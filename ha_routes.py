@@ -152,6 +152,22 @@ async def ha_state() -> dict[str, Any]:
 
         # Flags an automation can act on.
         "capped": bool(st["capped"]),
+        # The controller is alive but has stopped LOOKING -- the failure that
+        # ran unreported for seventeen hours on 2026-09-14. See
+        # solar.controller_blind; the staleness bar is two of the cadence the
+        # collector last recorded for itself plus a minute, floored at an
+        # hour so an engaged 120 s loop cannot make it twitchy.
+        "controller_blind": solar.controller_blind(
+            enabled=bool(conf["enabled"]),
+            running=collector_running(st, now),
+            capped=bool(st["capped"]),
+            last_tick_ts=last["ts"] if last else None,
+            now=now,
+            plugged=plugged_in,
+            location=location,
+            soc=view.get("soc"),
+            limit=view.get("limit"),
+            stale_after_s=max(3600, 2 * (st["heartbeat_sleep_s"] or 1800) + 60)),
         "dirty": bool(st["dirty"]),
         "rate_limited": bool(st["backoff_s"]),
         "ledger_stale": bool(st["ledger_stale"]),
