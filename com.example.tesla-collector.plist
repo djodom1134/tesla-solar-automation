@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.example.tesla-collector</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/d/Code/tesla_automation/.venv/bin/python</string>
+    <string>/Users/d/Code/tesla_automation/collector.py</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/d/Code/tesla_automation</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>60</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/d/Code/tesla_automation/collector.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/d/Code/tesla_automation/collector.log</string>
+</dict>
+</plist>

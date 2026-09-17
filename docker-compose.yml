@@ -1,0 +1,93 @@
+# Three processes, one network namespace.
+#
+# WHY THE SHARED NAMESPACE. The signing proxy's TLS certificate is issued for
+# CN=localhost with SANs `DNS:localhost, IP:127.0.0.1` only, and tesla.py
+# verifies against it (`verify=proxy_cert`). Give each service its own network
+# and the collector must dial https://proxy:4443, whose hostname the
+# certificate does not cover -- so every signed command fails TLS verification.
+#
+# Sharing the proxy's namespace keeps https://localhost:4443 literally true
+# inside the containers, so neither the certificate nor a line of code has to
+# change to move this off the Mac. The cost is that published ports and the
+# network live on `proxy` for all three; that is why 8000 is declared there.
+#
+# The alternative -- reissuing the certificate with a docker-internal SAN --
+# would mean regenerating TLS material for a working, car-paired proxy to buy
+# nothing but a tidier topology.
+#
+# THE SECRET ENV FILE IS secrets/app.env, NOT .env, and the name matters.
+# Compose automatically reads ./.env in the project directory to interpolate
+# ${VARS} in this file. Leaving the app's real secrets there hands them to
+# Compose's interpolator for no reason, and any `$` inside a value -- an API
+# key, a password -- is then treated as a variable reference: the first deploy
+# printed `WARNING: The "r6" variable is not set` from exactly that. Compose
+# never needs these values; only the container does.
+
+name: tesla
+
+x-common: &common
+  image: tesla-automation:latest
+  restart: unless-stopped
+  # Without a cap the json-file driver grows until the disk does not. These
+  # are chatty loops on a 300 s tick.
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "5"
+
+services:
+  proxy:
+    <<: *common
+    build:
+      context: .
+    container_name: tesla-proxy
+    # Owns the namespace, so the dashboard's port is published here even
+    # though it is the `app` service that listens on it.
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./keys:/keys:ro
+    command:
+      - tesla-http-proxy
+      - -tls-key
+      - /keys/tls-key.pem
+      - -cert
+      - /keys/tls-cert.pem
+      - -key-file
+      - /keys/private-key.pem
+      - -host
+      - localhost
+      - -port
+      - "4443"
+
+  app:
+    <<: *common
+    container_name: tesla-app
+    depends_on: [proxy]
+    network_mode: "service:proxy"
+    volumes:
+      - ./data:/data
+      - ./keys:/keys:ro
+      - ./secrets/app.env:/app/.env:ro
+    command: ["python", "app.py"]
+    healthcheck:
+      # urllib rather than curl: the slim image has no curl, and adding one
+      # for a health check is a package to patch forever.
+      test: ["CMD", "python", "-c",
+             "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/',timeout=5)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  collector:
+    <<: *common
+    container_name: tesla-collector
+    depends_on: [proxy]
+    network_mode: "service:proxy"
+    volumes:
+      - ./data:/data
+      - ./keys:/keys:ro
+      - ./secrets/app.env:/app/.env:ro
+    command: ["python", "collector.py"]

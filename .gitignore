@@ -1,0 +1,26 @@
+# Secrets — never commit these.
+.env
+.env.*
+# Glob, not exact names: rotations and hand-made backups (.bak, .manual-backup)
+# are just as sensitive as the original and must never be committable.
+.tokens.json*
+.tokens.tmp
+keys/
+
+# Local vehicle history and background-agent logs.
+car.db
+car.db-wal
+car.db-shm
+collector.log
+proxy.log
+
+# Subagent-driven-development scratch.
+.superpowers/
+
+__pycache__/
+*.pyc
+.venv/
+venv/
+.gstack/
+*.lock
+app.log

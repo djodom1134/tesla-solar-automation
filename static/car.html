@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Car · Charge & Controls</title>
+<link rel="stylesheet" href="/vendor/leaflet.css">
+<link rel="stylesheet" href="/styles.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>🚗</text></svg>">
+</head>
+<body>
+
+<section id="gate" class="gate" hidden>
+  <div class="gate-card">
+    <h1 id="gate-title">Connect your Tesla account</h1>
+    <p id="gate-body" class="muted"></p>
+    <div id="gate-actions" class="gate-actions"></div>
+    <p id="gate-error" class="gate-error" hidden></p>
+  </div>
+</section>
+
+<main id="car-app" hidden>
+
+  <header class="topbar">
+    <div class="titles">
+      <h1 id="car-name">Car</h1>
+      <p id="car-status" class="muted small"></p>
+    </div>
+    <div class="topbar-actions">
+      <a class="ghost-btn" href="/index.html">← Solar</a>
+      <a class="ghost-btn" href="/setup.html">Setup</a>
+      <button id="wake" class="ghost-btn" type="button" hidden>Wake car</button>
+      <button id="theme-toggle" class="ghost-btn" type="button" aria-label="Toggle dark mode" title="Toggle dark mode">◐</button>
+    </div>
+  </header>
+
+  <!-- Staleness is a first-class state, not an error. -->
+  <div id="stale-bar" class="stale-bar" hidden></div>
+  <div id="error-bar" class="error-bar" hidden></div>
+
+  <section class="hero" aria-label="Charge">
+    <div class="hero-ring">
+      <svg viewBox="0 0 120 120" role="img" aria-labelledby="hero-soc-label">
+        <circle class="ring-track" cx="60" cy="60" r="52"></circle>
+        <circle id="ring-fill" class="ring-fill" cx="60" cy="60" r="52"></circle>
+        <circle id="ring-limit" class="ring-limit" cx="60" cy="60" r="52"></circle>
+      </svg>
+      <div class="hero-ring-label">
+        <span id="hero-soc">—</span><span class="unit">%</span>
+      </div>
+    </div>
+    <div class="hero-facts">
+      <p id="hero-soc-label" class="hero-headline">—</p>
+      <p id="hero-sub" class="muted"></p>
+      <dl class="hero-dl">
+        <div><dt>Range</dt><dd id="hero-range">—</dd></div>
+        <div><dt>Limit</dt><dd id="hero-limit">—</dd></div>
+        <div><dt>Odometer</dt><dd id="hero-odo">—</dd></div>
+      </dl>
+    </div>
+  </section>
+
+  <section id="tiles" class="live" aria-label="Vehicle status"></section>
+
+  <section class="card">
+    <div class="card-head"><h2>Location</h2><span id="map-note" class="muted small"></span></div>
+    <div id="map" class="map"></div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>State of charge</h2>
+      <div id="soc-range" class="segmented" role="tablist" aria-label="Range"></div>
+    </div>
+    <div id="soc-chart" class="chart"></div>
+    <p id="soc-note" class="muted small"></p>
+  </section>
+
+  <section class="card" id="solar-card" hidden>
+    <h2>Solar charging</h2>
+
+    <!-- The tank is what the eye lands on first: a vertical fill split into
+         the solar and grid share of the CURRENT charge, with the banked-
+         miles figure and the lifetime free-miles figure promoted beside it
+         as headlines rather than buried as footnote hints (Task 20). -->
+    <div class="tank-row">
+      <div id="solar-tank" class="tank" role="img" aria-label="Charge, split by source"></div>
+      <div class="tank-facts">
+        <p id="solar-tank-label" class="tank-headline">—</p>
+        <p id="solar-banked" class="big"></p>
+        <p id="solar-lifetime-free" class="tank-sub"></p>
+      </div>
+    </div>
+    <p id="solar-tank-hint" class="hint"></p>
+
+    <!-- Two pills, not one. The mode is WHO is driving the car; the state is
+         where the solar machine itself has got to. One pill showing
+         `enabled ? state : "off"` conflated them, and could not say the one
+         thing that matters after an override: that the controller is
+         standing aside on purpose. -->
+    <div class="solar-head">
+      <span id="solar-mode" class="pill" title="Which mode charging is in">solar</span>
+      <span id="solar-state" class="pill">idle</span>
+      <span id="solar-surplus" class="big">—</span>
+      <span id="solar-amps" class="muted">—</span>
+    </div>
+    <div id="solar-override" class="override" hidden>
+      <p id="solar-override-note"></p>
+      <button id="solar-resume" class="btn" type="button">Resume solar control</button>
+    </div>
+    <p id="solar-limit-note" class="hint" hidden></p>
+    <p id="solar-grace" class="hint"></p>
+    <p id="solar-free-miles" class="hint"></p>
+    <p id="solar-charged-split" class="tank-sub"></p>
+    <div id="solar-reach" hidden>
+      <p id="solar-reach-head" class="tank-sub"></p>
+      <ul id="solar-reach-list" class="reach"></ul>
+    </div>
+    <p id="solar-warn" class="warn" hidden></p>
+  </section>
+
+  <section class="card" id="garage-card" hidden>
+    <h2>Garage</h2>
+    <div class="solar-head">
+      <span id="garage-state" class="pill">unknown</span>
+      <span id="garage-obstructed" class="warn" hidden>Obstructed</span>
+    </div>
+    <p id="garage-note" class="hint"></p>
+    <div class="row">
+      <button id="garage-open" class="btn" type="button">Open</button>
+      <button id="garage-close" class="btn danger" type="button">Close</button>
+    </div>
+  </section>
+
+  <section id="controls" class="card" aria-label="Controls"></section>
+
+  <footer class="foot">
+    <span id="foot-collector" class="muted small"></span>
+    <span id="foot-calls" class="muted small"></span>
+    <span id="foot-version" class="muted small"></span>
+  </footer>
+
+</main>
+
+<div id="tooltip" class="tooltip" role="tooltip" hidden></div>
+<div id="toast" class="toast" role="status" hidden></div>
+
+<script src="/vendor/leaflet.js"></script>
+<script type="module" src="/car.js"></script>
+</body>
+</html>

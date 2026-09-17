@@ -1,0 +1,37 @@
+# SECRETS -- must never enter an image layer. They arrive at runtime as
+# read-only mounts instead (see docker-compose.yml). A layer is forever: once
+# a credential is baked in, deleting it in a later layer does not remove it.
+.env
+.env.*
+.tokens.json
+# The flock sidecar is `.tokens.lock` -- with_suffix(".lock") REPLACES the
+# extension, it does not append. An earlier `.tokens.json.lock` matched
+# nothing and the file shipped.
+.tokens.lock
+# secrets/ holds app.env, the real .env under a name Compose will not
+# interpolate. It is a build-context directory like any other: absent from
+# this list, `COPY . .` bakes the Tesla client secret into a layer, which is
+# exactly what happened on the first successful build here.
+secrets/
+keys/
+
+# Live data. car.db belongs on a volume, not in the image -- baking it in
+# would ship a snapshot that silently diverges from the mounted one.
+car.db
+car.db-shm
+car.db-wal
+data/
+*.log
+
+# Local-only
+.venv/
+.git/
+.gitignore
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+.superpowers/
+docs/
+node_modules/
+.DS_Store

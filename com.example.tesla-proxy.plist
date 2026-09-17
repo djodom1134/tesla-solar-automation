@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.example.tesla-proxy</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/d/go/bin/tesla-http-proxy</string>
+    <string>-tls-key</string><string>/Users/d/Code/tesla_automation/keys/tls-key.pem</string>
+    <string>-cert</string><string>/Users/d/Code/tesla_automation/keys/tls-cert.pem</string>
+    <string>-key-file</string><string>/Users/d/Code/tesla_automation/keys/private-key.pem</string>
+    <string>-host</string><string>localhost</string>
+    <string>-port</string><string>4443</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>StandardOutPath</key><string>/Users/d/Code/tesla_automation/proxy.log</string>
+  <key>StandardErrorPath</key><string>/Users/d/Code/tesla_automation/proxy.log</string>
+</dict>
+</plist>

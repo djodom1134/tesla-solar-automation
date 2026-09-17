@@ -1,0 +1,452 @@
+/* Palette: the validated reference instance. Both modes are *selected* steps —
+   the dark column is not an automatic flip of the light one.
+   Validated with dataviz/scripts/validate_palette.js:
+     light  worst adjacent CVD ΔE 37.7  (battery→solar→grid ordering)
+     dark   worst adjacent CVD ΔE 35.9
+   Solar (#eda100) and battery (#1baf7a) fall below 3:1 on the light surface, so the
+   relief rule applies: every series carries a visible label and a table view exists. */
+
+:root {
+  --surface:      #fcfcfb;
+  --plane:        #f9f9f7;
+  --ink:          #0b0b0b;
+  --ink-2:        #52514e;
+  --muted:        #898781;
+  --grid:         #e1e0d9;
+  --baseline:     #c3c2b7;
+  --border:       rgba(11, 11, 11, 0.10);
+  --shadow:       0 1px 2px rgba(11, 11, 11, .04), 0 4px 16px rgba(11, 11, 11, .04);
+
+  --solar:        #eda100;
+  --battery:      #1baf7a;
+  --import:       #e34948;
+  --export:       #2a78d6;
+  --home:         #4a3aa7;
+  --good:         #0ca30c;
+
+  --radius: 14px;
+  --font: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --surface:  #1a1a19;
+    --plane:    #0d0d0d;
+    --ink:      #ffffff;
+    --ink-2:    #c3c2b7;
+    --muted:    #898781;
+    --grid:     #2c2c2a;
+    --baseline: #383835;
+    --border:   rgba(255, 255, 255, 0.10);
+    --shadow:   none;
+
+    --solar:    #c98500;
+    --battery:  #199e70;
+    --import:   #e66767;
+    --export:   #3987e5;
+    --home:     #9085e9;
+  }
+}
+
+/* Explicit toggle wins over the media query in both directions. */
+:root[data-theme="light"] {
+  --surface: #fcfcfb; --plane: #f9f9f7; --ink: #0b0b0b; --ink-2: #52514e;
+  --grid: #e1e0d9; --baseline: #c3c2b7; --border: rgba(11,11,11,.10);
+  --shadow: 0 1px 2px rgba(11,11,11,.04), 0 4px 16px rgba(11,11,11,.04);
+  --solar: #eda100; --battery: #1baf7a; --import: #e34948; --export: #2a78d6; --home: #4a3aa7;
+}
+:root[data-theme="dark"] {
+  --surface: #1a1a19; --plane: #0d0d0d; --ink: #ffffff; --ink-2: #c3c2b7;
+  --grid: #2c2c2a; --baseline: #383835; --border: rgba(255,255,255,.10); --shadow: none;
+  --solar: #c98500; --battery: #199e70; --import: #e66767; --export: #3987e5; --home: #9085e9;
+}
+
+* { box-sizing: border-box; }
+
+/* An author `display` rule beats the UA stylesheet's `display:none` for [hidden],
+   so .gate/.live/.card would keep rendering while "hidden". Make hidden win. */
+[hidden] { display: none !important; }
+
+body {
+  margin: 0;
+  font-family: var(--font);
+  background: var(--plane);
+  color: var(--ink);
+  -webkit-font-smoothing: antialiased;
+}
+
+h1, h2 { margin: 0; font-weight: 600; letter-spacing: -0.01em; }
+h1 { font-size: 1.35rem; }
+h2 { font-size: 1rem; }
+.muted { color: var(--muted); margin: 0; }
+.small { font-size: 0.8125rem; }
+
+/* ---------- gate ---------- */
+
+.gate { min-height: 100vh; display: grid; place-items: center; padding: 1.5rem; }
+.gate-card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 2.5rem; max-width: 34rem; box-shadow: var(--shadow);
+}
+.gate-card h1 { margin-bottom: .75rem; }
+.gate-card p { line-height: 1.6; }
+.gate-actions { margin-top: 1.5rem; display: flex; gap: .75rem; flex-wrap: wrap; }
+.gate-error {
+  margin-top: 1.25rem; padding: .75rem 1rem; border-radius: 8px;
+  background: color-mix(in srgb, var(--import) 12%, transparent);
+  color: var(--ink); font-size: .875rem; line-height: 1.5;
+}
+.gate code {
+  font-size: .8125rem; background: var(--plane); padding: .15em .4em;
+  border-radius: 4px; border: 1px solid var(--border);
+}
+
+.btn, .ghost-btn {
+  font: inherit; font-size: .875rem; font-weight: 500; cursor: pointer;
+  border-radius: 8px; padding: .6rem 1.1rem; transition: background .12s, border-color .12s;
+}
+.btn { background: var(--ink); color: var(--surface); border: 1px solid var(--ink); }
+.btn:hover { opacity: .88; }
+.ghost-btn { background: transparent; color: var(--ink-2); border: 1px solid var(--border); }
+.ghost-btn:hover { background: var(--surface); color: var(--ink); }
+
+/* ---------- layout ---------- */
+
+main { max-width: 1200px; margin: 0 auto; padding: 2rem 1.5rem 4rem; }
+
+.topbar {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 1rem; flex-wrap: wrap; margin-bottom: 1.5rem;
+}
+.topbar-actions { display: flex; gap: .5rem; }
+
+/* ---------- live strip ---------- */
+
+.live {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 1px; background: var(--border);
+  border: 1px solid var(--border); border-radius: var(--radius);
+  overflow: hidden; margin-bottom: 1.5rem;
+}
+.live-tile {
+  background: var(--surface); padding: 1rem 1.25rem;
+  display: flex; flex-direction: column; gap: .35rem; position: relative;
+}
+
+.tile-label {
+  font-size: .8125rem; color: var(--muted); font-weight: 500;
+  display: flex; align-items: center; gap: .45rem;
+}
+.tile-value {
+  font-size: 1.5rem; font-weight: 600; color: var(--ink);
+  display: flex; align-items: baseline; gap: .25rem;
+}
+.unit { font-size: .8125rem; font-weight: 500; color: var(--muted); }
+
+/* Colored key beside text — identity never comes from coloring the text itself. */
+.key { width: 10px; height: 10px; border-radius: 3px; flex: none; display: inline-block; }
+.key-solar   { background: var(--solar); }
+.key-battery { background: var(--battery); }
+.key-import  { background: var(--import); }
+.key-export  { background: var(--export); }
+.key-home    { background: var(--home); }
+.key-idle    { background: var(--muted); }
+
+/* ---------- filters ---------- */
+
+.filters {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 1rem; flex-wrap: wrap; margin-bottom: 1.25rem;
+}
+.segmented {
+  display: inline-flex; background: var(--surface); padding: 3px;
+  border: 1px solid var(--border); border-radius: 10px; gap: 2px;
+}
+.segmented button {
+  font: inherit; font-size: .8125rem; font-weight: 500; cursor: pointer;
+  background: transparent; color: var(--ink-2); border: 0;
+  padding: .45rem .9rem; border-radius: 7px; transition: background .12s, color .12s;
+}
+.segmented button:hover { color: var(--ink); }
+.segmented button[aria-selected="true"] { background: var(--ink); color: var(--surface); }
+
+.switch { display: flex; align-items: center; gap: .5rem; font-size: .8125rem; color: var(--ink-2); cursor: pointer; }
+.switch input { accent-color: var(--export); width: 1rem; height: 1rem; cursor: pointer; }
+
+/* Refetch holds the previous render — no skeleton, no layout jump. */
+.content { transition: opacity .15s; }
+.content.loading { opacity: .45; }
+
+/* ---------- hero ---------- */
+
+.hero-card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 1.75rem; margin-bottom: 1rem; box-shadow: var(--shadow);
+  display: flex; justify-content: space-between; align-items: flex-start; gap: 2rem; flex-wrap: wrap;
+}
+/* Proportional figures — tabular-nums makes a big number look loose. */
+.hero-figure {
+  margin: .5rem 0 .35rem; font-size: 3.25rem; font-weight: 600;
+  line-height: 1; letter-spacing: -0.02em; color: var(--ink);
+  display: flex; align-items: baseline; gap: .4rem;
+}
+.hero-unit { font-size: 1.125rem; font-weight: 500; color: var(--muted); }
+.hero-money { text-align: right; }
+.money-figure { margin: .5rem 0 .25rem; font-size: 1.75rem; font-weight: 600; }
+.money-figure.positive { color: var(--good); }
+
+/* ---------- kpis ---------- */
+
+.kpis {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 1px; background: var(--border);
+  border: 1px solid var(--border); border-radius: var(--radius);
+  overflow: hidden; margin-bottom: 1rem;
+}
+.stat { background: var(--surface); padding: 1.1rem 1.25rem; display: flex; flex-direction: column; gap: .4rem; }
+
+.meter { height: 4px; border-radius: 2px; background: color-mix(in srgb, var(--export) 18%, transparent); overflow: hidden; margin-top: .2rem; }
+.meter-fill { height: 100%; background: var(--export); border-radius: 2px; transition: width .3s; }
+
+/* ---------- cards & charts ---------- */
+
+.card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 1.5rem; margin-bottom: 1rem; box-shadow: var(--shadow);
+}
+.card-head {
+  display: flex; justify-content: space-between; align-items: flex-start;
+  gap: 1rem; flex-wrap: wrap; margin-bottom: 1.25rem;
+}
+.card-head h2 { margin-bottom: .2rem; }
+
+/* Height grows with content so the x-axis band is never cut off. */
+.chart-host { width: 100%; }
+.chart-host svg { display: block; width: 100%; height: auto; overflow: visible; }
+
+.legend { display: flex; gap: 1rem; flex-wrap: wrap; }
+.legend-item { display: flex; align-items: center; gap: .45rem; font-size: .8125rem; color: var(--ink-2); }
+.legend-swatch { width: 12px; height: 12px; border-radius: 3px; flex: none; }
+.legend-swatch.line { height: 3px; border-radius: 2px; width: 14px; }
+
+/* recessive chrome */
+.gridline { stroke: var(--grid); stroke-width: 1; }
+.axis-line { stroke: var(--baseline); stroke-width: 1; }
+.tick-label { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.axis-title { fill: var(--muted); font-size: 11px; }
+.bar-label { fill: var(--ink-2); font-size: 11px; font-weight: 500; }
+.crosshair { stroke: var(--baseline); stroke-width: 1; pointer-events: none; }
+.hit { fill: transparent; cursor: pointer; }
+.mark { transition: opacity .1s; }
+.mark.dim { opacity: .45; }
+
+/* ---------- tooltip ---------- */
+
+.tooltip {
+  position: fixed; z-index: 50; pointer-events: none;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 10px; padding: .65rem .8rem; min-width: 9rem;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, .12);
+  font-size: .8125rem;
+}
+.tt-title { color: var(--muted); font-size: .75rem; margin-bottom: .45rem; font-weight: 500; }
+.tt-row { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: .12rem 0; }
+.tt-name { display: flex; align-items: center; gap: .4rem; color: var(--ink-2); }
+/* Line key, not a box — at tooltip density a filled box is data-weight ink doing a label's job. */
+.tt-key { width: 12px; height: 3px; border-radius: 2px; flex: none; }
+/* Value leads, label follows. */
+.tt-value { font-weight: 600; color: var(--ink); font-variant-numeric: tabular-nums; }
+
+/* ---------- table ---------- */
+
+.table-scroll { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: .8125rem; }
+th, td { padding: .55rem .75rem; text-align: right; white-space: nowrap; }
+th:first-child, td:first-child { text-align: left; }
+thead th { color: var(--muted); font-weight: 500; border-bottom: 1px solid var(--border); }
+tbody td { border-bottom: 1px solid var(--grid); font-variant-numeric: tabular-nums; color: var(--ink-2); }
+tbody tr:last-child td { border-bottom: 0; }
+tbody tr:hover td { background: var(--plane); }
+tfoot td { font-weight: 600; color: var(--ink); border-top: 1px solid var(--border); }
+th .key { vertical-align: middle; margin-right: .35rem; }
+
+.empty { text-align: center; color: var(--muted); padding: 3rem 1rem; }
+
+.error-bar {
+  position: fixed; bottom: 1rem; left: 50%; transform: translateX(-50%);
+  background: var(--surface); border: 1px solid var(--border);
+  border-left: 3px solid var(--import);
+  padding: .75rem 1.1rem; border-radius: 10px; font-size: .8125rem;
+  box-shadow: 0 4px 20px rgba(0,0,0,.12); max-width: 90vw;
+}
+
+@media (max-width: 640px) {
+  main { padding: 1.25rem 1rem 3rem; }
+  .hero-figure { font-size: 2.5rem; }
+  .hero-money { text-align: left; }
+}
+
+/* ---------------------------------------------------------------- car page */
+
+.hero { display: flex; gap: 2rem; align-items: center; flex-wrap: wrap;
+        padding: 1.5rem 0; }
+.hero-ring { position: relative; width: 160px; height: 160px; flex: none; }
+.hero-ring svg { width: 100%; height: 100%; transform: rotate(-90deg); }
+.ring-track { fill: none; stroke: var(--grid); stroke-width: 10; }
+.ring-fill  { fill: none; stroke: var(--battery); stroke-width: 10;
+              stroke-linecap: round; transition: stroke-dasharray .6s ease; }
+.ring-fill.charging { stroke: var(--solar); }
+.ring-limit { fill: none; stroke: var(--ink); stroke-width: 12; opacity: .55; }
+.hero-ring-label { position: absolute; inset: 0; display: grid; place-content: center;
+                   font-size: 2.25rem; font-weight: 650; letter-spacing: -.02em; }
+.hero-ring-label .unit { font-size: 1.1rem; font-weight: 500; opacity: .6; }
+.hero-facts { flex: 1 1 16rem; }
+.hero-headline { font-size: 1.5rem; font-weight: 600; margin: 0 0 .25rem; }
+.hero-dl { display: flex; gap: 2rem; margin: 1rem 0 0; flex-wrap: wrap; }
+.hero-dl dt { font-size: .8rem; color: var(--muted); margin: 0; }
+.hero-dl dd { margin: .15rem 0 0; font-size: 1.05rem; font-variant-numeric: tabular-nums; }
+
+/* Staleness reads as information, not as an error — it is the normal state. */
+.stale-bar { background: var(--plane); color: var(--ink); border: 1px solid var(--border);
+             border-left: 3px solid var(--solar);
+             padding: .6rem .9rem; border-radius: var(--radius); margin-bottom: 1rem;
+             font-size: .9rem; }
+
+/* `position: relative; z-index: 0` gives the map its own stacking context, so
+   Leaflet's internal panes (which run up to z-index 1000 for controls) are
+   scoped inside it and can never paint over the page's fixed-position
+   tooltip/toast — without touching any of Leaflet's own per-pane z-indexes,
+   which stay intact for its internal stacking (tiles under markers under
+   popups, etc). */
+.map { position: relative; z-index: 0; height: 320px; border-radius: var(--radius);
+       overflow: hidden; border: 1px solid var(--border); }
+.map.empty { display: grid; place-content: center; background: var(--plane);
+             color: var(--muted); }
+.map.empty::after { content: "No location"; }
+
+.foot { display: flex; gap: 1.5rem; flex-wrap: wrap; padding: 2rem 0 1rem;
+        border-top: 1px solid var(--border); margin-top: 2rem; }
+
+.toast { position: fixed; left: 50%; bottom: 2rem; transform: translateX(-50%);
+         background: var(--ink); color: var(--surface); padding: .7rem 1.1rem;
+         border-radius: var(--radius); font-size: .9rem; z-index: 1000; max-width: 90vw;
+         box-shadow: var(--shadow); }
+.toast.bad { background: var(--import); color: #fff; }
+
+.control-group { border-top: 1px solid var(--border); padding: .5rem 0; }
+.control-group summary { cursor: pointer; font-weight: 600; padding: .5rem 0;
+                         list-style: revert; }
+.control-grid { display: grid; gap: .5rem; padding: .5rem 0 1rem; }
+.control-row { display: flex; align-items: center; justify-content: space-between;
+               gap: 1rem; flex-wrap: wrap; }
+.control-row.disabled { opacity: .45; }
+.control-label { font-size: .95rem; }
+.control-inputs { display: flex; gap: .5rem; align-items: center; }
+.control-field { padding: .35rem .5rem; font: inherit; font-size: .9rem;
+                 border: 1px solid var(--border); border-radius: .35rem;
+                 background: var(--surface); color: var(--ink); min-width: 5rem; }
+.btn.danger { background: var(--import); }
+
+/* ---- setup page ---- */
+#setup-app { max-width: 46rem; margin: 0 auto; padding: 1rem; }
+#setup-app .map { height: 22rem; border-radius: var(--radius, 8px); margin: .75rem 0; }
+#setup-app .row { display: flex; align-items: center; gap: .6rem; margin: .5rem 0; }
+#setup-app .row label { min-width: 11rem; }
+#setup-app .hint { color: var(--muted, #888); font-size: .85rem; margin: .35rem 0 .6rem; }
+#setup-app details { margin: .75rem 0; }
+#setup-app details summary { cursor: pointer; color: var(--muted, #888); }
+#setup-app .msg { margin-left: .6rem; font-size: .9rem; }
+#setup-app .msg.ok { color: var(--good, #22c55e); }
+#setup-app .msg.err { color: var(--bad, #ef4444); }
+
+/* ---- solar status card (and the garage card, which shares the same look) ---- */
+#solar-card .solar-head, #garage-card .solar-head { display: flex; align-items: baseline; gap: .75rem; }
+#solar-card .big { font-size: 1.6rem; font-weight: 600; }
+#solar-card .pill, #garage-card .pill {
+  padding: .15rem .55rem; border-radius: 999px; font-size: .8rem;
+  background: var(--chip, #33333322);
+}
+#solar-card .pill.state-charging { background: var(--good, #22c55e); color: #fff; }
+#solar-card .pill.state-grace    { background: var(--warn, #f59e0b); color: #fff; }
+#garage-card .pill.state-closed  { background: var(--good, #22c55e); color: #fff; }
+#garage-card .pill.state-open    { background: var(--warn, #f59e0b); color: #fff; }
+/* Mode pills. The mode is WHO is driving the car, so each one is coloured
+   for what it means rather than for how alarming it is: solar reads as sun,
+   "charging now" as the deliberate grid draw it is, and manual as the plain
+   statement that this controller is not the one in charge. */
+#solar-card .pill.mode-solar  { background: var(--solar); color: #1a1a19; }
+#solar-card .pill.mode-now    { background: var(--import); color: #fff; }
+#solar-card .pill.mode-manual { background: var(--home); color: #fff; }
+#solar-card .pill.mode-off    { background: var(--chip, #33333322); color: var(--muted); }
+
+/* The override notice. Bordered rather than tinted: it is not a warning --
+   nothing is wrong, the owner did this on purpose -- but it does carry the
+   only control on the card, and it should be findable at a glance. */
+#solar-card .override {
+  display: flex; flex-wrap: wrap; align-items: center; gap: .75rem;
+  margin: .6rem 0; padding: .7rem .85rem;
+  border: 1px solid var(--border); border-left: 3px solid var(--home);
+  border-radius: var(--radius, 14px); background: var(--plane);
+}
+#solar-card .override p { margin: 0; flex: 1 1 18rem; font-size: .9rem; color: var(--ink-2); }
+
+#solar-card .warn, #garage-card .warn { color: var(--bad, #ef4444); }
+#solar-card .hint, #garage-card .hint { color: var(--muted, #888); font-size: .85rem; margin: .35rem 0 .6rem; }
+
+/* ---- solar tank (Task 20) --------------------------------------------
+   Vertical battery fill, split into the solar and grid share of the
+   CURRENT charge -- placed first in the card, where the eye lands, with
+   the banked-miles and lifetime-free-miles figures promoted beside it as
+   headlines rather than the grey hint text they shipped as. */
+#solar-card .tank-row { display: flex; align-items: center; gap: 1.25rem; margin-bottom: .4rem; }
+#solar-card .tank { width: 4.25rem; flex: none; }
+#solar-card .tank svg { width: 100%; height: auto; display: block; }
+/* Neutral chrome -- same gray the ring/gridlines use, not either energy hue. */
+#solar-card .tank-outline { fill: none; stroke: var(--grid); stroke-width: 2; }
+#solar-card .tank-fill.tank-solar { fill: var(--solar); }
+/* Grid energy is ordinary, not an error state -- --import is reserved for
+   alarm/danger UI (.toast.bad, .btn.danger) elsewhere in this file. A big
+   red fill with no legend beside it reads as "something is wrong" even
+   when the battery is healthy. --ink-2 stays legible as a solid fill in
+   both themes (--baseline nearly disappears against --surface in dark
+   mode, since --baseline #383835 sits right next to --surface #1a1a19). */
+#solar-card .tank-fill.tank-grid  { fill: var(--ink-2); }
+#solar-card .tank-facts { flex: 1 1 auto; min-width: 0; }
+#solar-card .tank-headline { font-size: 1.05rem; font-weight: 600; margin: 0 0 .2rem; }
+#solar-card .tank-facts .big { margin: 0 0 .15rem; }
+#solar-card .tank-sub { font-size: .95rem; font-weight: 600; color: var(--ink-2); margin: .2rem 0 0; }
+#garage-card .row { display: flex; align-items: center; gap: .6rem; margin: .5rem 0; }
+
+/* Live banked-miles ticker and the places it unlocks. The number is
+   tabular-nums so thousandths ticking over does not jiggle the sentence. */
+.live-miles {
+  font-variant-numeric: tabular-nums;
+}
+
+ul.reach {
+  list-style: none;
+  margin: 0.4rem 0 0;
+  padding: 0;
+  /* Without a cap, space-between throws the distance to the far edge of a
+     1150px card and it stops reading as belonging to the name beside it. */
+  max-width: 32rem;
+}
+
+ul.reach li {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.28rem 0;
+  border-bottom: 1px solid var(--rule, rgba(128, 128, 128, 0.18));
+  font-variant-numeric: tabular-nums;
+}
+
+ul.reach li:last-child { border-bottom: 0; }
+
+.reach-on .reach-name { font-weight: 600; }
+.reach-on .reach-dist { color: var(--ink-2); }
+
+/* Not yet reachable: present but clearly pending, so the list reads as a
+   destination approaching rather than a failure. */
+.reach-off { opacity: 0.45; }
+.reach-off .reach-dist { font-variant-numeric: tabular-nums; }

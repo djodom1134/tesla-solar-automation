@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Setup — Tesla</title>
+<link rel="stylesheet" href="/vendor/leaflet.css">
+<link rel="stylesheet" href="/styles.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>⚙️</text></svg>">
+</head>
+<body>
+  <div id="setup-app">
+    <header class="topbar">
+      <h1>Setup</h1>
+      <div class="topbar-actions">
+        <a class="ghost-btn" href="/car.html">Car</a>
+        <a class="ghost-btn" href="/index.html">Solar</a>
+      </div>
+    </header>
+
+    <div id="setup-error" class="error-bar" hidden></div>
+
+    <section class="card">
+      <h2>Home</h2>
+      <p class="hint">Drag the pin to where the car actually parks — the driveway,
+        not the middle of the house. The circle is the geofence.</p>
+      <div id="map" class="map"></div>
+      <div class="row">
+        <label for="radius">Radius</label>
+        <input type="range" id="radius" min="25" max="500" step="5" value="100">
+        <output id="radius-out">100 m</output>
+      </div>
+      <p>Car is currently: <strong id="classification">unknown</strong></p>
+      <button id="save-home">Save home</button>
+      <span id="home-msg" class="msg"></span>
+    </section>
+
+    <section class="card">
+      <h2>Solar charging</h2>
+      <label class="row"><input type="checkbox" id="enabled"> Match charge rate to solar export</label>
+
+      <div class="row">
+        <label for="period">Loop period</label>
+        <select id="period">
+          <option value="120">120 s (recommended)</option>
+          <option value="60">60 s (tracks clouds harder, costs more)</option>
+        </select>
+      </div>
+
+      <div class="row">
+        <label for="ceiling">Charge limit ceiling</label>
+        <input type="range" id="ceiling" min="50" max="100" step="5" value="90">
+        <output id="ceiling-out">90%</output>
+      </div>
+      <p class="hint">Raised only while surplus is actually being exported, and put
+        back when the sun goes. Sitting near 100% is what ages the pack, not
+        reaching it.</p>
+      <label class="row"><input type="checkbox" id="raise-limit" checked>
+        Allow raising the limit to capture more sun</label>
+
+      <h3>If you change the charge rate yourself</h3>
+      <label class="row"><input type="checkbox" id="pause-override" checked>
+        Pause solar control when I set the charge rate in the app or the car</label>
+      <p class="hint">You and this controller both write the same setting, and
+        without this the controller wins — move the slider in the Tesla app and
+        the next loop writes its own rate straight back over yours. With it, your
+        rate stands and solar control stands aside until you either stop and
+        restart charging, or turn it back on from the
+        <a href="/car.html">car page</a>. It only reacts to the charge
+        <em>rate</em> — changing the charge limit, or stopping the charge, is not
+        treated as taking over.</p>
+
+      <div class="row">
+        <label for="grace">Cloud grace</label>
+        <input type="number" id="grace" min="0" max="20" step="1" value="3">
+        <span>minutes</span>
+      </div>
+      <p class="hint">Below about 1.3 kW the car cannot charge at all. Grace holds at
+        the minimum through short clouds instead of stopping — which imports a little.
+        Set to 0 to never import.</p>
+
+      <div class="row">
+        <label for="gracewh">Grace budget</label>
+        <input type="number" id="gracewh" min="0" max="5000" step="10" value="250">
+        <span>Wh</span>
+      </div>
+      <p class="hint">The real limit on riding out a dip: how much grid energy the car
+        may spend holding at the minimum before it gives up. An air-conditioner cycle
+        runs 6–10 minutes and costs 120–200 Wh to bridge, so too small a budget pays
+        most of the cost and still stops.</p>
+
+      <h3>Electricity rates</h3>
+      <div class="row">
+        <label for="imp-rate">Imported</label>
+        <input type="number" id="imp-rate" min="0" max="5" step="0.001"
+               placeholder="0.12">
+        <span>per kWh</span>
+      </div>
+      <div class="row">
+        <label for="exp-rate">Exported</label>
+        <input type="number" id="exp-rate" min="0" max="5" step="0.001"
+               placeholder="0.04">
+        <span>per kWh</span>
+      </div>
+      <p class="hint">The gap between these two is the whole reason self-consumption
+        pays. Credited the same as you are charged (full net metering) and using your
+        own solar saves nothing — the grid is already your battery. Credited less, and
+        every kWh you keep is worth the difference. Leave blank to hide all money
+        figures rather than show a misleading zero.</p>
+
+      <details>
+        <summary>Tuning</summary>
+        <div class="row"><label for="margin">Export margin (W)</label>
+          <input type="number" id="margin" min="0" max="2000" step="10" value="100"></div>
+        <div class="row"><label for="deadband">Deadband (W)</label>
+          <input type="number" id="deadband" min="50" max="2000" step="10" value="250"></div>
+        <div class="row"><label for="ramp">Ramp limit (A/tick)</label>
+          <input type="number" id="ramp" min="1" max="48" step="1" value="8"></div>
+        <div class="row"><label for="mina">Minimum amps</label>
+          <input type="number" id="mina" min="5" max="32" step="1" value="5"></div>
+        <div class="row"><label for="cap">Daily request cap</label>
+          <input type="number" id="cap" min="0" max="20000" step="50" value="400"></div>
+      </details>
+
+      <button id="save-solar">Save</button>
+      <span id="solar-msg" class="msg"></span>
+    </section>
+
+    <section class="card">
+      <h2>Garage</h2>
+      <div class="row">
+        <label for="garage-url">ratgdo URL</label>
+        <input type="text" id="garage-url" placeholder="http://192.168.x.x">
+        <button id="garage-test" type="button">Test connection</button>
+      </div>
+      <p id="garage-test-msg" class="hint"></p>
+
+      <label class="row"><input type="checkbox" id="garage-auto-open">
+        Open automatically when the car arrives</label>
+
+      <div class="row">
+        <label for="garage-ring">Arrival ring radius</label>
+        <input type="number" id="garage-ring" min="50" max="5000" step="50" value="800">
+        <span>m</span>
+      </div>
+      <p class="hint">Hundreds of metres, not the tight geofence used for "is it
+        parked at home" — this is "it is arriving".</p>
+
+      <div class="row">
+        <label for="garage-close-hour">Close automatically at</label>
+        <input type="number" id="garage-close-hour" min="0" max="23" step="1" placeholder="off">
+        <span>:00</span>
+      </div>
+      <div class="row">
+        <label for="garage-warn">Warning time before closing</label>
+        <input type="number" id="garage-warn" min="5" max="60" step="1" value="8">
+        <span>seconds</span>
+      </div>
+      <p class="hint">There is no way to get a fully compliant audible warning
+        through this device's API, so this only turns the garage light on and
+        re-checks the door before closing — it never closes a door that is
+        obstructed or that is no longer open by the time the wait is up.
+        <strong>The ratgdo's own auto-close</strong>, configured in its own web
+        UI rather than here, gives a fully warned close on an open-duration
+        timer and is the safer option if you'd rather rely on that instead of
+        this schedule.</p>
+
+      <button id="save-garage">Save</button>
+      <span id="garage-msg" class="msg"></span>
+    </section>
+
+    <section class="card">
+      <h2>Deadline warning</h2>
+      <p class="hint">Never acts — it only tells you, once the sun is done for the day,
+        that solar alone did not reach your target.</p>
+      <div class="row">
+        <label for="dsoc">Want at least</label>
+        <input type="number" id="dsoc" min="0" max="100" step="5" placeholder="off">
+        <span>% by</span>
+        <input type="number" id="dhour" min="0" max="23" step="1" placeholder="7">
+        <span>:00</span>
+      </div>
+      <button id="save-deadline">Save</button>
+      <span id="deadline-msg" class="msg"></span>
+    </section>
+  </div>
+
+  <script src="/vendor/leaflet.js"></script>
+  <script type="module" src="/setup.js"></script>
+</body>
+</html>
