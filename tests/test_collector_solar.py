@@ -3560,3 +3560,75 @@ async def test_a_raise_the_car_has_not_applied_yet_keeps_its_record(tmp_path):
         "engaging must not record the RAISED limit as the owner's")
     assert st["raised_to"] == 95
     store_.close()
+
+
+class _ChargingAtOurAmpsClient:
+    """A car still charging at the controller's own 17 A when the collector
+    restarts. Reads always reflect the amps the car currently holds."""
+
+    def __init__(self):
+        self.amps = 17
+        self.commands: list[tuple[str, dict]] = []
+
+    async def resolve_vin(self):
+        return "VIN1"
+
+    async def energy_sites(self):
+        return [{"energy_site_id": 1}]
+
+    async def vehicle(self, vin):
+        return {"state": "online"}
+
+    async def vehicle_data(self, vin, *a, **k):
+        return {"charging_state": "Charging", "amps_actual": self.amps,
+                "charge_amps": self.amps, "amps_max": 48, "volts": 240,
+                "soc": 83, "limit": 80, "lat": 40.0, "lon": -105.0,
+                "fast_charger_present": False, "fast_charger": None,
+                "vin": "VIN1", "sampled_at": int(time.time())}
+
+    async def _get(self, path, ttl=0):
+        return {"grid_power": -300.0, "solar_power": 5500.0}
+
+    async def command(self, vin, name, params):
+        self.commands.append((name, dict(params)))
+        if name == "set_charging_amps":
+            self.amps = params["charging_amps"]
+        return 200, {"response": {"result": True}}
+
+    async def wake_up(self, vin):
+        return {"state": "online"}
+
+    async def aclose(self):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_recovery_does_not_hand_the_tick_a_view_it_just_made_stale(
+        tmp_path, monkeypatch):
+    """2026-09-18 13:10, live. Startup recovery put the owner's 48 A back,
+    then the same pass adopted the still-running charge off the view read
+    BEFORE that restore -- which said 17 A, the controller's own value -- and
+    recorded it as the owner's. The next restart "restored" 17 A as the car's
+    standing charge rate."""
+    db_path = tmp_path / "car.db"
+    seed = Store(db_path)
+    solar.save_config(seed._db, enabled=1)
+    home.save(seed._db, 40.0, -105.0, 100)
+    solar.save_state(seed._db, "VIN1", state="charging", dirty=1,
+                     original_amps=48, original_limit=80)
+    seed.close()
+
+    client = _ChargingAtOurAmpsClient()
+    monkeypatch.setattr(collector.settings, "db_file", db_path)
+    monkeypatch.setattr(collector, "TeslaClient", lambda settings: client)
+    monkeypatch.setattr(collector.vehicle, "derive", lambda raw: raw)
+    monkeypatch.setattr(collector.tesla, "proxy_up", lambda url: True)
+
+    await collector.run(once=True)
+
+    assert ("set_charging_amps", {"charging_amps": 48}) in client.commands
+    store_ = Store(db_path)
+    st = solar.load_state(store_._db, "VIN1")
+    assert st["original_amps"] in (None, 48), (
+        f"the controller's own 17 A was recorded as the owner's: {st['original_amps']}")
+    store_.close()

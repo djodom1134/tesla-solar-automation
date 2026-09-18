@@ -1380,9 +1380,27 @@ async def run(once: bool = False) -> int:
             if (view is not None or watching) and solar_wanted:
                 if not recovery_done:
                     db = store._db
+                    was_dirty = bool(solar.load_state(db, vin)["dirty"])
                     recovery_done = await recover(
                         client, db, vin, solar.load_state(db, vin),
                         home.classify(view, home.load(db)), settings, view)
+                    if recovery_done and was_dirty and view is not None:
+                        # The restore just changed the car, so the view is
+                        # the car BEFORE it. Ticking on it records the
+                        # controller's own amps as the owner's: observed
+                        # 2026-09-18 13:10, recovery put back 48 A, the tick
+                        # adopted the still-running charge off a view saying
+                        # 17 A, and the next restart "restored" 17 A as the
+                        # car's standing rate.
+                        view = await refresh_view(client, store, vin)
+                        ticks_since_view = 0
+                        if view is None:
+                            # No honest view to tick on; the next pass reads.
+                            if once:
+                                return 0
+                            await asyncio.sleep(
+                                next_interval(car_state, view, settings, 0))
+                            continue
                     if not recovery_done:
                         # Best-effort, not synchronous (spec 3.6): leave dirty
                         # set and retry next tick rather than engaging with a
