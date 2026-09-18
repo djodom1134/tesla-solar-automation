@@ -3632,3 +3632,66 @@ async def test_recovery_does_not_hand_the_tick_a_view_it_just_made_stale(
     assert st["original_amps"] in (None, 48), (
         f"the controller's own 17 A was recorded as the owner's: {st['original_amps']}")
     store_.close()
+
+
+class _OneMissedReadClient:
+    """Charging on solar and awake throughout, but vehicle_data 408s once --
+    the live 2026-09-18 13:43 reading."""
+
+    def __init__(self, miss_on: int):
+        self.reads = 0
+        self.miss_on = miss_on
+        self.state_checks = 0
+
+    async def resolve_vin(self):
+        return "VIN1"
+
+    async def energy_sites(self):
+        return [{"energy_site_id": 1}]
+
+    async def vehicle(self, vin):
+        self.state_checks += 1
+        return {"state": "online"}
+
+    async def vehicle_data(self, vin, *a, **k):
+        self.reads += 1
+        if self.reads == self.miss_on:
+            raise tesla.VehicleAsleep(vin)
+        return {"charging_state": "Charging", "amps_actual": 16,
+                "charge_amps": 16, "amps_max": 48, "volts": 240, "soc": 84,
+                "limit": 95, "lat": 40.0, "lon": -105.0,
+                "fast_charger_present": False, "fast_charger": None,
+                "vin": "VIN1", "sampled_at": int(time.time())}
+
+    async def _get(self, path, ttl=0):
+        return {"grid_power": -300.0, "solar_power": 5500.0}
+
+    async def command(self, vin, name, params):
+        return 200, {"response": {"result": True}}
+
+    async def wake_up(self, vin):
+        return {"state": "online"}
+
+    async def aclose(self):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_one_missed_read_mid_charge_does_not_stand_the_loop_down(
+        tmp_path, monkeypatch):
+    """2026-09-18 13:43, live: one vehicle_data 408 during a solar charge was
+    taken as sleep, and the loop slept poll_asleep (1800 s) with the car
+    drawing 16 A. A missed read must keep the engaged cadence and hand the
+    question to a real state check on the next pass."""
+    monkeypatch.setattr(collector.vehicle, "derive", lambda raw: raw)
+    # Pass 1 reads via poll_once; the engaged passes after it refresh on
+    # view_refresh_ticks, so the second vehicle_data is the refresh.
+    client = _OneMissedReadClient(miss_on=2)
+    monkeypatch.setattr(collector, "should_refresh_view",
+                        lambda *a, **k: True)
+    sleeps, _ = await _drive_run_capturing_sleeps(
+        monkeypatch, tmp_path, client, ticks=4)
+    assert collector.settings.poll_asleep not in sleeps, (
+        f"a missed read stood the loop down to the asleep cadence: {sleeps}")
+    assert all(s <= 120 for s in sleeps), sleeps
+    assert client.state_checks >= 2, "the next pass must check, not assume"

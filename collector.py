@@ -1311,6 +1311,7 @@ async def run(once: bool = False) -> int:
             # meter-only watch deliberately makes no vehicle call, and force
             # mode needs one.
             watching = False
+            view_missed = False
             if (car_state != "online" and solar_wanted
                     and not solar.forcing(conf, time.time())
                     and site_id is not None
@@ -1335,7 +1336,14 @@ async def run(once: bool = False) -> int:
                                            wrote_last_tick):
                         fresh = await refresh_view(client, store, vin)
                         if fresh is None:
-                            car_state, view, engaged = "asleep", None, 0
+                            # NOT proof of sleep. vehicle_data 408s now and
+                            # then for a car that is plainly awake -- observed
+                            # 2026-09-18 13:43, mid-charge at 16 A. Calling
+                            # that "asleep" dropped the loop to poll_asleep
+                            # and left a charging car unwatched for 30 min.
+                            # Stay engaged; the next pass takes a real state
+                            # check (poll_once) at the engaged cadence.
+                            view, view_missed = None, True
                         else:
                             view, ticks_since_view = fresh, 0
                     else:
@@ -1453,7 +1461,7 @@ async def run(once: bool = False) -> int:
                 # wrote) pair, and changing that would break them all.
                 backoff_s = solar.load_state(store._db, vin)["backoff_s"]
             else:
-                engaged = 0
+                engaged = conf["period_s"] if view_missed else 0
 
             soc = (view or {}).get("soc")
             _log(f"{car_state}" + (f" soc={soc}%" if soc is not None else ""))
