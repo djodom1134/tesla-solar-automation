@@ -139,7 +139,7 @@ def control(grid_w: float, current_a: int, tun: Tunables) -> Decision:
 
 
 def sleeping_candidate(view: dict | None, age_s: float | None,
-                       max_age_s: float) -> bool:
+                       max_age_s: float, raise_to: int | None = None) -> bool:
     """Whether a SLEEPING car's last-known state justifies watching the meter
     on its behalf.
 
@@ -157,9 +157,19 @@ def sleeping_candidate(view: dict | None, age_s: float | None,
 
       plugged   -- waking an unplugged car buys nothing and cannot charge
       headroom  -- at or within a point of its limit there is nowhere to put
-                   the energy
+                   the energy, UNLESS the limit may be raised (`raise_to`)
       fresh     -- a car we have not been watching may have been driven away
                    since; acting on it would wake a car somewhere else
+
+    `raise_to` is the limit the controller is still allowed to raise to this
+    engagement (see raisable_to), or None. Headroom is measured against it,
+    because a raise is headroom the controller can make. Measuring against
+    the car's own limit alone meant a car that filled to its limit and then
+    fell asleep was never looked at again: raise_decision can only run on a
+    tick, a sleeping car only gets a tick through this function, and this
+    function called the car full. A car finishes a charge, sleeps within the
+    half hour, and stays asleep at its limit while the array exports --
+    exactly the car the raise was written for, and the one it never reached.
 
     `age_s` is time since we last KNEW where the car was, which is not the
     same as the snapshot's age and must not be passed as one -- see
@@ -178,7 +188,27 @@ def sleeping_candidate(view: dict | None, age_s: float | None,
     soc, limit = view.get("soc"), view.get("limit")
     if soc is None or limit is None:
         return False
+    if raise_to is not None:
+        limit = max(limit, raise_to)
     return soc < limit - 1
+
+
+def at_limit(view: dict) -> bool:
+    """Whether the car has no headroom at its OWN limit -- the same line
+    sleeping_candidate draws. Unknown is not "at limit": the caller has
+    already refused a view with no soc or limit."""
+    soc, limit = view.get("soc"), view.get("limit")
+    return soc is not None and limit is not None and soc >= limit - 1
+
+
+def raisable_to(conf: dict, st: dict) -> int | None:
+    """The limit this engagement may still raise to, or None when it may not:
+    raising is switched off, or this engagement has already raised once (see
+    raise_decision's ONCE PER ENGAGEMENT). What sleeping_candidate counts as
+    headroom for a car sitting at its own limit."""
+    if not conf["raise_limit"] or st["raised_to"] is not None:
+        return None
+    return min(int(conf["soc_ceiling"]), 100)
 
 
 def asleep_confirmed(*, now: float, snapshot_ts: float | None,

@@ -508,3 +508,34 @@ def test_a_ticking_controller_can_still_be_blind_and_must_say_so():
     # the quiet one.
     assert solar.knowledge_stale(running=True, snapshot_age_s=None,
                                  max_age_s=day)
+
+
+def test_a_car_at_its_limit_is_worth_watching_while_the_limit_may_rise():
+    """Headroom the controller can make is headroom. A car at its limit is
+    watched when a raise is still possible -- and only then."""
+    full = {"charging_state": "Complete", "soc": 80, "limit": 80}
+    assert not solar.sleeping_candidate(full, 600, 21600)
+    assert solar.sleeping_candidate(full, 600, 21600, raise_to=90)
+    # A raise to where the car already is makes no room.
+    assert not solar.sleeping_candidate(full, 600, 21600, raise_to=80)
+    assert not solar.sleeping_candidate({**full, "soc": 89}, 600, 21600,
+                                        raise_to=90)
+    # Never a reason to watch an unplugged or unplaceable car.
+    assert not solar.sleeping_candidate(
+        {**full, "charging_state": "Disconnected"}, 600, 21600, raise_to=90)
+    assert not solar.sleeping_candidate(full, 21601, 21600, raise_to=90)
+
+
+def test_raisable_to_is_the_ceiling_only_while_a_raise_is_still_allowed():
+    conf = {"raise_limit": 1, "soc_ceiling": 90}
+    assert solar.raisable_to(conf, {"raised_to": None}) == 90
+    assert solar.raisable_to(conf, {"raised_to": 90}) is None
+    assert solar.raisable_to({**conf, "raise_limit": 0},
+                             {"raised_to": None}) is None
+
+
+def test_at_limit_draws_the_same_line_as_sleeping_candidate():
+    assert solar.at_limit({"soc": 79, "limit": 80})
+    assert solar.at_limit({"soc": 80, "limit": 80})
+    assert not solar.at_limit({"soc": 78, "limit": 80})
+    assert not solar.at_limit({"soc": None, "limit": 80})
