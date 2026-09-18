@@ -424,6 +424,58 @@ function reachPaint(miles) {
   }
 }
 
+// Money saved against a gasoline car. Sun and grid are separate lines because
+// they are separate claims: the sun's miles cost nothing, the grid's cost
+// electricity, and adding the two would hide which one is doing the work.
+function renderSavings(sv) {
+  const box = $("solar-savings");
+  if (!sv) { box.hidden = true; return; }
+  const usd = (v) => `${v < 0 ? "−" : ""}$${nfmt(Math.abs(v), 2)}`;
+  const today = sv.sun_usd_today ? ` (${usd(sv.sun_usd_today)} today)` : "";
+  $("solar-savings-sun").textContent =
+    `Saved by the sun: ${usd(sv.sun_usd)} of gas not bought${today}.`;
+  $("solar-savings-grid").textContent = sv.grid_usd === null
+    ? `Saved on grid electricity: ${usd(sv.grid_gas_usd)} of gas not bought `
+      + "— set an import rate to net off what the electricity cost."
+    : `Saved on grid electricity: ${usd(sv.grid_usd)} `
+      + `(${usd(sv.grid_gas_usd)} of gas, less ${usd(sv.grid_electric_usd)} of power).`;
+  const week = shortDate(new Date(`${sv.gas_week}T12:00:00`).getTime() / 1000);
+  $("solar-savings-basis").textContent =
+    `Against a ${nfmt(sv.mpg, 0)} mpg car. Regular gas ${usd(sv.gas_usd_per_gal)}/gal `
+    + `(${sv.gas_source}, week of ${week}); each charge priced at its own week's gas.`;
+  box.hidden = false;
+}
+
+// Lifetime and a year ahead. Estimates, and the basis line says exactly which
+// parts are assumed: the car's age when it came from the VIN, and the sun
+// share measured since tracking began applied to the whole life.
+function renderProjection(p) {
+  const box = $("solar-projection");
+  if (!p) { box.hidden = true; return; }
+  const usd = (v) => `${v < 0 ? "−" : ""}$${nfmt(Math.abs(v), 0)}`;
+  $("solar-projection-life").textContent =
+    `Lifetime saved vs. gas (est.): ${usd(p.lifetime_usd)} — `
+    + `${usd(p.lifetime_sun_usd)} sun, ${usd(p.lifetime_grid_usd)} grid, `
+    + `over ${nfmt(p.odometer_mi, 0)} mi.`;
+  $("solar-projection-year").textContent =
+    `Projected per year: ${usd(p.yearly_usd)} — `
+    + `${usd(p.yearly_sun_usd)} sun, ${usd(p.yearly_grid_usd)} grid, `
+    + `at ${nfmt(p.annual_mi, 0)} mi/yr.`;
+  const start = new Date(p.in_service_ts * 1000);
+  const since = `${SHORT_MONTHS[start.getMonth()]} ${start.getFullYear()}`;
+  const age = p.in_service_basis === "configured" ? `since ${since}`
+    : `since ~${since} (estimated from the VIN's model year)`;
+  const share = p.sun_share_basis === "driven"
+    ? "of miles driven on sun since tracking began"
+    : "of home charging from sun";
+  $("solar-projection-basis").textContent =
+    `${nfmt(p.odometer_mi, 0)} mi over ${nfmt(p.years, 1)} yr ${age}. `
+    + `${nfmt(100 * p.sun_share, 1)}% ${share}, applied to the whole life. `
+    + `Grid miles at $${nfmt(p.electric_usd_per_mi, 3)}/mi at the home rate; `
+    + "Supercharging costs more, so the grid figure is an upper bound.";
+  box.hidden = false;
+}
+
 async function loadSolar() {
   let s;
   try {
@@ -593,6 +645,9 @@ async function loadSolar() {
       + `${nfmt(s.charged_grid_kwh, 2)} kWh from grid `
       + `(${nfmt(s.charged_solar_share, 0)}% solar)${miles}.`;
   }
+
+  renderSavings(s.savings);
+  renderProjection(s.projection);
 
   const warn = $("solar-warn");
   if (s.capped) {

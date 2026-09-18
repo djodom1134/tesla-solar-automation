@@ -660,3 +660,16 @@ def test_an_unrelated_save_does_not_cancel_the_pause(client, monkeypatch):
 
     assert r.status_code == 200
     assert _loaded_state()["override_amps"] == 32
+
+
+def test_status_has_no_savings_until_gas_prices_arrive(client, monkeypatch):
+    """No price, no figure: the card hides the savings block rather than
+    showing $0.00, which would read as a measured nothing."""
+    monkeypatch.setattr(solar_routes, "DEMO", False)
+    assert client.get("/api/car/solar/status").json()["savings"] is None
+
+
+def test_demo_status_carries_savings(client):
+    sv = client.get("/api/car/solar/status").json()["savings"]
+    assert sv["sun_usd"] > 0 and sv["grid_usd"] is not None
+    assert sv["mpg"] == 20

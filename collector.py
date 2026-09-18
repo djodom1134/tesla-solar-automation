@@ -22,6 +22,7 @@ import httpx
 
 import energy
 import garage
+import gas
 import green
 import home
 import meters
@@ -1203,6 +1204,7 @@ async def run(once: bool = False) -> int:
     last_sleep_s = 60
     # Runs on first pass, then hourly.
     last_site_ingest = 0.0
+    last_gas_attempt = 0.0
     last_force_wake = 0.0
     try:
         try:
@@ -1232,6 +1234,16 @@ async def run(once: bool = False) -> int:
             st = solar.load_state(store._db, vin)
             solar_wanted = (bool(conf["enabled"]) or bool(st["dirty"])
                             or solar.forcing(conf, time.time()))
+
+            # Daily gas price for the savings card. Not a Tesla request, so
+            # it is neither counted nor capped; gas.due throttles it itself.
+            if gas.due(store._db, time.time(), last_gas_attempt):
+                last_gas_attempt = time.time()
+                try:
+                    weeks = await gas.refresh(store._db)
+                    _log(f"gas prices refreshed ({weeks} weeks, {gas.SOURCE})")
+                except Exception as exc:      # never let this kill the loop
+                    _log(f"gas price refresh failed: {exc}")
 
             if time.time() - last_site_ingest >= SITE_INGEST_INTERVAL_S:
                 last_site_ingest = time.time()

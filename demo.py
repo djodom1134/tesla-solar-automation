@@ -415,6 +415,27 @@ def solar_status() -> dict:
         # alone, because a miles figure resting on an assumed pack size
         # contradicts banked_miles, which needs no pack size at all.
         "charged_miles_basis": "measured",
+        # Against a 20 mpg car at a demo $4.25/gal: 794.0 sun miles is 39.7
+        # gal, 143.9 grid miles is 7.2 gal less 38.9 kWh at $0.12.
+        "savings": {
+            "sun_usd": 168.73, "sun_kwh": 214.6, "sun_usd_today": 1.91,
+            "grid_gas_usd": 30.58, "grid_electric_usd": 4.67,
+            "grid_usd": 25.91, "grid_kwh": 38.9,
+            "gas_usd_per_gal": 4.25, "gas_week": "2026-09-14",
+            "gas_source": "EIA weekly retail, Denver regular", "mpg": 20.0,
+            "import_rate": 0.12,
+        },
+        # 48,000 mi over 4 years at 29.7% sun (the demo's driven-free share).
+        "projection": {
+            "odometer_mi": 48000.0, "years": 4.0, "annual_mi": 12000,
+            "sun_share": 0.297, "electric_usd_per_mi": 0.0363,
+            "lifetime_sun_usd": 2566.08, "lifetime_grid_usd": 5078.95,
+            "lifetime_usd": 7645.03,
+            "yearly_sun_usd": 757.35, "yearly_grid_usd": 1486.54,
+            "yearly_usd": 2243.89,
+            "in_service_ts": 1656655200, "in_service_basis": "model year",
+            "sun_share_basis": "driven",
+        },
         # Task 20: lifetime free miles driven -- a demo car with months of
         # history behind it, so the promoted headline has something to
         # show. 128.4 / 431.7 = 29.7%, the brief's own worked example.

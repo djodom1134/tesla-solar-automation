@@ -908,6 +908,9 @@ CREATE TABLE IF NOT EXISTS solar_config (
   -- that is down at midnight expires late on its next tick instead of
   -- missing the rollover entirely.
   force_charge_until  INTEGER,
+  -- When the car entered service, for its lifetime mileage average (gas.py).
+  -- NULL = estimate from the VIN's model year.
+  in_service_ts       INTEGER,
   -- Task 17b: the ratgdo garage opener. garage_close_hour is NULL = off, the
   -- same "absence means disabled" convention as deadline_hour above.
   garage_url          TEXT,
@@ -1052,6 +1055,7 @@ CONFIG_DEFAULTS = {
     "garage_close_hour": None, "garage_close_warn_s": 8,
     "force_charge_until": None,
     "pause_on_override": 1,
+    "in_service_ts": None,
 }
 
 STATE_DEFAULTS = {
@@ -1176,6 +1180,8 @@ CONFIG_NEW_COLUMNS = (
     # the protection on upgrade without touching the setup page -- the
     # behaviour it replaces is the one nobody asked for.
     ("pause_on_override", "INTEGER NOT NULL DEFAULT 1"),
+    # When the car entered service; NULL = estimated from the VIN (gas.py).
+    ("in_service_ts", "INTEGER"),
 )
 
 

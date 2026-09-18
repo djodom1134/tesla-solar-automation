@@ -14,6 +14,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+import gas
 import home
 import solar
 
@@ -121,6 +122,7 @@ class Store:
         _migrate(self._db)
         self._db.executescript(home.SCHEMA)
         self._db.executescript(solar.SCHEMA)
+        self._db.executescript(gas.SCHEMA)
         solar.migrate_state(self._db)
         solar.migrate_config(self._db)
         meters.migrate(self._db)

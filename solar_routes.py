@@ -18,6 +18,7 @@ from fastapi import APIRouter, Body, HTTPException
 
 import demo
 import garage
+import gas
 import green
 import home
 import landmarks
@@ -315,6 +316,9 @@ CONFIG_BOUNDS = {
     "watch_s": (60, 3600),
     # The manual-override pause. 1 by default -- see solar.override_step.
     "pause_on_override": (0, 1),
+    # Unix time the car entered service, for its lifetime mileage average.
+    # From 2008 (the first Roadster) to 2100: a sanity rail, as above.
+    "in_service_ts": (1_199_145_600, 4_102_444_800),
 }
 
 # Fields carrying real values rather than counts. int() would silently
@@ -323,7 +327,7 @@ FLOAT_CONFIG_FIELDS = ("import_rate", "export_rate", "grace_budget_wh")
 
 # Fields where absence is meaningful and must round-trip as NULL.
 NULLABLE_CONFIG_FIELDS = ("deadline_soc", "deadline_hour",
-                          "import_rate", "export_rate")
+                          "import_rate", "export_rate", "in_service_ts")
 
 
 @router.get("/solar/config")
@@ -445,6 +449,64 @@ async def put_charge_mode(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
     return _mode_payload(solar.load_config(store()._db), _mode_state(), now)
 
 
+def _savings(db, vin: str, conf: dict, mi_per_kwh: float | None) -> dict | None:
+    """Money saved against a gasoline car -- see gas.py. Lifetime figures
+    cover the same ticks as charged_split (all of them), and today's sun
+    figure the same day as free_miles, so every number on the card is taken
+    over the ground the line beside it describes."""
+    prices = gas.load_prices(db)
+    if not vin or not prices:
+        return None
+    rows = [dict(r) for r in db.execute(
+        "SELECT ts, car_w, grid_w, period_s FROM solar_ticks"
+        " WHERE vin = ? AND car_w > 0", (vin,))]
+    rate = conf.get("import_rate")
+    if rate is None:
+        rate = settings.import_rate
+    lifetime = gas.savings(rows, prices, mi_per_kwh, rate, settings.timezone)
+    if lifetime is None:
+        return None
+    midnight = _midnight_ts()
+    today = gas.savings([r for r in rows if r["ts"] >= midnight], prices,
+                        mi_per_kwh, rate, settings.timezone)
+    week, price = prices[-1]
+    return {**lifetime,
+            "sun_usd_today": today["sun_usd"] if today else 0.0,
+            "gas_usd_per_gal": price, "gas_week": week,
+            "gas_source": gas.SOURCE, "mpg": gas.MPG,
+            "import_rate": rate}
+
+
+def _projection(db, vin: str, conf: dict, view: dict,
+                green_status: dict) -> dict | None:
+    """Lifetime and yearly money saved against a gasoline car -- see
+    gas.projection. The sun share is miles actually driven on banked sun,
+    falling back to the home-charging kWh split only before any driving has
+    been tracked."""
+    prices = gas.load_prices(db)
+    if not vin or not prices:
+        return None
+    share = green_status["free_miles_share"]
+    if share is None:
+        share = green_status["charged_solar_share"]
+    started, basis = gas.in_service(conf.get("in_service_ts"),
+                                    view.get("vin") or vin, settings.timezone)
+    rate = conf.get("import_rate")
+    if rate is None:
+        rate = settings.import_rate
+    out = gas.projection(
+        odometer_mi=view.get("odometer_mi"), in_service_ts=started,
+        now=time.time(), prices=prices,
+        sun_share=(share / 100) if share is not None else None,
+        mi_per_kwh=green_status["mi_per_kwh"], import_rate=rate,
+        tz=settings.timezone)
+    if out is None:
+        return None
+    return {**out, "in_service_ts": int(started), "in_service_basis": basis,
+            "sun_share_basis": ("driven" if green_status["free_miles_share"]
+                                is not None else "charged")}
+
+
 @router.get("/solar/status")
 async def get_solar_status() -> dict[str, Any]:
     if DEMO:
@@ -477,6 +539,10 @@ async def get_solar_status() -> dict[str, Any]:
             free_w, _g["mi_per_kwh"], view.get("soc"),
             view.get("range_mi"), _g["pack_kwh"])
     conf = solar.load_config(db)
+    green_status = _green_status(
+        db, vin, state["solar_soc"], view.get("soc"), view.get("range_mi"),
+        state["free_miles_driven"], state["tracked_miles"],
+        state["free_miles_since"])
     return {
         "state": state["state"],
         "enabled": bool(conf["enabled"]),
@@ -516,9 +582,9 @@ async def get_solar_status() -> dict[str, Any]:
         # store.GAP_SECONDS since the ledger last observed the car means the
         # pack may have changed unobserved.
         "ledger_stale": bool(state["ledger_stale"]),
-        **_green_status(db, vin, state["solar_soc"], view.get("soc"), view.get("range_mi"),
-                        state["free_miles_driven"], state["tracked_miles"],
-                        state["free_miles_since"]),
+        **green_status,
+        "savings": _savings(db, vin, conf, green_status["mi_per_kwh"]),
+        "projection": _projection(db, vin, conf, view, green_status),
     }
 
 
