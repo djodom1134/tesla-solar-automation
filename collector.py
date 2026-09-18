@@ -331,7 +331,8 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
         age_s = solar.knowledge_age_s(time.time(),
                                       snap["ts"] if snap else None,
                                       st["asleep_confirmed_ts"])
-        if not solar.sleeping_candidate(shadow, age_s, SNAPSHOT_MAX_AGE_S):
+        if not solar.sleeping_candidate(shadow, age_s, SNAPSHOT_MAX_AGE_S,
+                                        solar.raisable_to(conf, st)):
             return st["state"], False
         view = shadow
         from_snapshot = True
@@ -424,6 +425,63 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
                        soc=view.get("soc"), period_s=conf["period_s"],
                        note="grid_power stuck")
         return st["state"], False
+
+    # --- a sleeping car at its limit: the raise is the only way in ----------
+    # sleeping_candidate lets this car through only because its limit may be
+    # raised. Nothing else is worth doing for it -- charge_start into a car
+    # with no headroom is refused `complete` -- so this tick asks the one
+    # question that matters, whether the raise is due, and never acts on the
+    # snapshot to answer it. set_charge_limit issued against a stale view
+    # would record a limit _restore can later fail to recognise as ours
+    # (it compares the VIEW's limit to raised_to), leaving the owner's car
+    # parked at the ceiling with nothing on disk to say so.
+    #
+    # So: sustain the raise hold on the meter alone, and when it is due, wake
+    # the car and let the rest of this tick run on what the car actually
+    # says. raise_decision then decides again on real data, with the hold
+    # carried in, and the raise and the charge_start follow on the same path
+    # an awake Complete car has used since 2026-09-13.
+    if from_snapshot and solar.at_limit(view):
+        due, raise_hold = solar.raise_decision(
+            enabled=bool(conf["raise_limit"]),
+            state=st["state"],
+            soc=view.get("soc"),
+            limit=view.get("limit"),
+            ceiling=conf["soc_ceiling"],
+            grid_w=grid_w,
+            raised_to=st["raised_to"],
+            hold_elapsed_s=st["raise_hold_elapsed"],
+            raise_hold_s=conf["raise_hold_s"],
+            period_s=conf["period_s"],
+            complete=True,         # no headroom is what "Complete" reports
+            plugged=True,          # sleeping_candidate refused Disconnected
+            location=location,
+        )
+        if due is None:
+            solar.save_state(db, vin, raise_hold_elapsed=raise_hold)
+            # Logged like any other quiet tick: the dark stand-down reads its
+            # evidence from solar_ticks, and an unlogged tick is what parked
+            # the watch through a sunny morning on 2026-07-29 (is_dark_at).
+            solar.log_tick(db, vin, ts=int(time.time()), state=st["state"],
+                           grid_w=grid_w, solar_w=live.get("solar_power"),
+                           soc=view.get("soc"), period_s=conf["period_s"],
+                           note="asleep at limit; raise hold")
+            return st["state"], False
+        fresh = await _wake_and_look(client, store_, vin)
+        if fresh is None:
+            # Reset rather than keep the hold: a kept hold would buy another
+            # $0.02 wake on the very next tick. Same reasoning as the `wake`
+            # action's failure path below.
+            _log("woke for a charge-limit raise but the car gave no view; "
+                 "holding")
+            solar.save_state(db, vin, raise_hold_elapsed=0)
+            return st["state"], False
+        _log(f"woke a car asleep at its limit ({view.get('soc')}%/"
+             f"{view.get('limit')}%) for exporting sun")
+        solar.save_state(db, vin, raise_hold_elapsed=raise_hold)
+        st = solar.load_state(db, vin)
+        view, from_snapshot = fresh, False
+        location = home.classify(view, home_cfg)
 
     # --- decide ------------------------------------------------------------
     tun = solar.tunables_from(conf, view.get("amps_max"), view.get("volts"))
@@ -571,8 +629,12 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
         raise_hold_s=conf["raise_hold_s"],
         period_s=conf["period_s"],
         # "Complete" is the car reporting no headroom, which is the one
-        # refusal a higher limit is the cure for. See raise_decision.
-        complete=view.get("charging_state") == "Complete",
+        # refusal a higher limit is the cure for. See raise_decision. A car
+        # just woken at its limit can report "Stopped" for the same fact, and
+        # charge_start is refused `complete` all the same -- so no headroom
+        # counts, whatever the label.
+        complete=(view.get("charging_state") == "Complete"
+                  or (not tick.car_charging and solar.at_limit(view))),
         plugged=tick.plugged,
         location=location,
     )
@@ -599,6 +661,20 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
                  f"for solar")
     solar.save_state(db, vin, raised_to=raised, raise_hold_elapsed=raise_hold)
     st = solar.load_state(db, vin)
+
+    # A raise that landed THIS tick is not followed by a charge_start in the
+    # same tick. The car takes its new limit asynchronously: observed live
+    # 2026-09-18 12:52, set_charge_limit 80 -> 95 was accepted and the
+    # charge_start two seconds behind it was still refused `complete`. The
+    # rollback then handed _restore a view that still said 80, _restore did
+    # not recognise the raise as ours, and cleared the record of it -- the
+    # car went on to charge toward 95% at the owner's 48 A with the
+    # controller holding nothing to put back. Next tick, on a fresh read, the
+    # car either started itself (a raise above SoC resumes the charge) or
+    # takes the charge_start; either way the record is intact.
+    raised_now = target_limit is not None and raised == target_limit
+    if raised_now and "charge_start" in actions:
+        machine, actions = solar.machine_from(st), []
 
     # --- act ---------------------------------------------------------------
     written = None
@@ -636,9 +712,13 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
                 return "stopped", False
         elif action == "charge_start":
             if st["original_amps"] is None:      # remember BEFORE we change it
+                # original_limit may already hold the owner's value, recorded
+                # by the raise; the view's limit is by now the raised one.
                 solar.save_state(db, vin, dirty=1,
                                  original_amps=view.get("charge_amps"),
-                                 original_limit=view.get("limit"),
+                                 original_limit=st["original_limit"]
+                                 if st["original_limit"] is not None
+                                 else view.get("limit"),
                                  engaged_at=int(time.time()))
                 st = solar.load_state(db, vin)
             if not await _command(client, db, vin, "charge_start"):
@@ -688,9 +768,13 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
             # put back and the owner's own per-location amps setting is lost
             # the moment set_amps below writes over it.
             if st["original_amps"] is None:
+                # As charge_start: never overwrite an owner's limit the raise
+                # already recorded with the raised value now in the view.
                 solar.save_state(db, vin, dirty=1,
                                  original_amps=view.get("charge_amps"),
-                                 original_limit=view.get("limit"),
+                                 original_limit=st["original_limit"]
+                                 if st["original_limit"] is not None
+                                 else view.get("limit"),
                                  engaged_at=int(time.time()))
                 st = solar.load_state(db, vin)
         elif action == "charge_stop":
@@ -846,7 +930,10 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
                    import_w=max(grid_w, 0.0), period_s=conf["period_s"])
     _log(f"solar {machine.state} surplus={surplus_w:.0f}W "
          f"amps={current_a}->{written if written is not None else '-'}")
-    return machine.state, (written is not None) or restored
+    # A raise counts as a write for the caller's purposes: the car has just
+    # been changed, so the next tick must read it rather than reuse a view
+    # that still shows the old limit and no charge (should_refresh_view).
+    return machine.state, (written is not None) or restored or raised_now
 
 
 async def refresh_view(client: TeslaClient, store_: Store, vin: str):
@@ -865,6 +952,31 @@ async def refresh_view(client: TeslaClient, store_: Store, vin: str):
         return None
     store_.record(view, at_home=home.classify(view, home.load(store_._db)))
     return view
+
+
+# A woken car answers vehicle_data with a 408 until it is actually up, which
+# takes seconds to tens of seconds. Three looks ten seconds apart covers the
+# usual case inside one watch tick; a car slower than that is left for the
+# next wake rather than paid for with more reads.
+WAKE_LOOKS = 3
+WAKE_LOOK_GAP_S = 10
+
+
+async def _wake_and_look(client: TeslaClient, store_: Store, vin: str):
+    """Wake a sleeping car and read it. Returns the fresh view, or None if
+    the wake failed or the car never answered. The view is recorded as the
+    new snapshot, exactly as refresh_view records it."""
+    try:
+        await client.wake_up(vin)
+    except (TeslaAPIError, TeslaAuthError, httpx.HTTPError, OSError) as exc:
+        _log(f"wake failed: {exc}")
+        return None
+    for _ in range(WAKE_LOOKS):
+        await asyncio.sleep(WAKE_LOOK_GAP_S)
+        view = await refresh_view(client, store_, vin)
+        if view is not None:
+            return view
+    return None
 
 
 def should_refresh_view(ticks_since_view: int, refresh_every: int,
@@ -1196,7 +1308,8 @@ async def run(once: bool = False) -> int:
                     solar.knowledge_age_s(now_beat,
                                           snap["ts"] if snap else None,
                                           confirmed),
-                    SNAPSHOT_MAX_AGE_S)
+                    SNAPSHOT_MAX_AGE_S,
+                    solar.raisable_to(conf, st))
 
             try:
                 if watching:
@@ -1286,7 +1399,14 @@ async def run(once: bool = False) -> int:
                 state, wrote_last_tick = await solar_tick(
                     client, store, vin, view, settings, site_id)
                 engaged = conf["period_s"] if state in ENGAGED_STATES else 0
-                if watching and state not in ("idle", "stopped"):
+                # A watch tick can also wake a car and stay idle -- the
+                # limit-raise wake reads a fresh view (a new snapshot) and
+                # leaves the charge_start to later ticks. Believing the car
+                # still asleep would send the next pass back to the snapshot
+                # and buy another wake instead of a look.
+                woke = (snap is not None
+                        and (store.snapshot(vin) or {}).get("ts", 0) > snap["ts"])
+                if watching and (state not in ("idle", "stopped") or woke):
                     # Engaging from a watch tick necessarily woke the car, but
                     # watch ticks skip poll_once, so car_state is still the
                     # stale "offline" that next_interval short-circuits on --
