@@ -168,6 +168,18 @@ async def ha_state() -> dict[str, Any]:
             soc=view.get("soc"),
             limit=view.get("limit"),
             stale_after_s=max(3600, 2 * (st["heartbeat_sleep_s"] or 1800) + 60)),
+        # The controller is alive AND ticking, but on a view of the car too
+        # old to act on -- the failure that ran for 44.5 hours on 2026-09-17
+        # with every flag above it reporting healthy. See solar.knowledge_stale.
+        # The bar is a full day: carrying a view through the night is what the
+        # unbroken watch is FOR, so anything tighter fires every morning.
+        # Additive field, SCHEMA deliberately still 1 -- the 34 consumer
+        # sensors gate availability on `schema == 1` by equality, so a bump
+        # for a new field marks every one of them unavailable.
+        "knowledge_stale": solar.knowledge_stale(
+            running=collector_running(st, now),
+            snapshot_age_s=(now - snap["ts"]) if snap else None,
+            max_age_s=24 * 3600),
         "dirty": bool(st["dirty"]),
         "rate_limited": bool(st["backoff_s"]),
         "ledger_stale": bool(st["ledger_stale"]),

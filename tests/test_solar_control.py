@@ -404,3 +404,107 @@ def test_the_legitimate_quiet_paths_are_not_mistaken_for_blindness():
     assert not _blind(soc=98, limit=99)
     assert not _blind(soc=None)
     assert not _blind(limit=None)
+
+
+# --- 2026-09-17: the watch believed a plug that Tesla kept denying ---------
+
+def test_a_refusal_naming_disconnected_corrects_the_snapshot():
+    """THE DAY THIS EXISTS FOR, 2026-09-17.
+
+    The car was unplugged some time on the 15th while asleep. The meter-only
+    watch reasoned from the snapshot taken before that, which says
+    `plugged_in: true` and `charging_state: "Stopped"` at 39% against an 80%
+    limit -- every clause sleeping_candidate asks for. So the watch held, and
+    a held watch makes NO vehicle call, so nothing ever replaced the view
+    that was wrong. Forty-four and a half hours, 122 requests spent, not one
+    of them a look at the car.
+
+    The unbroken-chain rule (asleep_confirmed) is what let the age grow that
+    far: it vouches that a sleeping car has not MOVED, which is true and
+    free, and knowledge_age_s therefore answered 0 s on every tick while the
+    view underneath it aged out of all recognition. Location was never the
+    thing that had gone stale. The PLUG was, and a human can pull a cable
+    from a sleeping car without waking it, so no amount of attendance can
+    vouch for that.
+
+    What makes this recoverable rather than merely unlucky is that the car
+    told us, nineteen times. Every surplus crossing sent charge_start and
+    every one came back `car could not execute command: disconnected`. That
+    refusal is ground truth about the exact field the snapshot had wrong, and
+    it was logged and dropped on the floor while the next tick went back to
+    believing the snapshot.
+
+    So a refusal that contradicts the snapshot corrects it. Matched as a
+    SUBSTRING for the reason _command already documents -- the signing proxy
+    wraps the car's reason in prose, and the live string is "car could not
+    execute command: disconnected".
+    """
+    correction = solar.snapshot_correction(
+        "car could not execute command: disconnected")
+    assert correction == {"charging_state": "Disconnected", "plugged_in": False}
+
+    # And that correction is precisely what makes the watch let go: the
+    # Disconnected clause sleeping_candidate already has does the rest, so
+    # the very next tick pays for a real state check instead of a 45th hour.
+    stale = {"charging_state": "Stopped", "soc": 39, "limit": 80,
+             "plugged_in": True}
+    assert solar.sleeping_candidate(stale, age_s=0.0, max_age_s=21600), (
+        "precondition: this is the view that held the watch open")
+    assert not solar.sleeping_candidate(
+        {**stale, **correction}, age_s=0.0, max_age_s=21600)
+
+
+def test_only_reasons_that_actually_contradict_the_snapshot_correct_it():
+    """A refusal is not a licence to rewrite the view generally. `complete`
+    and `is_charging` say something about the CHARGE, not about the cable,
+    and a car that is plugged in and full is still plugged in -- correcting
+    the plug there would disarm the watch on a car it should be watching.
+    Unknowns and absences say nothing at all.
+    """
+    for reason in ("car could not execute command: complete",
+                   "car could not execute command: is_charging",
+                   "car could not execute command: not_charging",
+                   "", None):
+        assert solar.snapshot_correction(reason) is None, reason
+
+
+def test_a_ticking_controller_can_still_be_blind_and_must_say_so():
+    """controller_blind was built for 2026-09-14, when the loop logged no
+    tick for seventeen hours, and it asks the only question that day needed:
+    is anything still happening? On 2026-09-17 the answer was yes. Ticks
+    landed every five minutes, solar_ticks was current to 135 s, and the
+    alarm was correctly silent -- while the view underneath every one of
+    those ticks was 44.5 hours old.
+
+    Liveness, usefulness, and now FRESHNESS are three questions, and the
+    second incident was the third one going unasked. A controller reasoning
+    from a day-old view is not looking at the car, however busy it looks.
+
+    Kept separate from controller_blind on purpose: that function reasons
+    about the car (plugged, soc, limit) from the snapshot, and the whole
+    claim here is that the snapshot cannot be trusted. An alarm about stale
+    data must not be gated on the stale data.
+    """
+    day = 24 * 3600
+    assert solar.knowledge_stale(running=True, snapshot_age_s=160438,
+                                 max_age_s=day), "the live outage"
+    assert not solar.knowledge_stale(running=True, snapshot_age_s=135,
+                                     max_age_s=day)
+
+    # An ordinary overnight sleep is exactly what the unbroken watch exists
+    # to carry, so the bar has to sit well past one. An alarm that fires
+    # every morning is one the owner learns to ignore, and that is how the
+    # seventeen hours were missed in the first place.
+    assert not solar.knowledge_stale(running=True, snapshot_age_s=17 * 3600,
+                                     max_age_s=day)
+
+    # A dead collector already has its own signal (collector_running), and
+    # two alarms for one fault is the noise this file keeps arguing against.
+    assert not solar.knowledge_stale(running=False, snapshot_age_s=160438,
+                                     max_age_s=day)
+
+    # A car this collector has never seen has no view to be stale, but it
+    # equally has nothing to reason from -- which is the alarming case, not
+    # the quiet one.
+    assert solar.knowledge_stale(running=True, snapshot_age_s=None,
+                                 max_age_s=day)

@@ -532,3 +532,34 @@ def test_latest_vin_answers_which_car_without_touching_the_api(tmp_path):
               at_home=True)
     assert st.latest_vin() == "VIN_NEW"
     st.close()
+
+
+def test_correct_snapshot_fixes_fields_without_freshening_the_view(db):
+    """2026-09-17. A refusal proved the stored view's plug wrong (see
+    solar.snapshot_correction). Writing the correction must NOT move `ts`:
+    the view is now less wrong, not newer, and snapshot_age_s is the one
+    signal that was telling the truth throughout the outage -- 160438 s,
+    right there in /api/ha/state, while every flag beside it said fine.
+    """
+    db.record(view(1000, 39))
+    db._db.execute("UPDATE snapshot SET json = json_set(json, '$.plugged_in', 1)")
+    db._db.execute(
+        "UPDATE snapshot SET json = json_set(json, '$.charging_state', 'Stopped')")
+
+    assert store.correct_snapshot(
+        db._db, "VIN1", {"charging_state": "Disconnected", "plugged_in": False})
+
+    snap = db.snapshot("VIN1")
+    assert snap["view"]["charging_state"] == "Disconnected"
+    assert snap["view"]["plugged_in"] is False
+    assert snap["ts"] == 1000, "a correction is not an observation"
+    assert snap["view"]["soc"] == 39, "untouched fields survive"
+
+
+def test_correct_snapshot_is_a_no_op_with_nothing_to_correct(db):
+    """No snapshot yet, or the view already agrees. Returns False so the
+    caller can log a real correction and stay quiet about a redundant one."""
+    assert not store.correct_snapshot(db._db, "NOSUCH", {"plugged_in": False})
+    db.record(view(1000, 39))          # records charging_state Disconnected
+    assert not store.correct_snapshot(
+        db._db, "VIN1", {"charging_state": "Disconnected"})

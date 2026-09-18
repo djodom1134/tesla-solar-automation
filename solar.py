@@ -245,6 +245,57 @@ def knowledge_age_s(now: float, snapshot_ts: float | None,
     return None if snapshot_ts is None else now - snapshot_ts
 
 
+# What a command refusal proves about a snapshot that disagrees with it.
+# Keyed by the car's own reason, matched as a SUBSTRING because the signing
+# proxy wraps it in prose -- the live string is "car could not execute
+# command: disconnected", never the bare word (see collector._command, which
+# learned the same lesson about ALREADY_DONE_REASONS).
+#
+# Only reasons that contradict a field the WATCH reads belong here. `complete`
+# and `is_charging` are about the charge, not the cable; a plugged-in car that
+# is full is still plugged in, and correcting the plug on those would disarm
+# the watch on exactly the cars it exists to serve.
+CONTRADICTED_BY_REFUSAL = {
+    "disconnected": {"charging_state": "Disconnected", "plugged_in": False},
+}
+
+
+def snapshot_correction(reason: str | None) -> dict | None:
+    """The fields a refusal proves are wrong in the stored view, or None.
+
+    THE DAY THIS EXISTS FOR, 2026-09-17. The car was unplugged while asleep
+    on the 15th. The meter-only watch reasoned from the snapshot taken before
+    that -- plugged in, Stopped, 39% against an 80% limit -- which satisfies
+    every clause sleeping_candidate asks for, so the watch held. A held watch
+    makes no vehicle call by design, so nothing ever replaced the view that
+    was wrong: 44.5 hours, 122 requests spent, not one of them a look at the
+    car.
+
+    asleep_confirmed is what let the age grow that far, and it was not wrong
+    to. It vouches that a SLEEPING car has not moved, which is true and free,
+    so knowledge_age_s answered 0 s on every tick. But location was never the
+    thing that had gone stale. The plug was -- and a human can pull a cable
+    from a sleeping car without waking it, so no amount of attendance can
+    vouch for that field. Nothing in a chain of observations about movement
+    has anything to say about a cable.
+
+    What makes this recoverable is that the car told us, nineteen times: every
+    surplus crossing sent charge_start and every one came back `disconnected`.
+    That is ground truth about the exact field the snapshot had wrong,
+    arriving on the one path the watch does not suppress -- commands still go
+    out. It was logged and dropped, and the next tick went back to believing
+    the snapshot. So: believe the car over the cache, and let the existing
+    Disconnected clause in sleeping_candidate end the watch on the next pass.
+    """
+    text = str(reason or "")
+    if not text:
+        return None
+    for needle, correction in CONTRADICTED_BY_REFUSAL.items():
+        if needle in text:
+            return dict(correction)
+    return None
+
+
 def backoff_seconds(consecutive_429s: int, period_s: int,
                     retry_after: float | None, cap_s: int = 1800) -> int:
     """How long to wait after a 429 before the next request.
@@ -372,6 +423,47 @@ def controller_blind(*, enabled: bool, running: bool, capped: bool,
     if last_tick_ts is None:
         return True
     return (now - last_tick_ts) > stale_after_s
+
+
+def knowledge_stale(*, running: bool, snapshot_age_s: float | None,
+                    max_age_s: float) -> bool:
+    """Whether the controller is reasoning about the car from a view too old
+    to reason from. Reported, never acted on -- ha_routes carries it to Home
+    Assistant, exactly as controller_blind and should_plug_in are.
+
+    THE DAY THIS EXISTS FOR, 2026-09-17, and it is the sequel to the one
+    controller_blind was written for. That function asks "is anything still
+    happening", because on 2026-09-14 nothing was. This time everything was:
+    ticks every five minutes, solar_ticks current to 135 s, 122 requests
+    spent -- and not one of them a look at the car, whose last view was 44.5
+    hours old. The meter-only watch suppresses vehicle calls by design and
+    the unbroken chain (asleep_confirmed) held knowledge_age_s at zero, so
+    every existing signal reported a healthy controller for two days.
+
+    Liveness, usefulness and FRESHNESS are three different questions. The
+    first incident was the second going unasked; this one was the third.
+
+    Deliberately NOT folded into controller_blind. That function reasons
+    about the car -- plugged, location, soc, limit -- and every one of those
+    values comes from the snapshot whose trustworthiness is the entire
+    question here. During the outage its `plugged` was the poisoned `true`
+    that held the watch open. An alarm about stale data cannot be gated on
+    the stale data.
+
+    max_age_s belongs to the caller, and it has to sit well clear of an
+    ordinary overnight sleep: carrying a view through the night is precisely
+    what the unbroken watch exists to do, and an alarm that fires every
+    morning is one the owner learns to ignore -- which is how seventeen
+    hours went unnoticed the first time.
+
+    A car never seen at all alarms rather than staying quiet: there is no
+    view to be stale, but there is equally nothing to reason from.
+    """
+    if not running:
+        return False          # collector_running already says this, once
+    if snapshot_age_s is None:
+        return True
+    return snapshot_age_s > max_age_s
 
 
 def should_plug_in(*, plugged: bool, location: str, soc: int | None,

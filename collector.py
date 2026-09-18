@@ -26,6 +26,7 @@ import green
 import home
 import meters
 import solar
+import store
 import tesla
 import vehicle
 from config import settings
@@ -124,13 +125,21 @@ ALREADY_DONE_REASONS = {
 ENGAGED_STATES = {"charging", "grace", "stopped"}
 
 
-async def _command(client: TeslaClient, vin: str, name: str, **params) -> bool:
+async def _command(client: TeslaClient, db, vin: str, name: str,
+                   **params) -> bool:
     """Issue one signed command. Returns True only when the car accepted it.
 
     client.command() returns a (status, body) TUPLE, and the proxy answers 200
     with result:false for a refusal. Treating any non-exception as success
     would let the controller integrate against an amps value the car never
     adopted -- the exact failure invariant 2 of the spec exists to prevent.
+
+    `db` is here so a refusal can be BELIEVED, not merely logged. A command
+    is the one channel the meter-only watch does not suppress, which makes it
+    the only thing that can tell a blind controller its snapshot is wrong --
+    see solar.snapshot_correction and the 44.5 hours of 2026-09-17. It is
+    positional rather than optional on purpose: a call site that forgets it
+    would go back to dropping that evidence silently, which is the bug.
     """
     try:
         status, body = await client.command(vin, name, params)
@@ -160,6 +169,12 @@ async def _command(client: TeslaClient, vin: str, name: str, **params) -> bool:
             _log(f"command {name}: already {reason}; treating as done")
             return True
         _log(f"command {name} refused: {reason}")
+        # The car just contradicted something the stored view claims. Believe
+        # the car: correcting it here is what lets the next tick drop a watch
+        # that is reasoning from a view the car has already denied.
+        correction = solar.snapshot_correction(text)
+        if correction and store.correct_snapshot(db, vin, correction):
+            _log(f"snapshot corrected by refusal: {correction}")
         return False
     return True
 
@@ -184,7 +199,7 @@ async def _restore(client: TeslaClient, db, vin: str, st: dict,
     ok, commanded = True, False
     if st["original_amps"] is not None:
         commanded = True
-        ok &= await _command(client, vin, "set_charging_amps",
+        ok &= await _command(client, db, vin, "set_charging_amps",
                              charging_amps=st["original_amps"])
     if view is None:
         if st["original_limit"] is not None:
@@ -192,7 +207,7 @@ async def _restore(client: TeslaClient, db, vin: str, st: dict,
     elif (st["original_limit"] is not None and st["raised_to"] is not None
           and view.get("limit") == st["raised_to"]):
         commanded = True
-        ok &= await _command(client, vin, "set_charge_limit",
+        ok &= await _command(client, db, vin, "set_charge_limit",
                              percent=st["original_limit"])
     if not ok:
         _log("restore refused; leaving dirty set to retry")
@@ -235,7 +250,7 @@ async def _release(client: TeslaClient, db, vin: str, st: dict,
     if (view is not None and st["original_limit"] is not None
             and st["raised_to"] is not None
             and view.get("limit") == st["raised_to"]):
-        await _command(client, vin, "set_charge_limit",
+        await _command(client, db, vin, "set_charge_limit",
                        percent=st["original_limit"])
     solar.save_state(db, vin, dirty=0, original_amps=None, original_limit=None,
                      raised_to=None, engaged_at=None,
@@ -578,7 +593,7 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
             solar.save_state(db, vin, dirty=1, original_limit=view.get("limit"),
                              engaged_at=int(time.time()))
             st = solar.load_state(db, vin)
-        if await _command(client, vin, "set_charge_limit", percent=target_limit):
+        if await _command(client, db, vin, "set_charge_limit", percent=target_limit):
             raised = target_limit
             _log(f"raised charge limit {view.get('limit')} -> {target_limit} "
                  f"for solar")
@@ -626,7 +641,7 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
                                  original_limit=view.get("limit"),
                                  engaged_at=int(time.time()))
                 st = solar.load_state(db, vin)
-            if not await _command(client, vin, "charge_start"):
+            if not await _command(client, db, vin, "charge_start"):
                 # The car did not start. Most often it was still coming out
                 # of sleep: a command issued seconds behind wake_up comes
                 # back HTTP 500 (observed live 2026-07-28 09:30).
@@ -656,12 +671,12 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
                                  original_amps=view.get("charge_amps"),
                                  engaged_at=int(now_ts))
                 st = solar.load_state(db, vin)
-            if not await _command(client, vin, "charge_start"):
+            if not await _command(client, db, vin, "charge_start"):
                 _log("forced charge_start refused")
                 break
 
         elif action == "force_amps":
-            await _command(client, vin, "set_charging_amps",
+            await _command(client, db, vin, "set_charging_amps",
                            charging_amps=tun.max_a)
 
         elif action == "adopt":
@@ -679,7 +694,7 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
                                  engaged_at=int(time.time()))
                 st = solar.load_state(db, vin)
         elif action == "charge_stop":
-            await _command(client, vin, "charge_stop")
+            await _command(client, db, vin, "charge_stop")
         elif action == "set_amps":
             if machine.state == "grace":
                 target = tun.min_a
@@ -721,7 +736,7 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
             # write, because it is the one permitted ramp violation.
             if target == view.get("charge_amps") and machine.state != "grace":
                 continue
-            if await _command(client, vin, "set_charging_amps",
+            if await _command(client, db, vin, "set_charging_amps",
                               charging_amps=target):
                 written = target
                 # Open a fresh handshake on our own command (see

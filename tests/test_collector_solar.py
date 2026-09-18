@@ -13,6 +13,7 @@ import green
 import home
 import solar
 import tesla
+import store as store_mod
 from store import Store
 
 S = SimpleNamespace(poll_driving=120, poll_charging=300, poll_idle=900,
@@ -57,6 +58,17 @@ def test_should_refresh_view_predicate():
 # _command's truth table -- the invariant the whole controller rests on.
 # --------------------------------------------------------------------------
 
+def _db():
+    """A bare in-memory db for the _command truth table. These cases carry no
+    snapshot, so the refusal-correction path finds nothing to correct and the
+    truth table stays about the truth table."""
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(store_mod.SCHEMA)
+    conn.executescript(solar.SCHEMA)
+    return conn
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status,body,expected", [
     (200, {"response": {"result": True}}, True),
@@ -70,8 +82,8 @@ async def test_command_reports_success_only_on_a_real_ack(status, body, expected
         async def command(self, vin, name, params):
             return status, body
 
-    ok = await collector._command(FakeClient(), "VIN1", "set_charging_amps",
-                                  charging_amps=10)
+    ok = await collector._command(FakeClient(), _db(), "VIN1",
+                                  "set_charging_amps", charging_amps=10)
     assert ok is expected
 
 
@@ -84,8 +96,8 @@ async def test_command_returns_false_on_a_transport_error_rather_than_propagatin
         async def command(self, vin, name, params):
             raise httpx.ConnectError("connection refused")
 
-    ok = await collector._command(FakeClient(), "VIN1", "set_charging_amps",
-                                  charging_amps=10)
+    ok = await collector._command(FakeClient(), _db(), "VIN1",
+                                  "set_charging_amps", charging_amps=10)
     assert ok is False
 
 
@@ -2543,7 +2555,8 @@ async def test_already_charging_is_recognised_through_the_proxys_prose():
                 "result": False,
                 "reason": "car could not execute command: is_charging"}}
 
-    assert await collector._command(_Wrapped(), "VIN1", "charge_start") is True
+    assert await collector._command(_Wrapped(), _db(), "VIN1",
+                                    "charge_start") is True
 
     # And the pairing still holds through the prose: the same wrapped shape
     # from set_charging_amps is a genuine failure, because the write did not
@@ -2555,7 +2568,8 @@ async def test_already_charging_is_recognised_through_the_proxys_prose():
                 "reason": "car could not execute command: is_charging"}}
 
     assert await collector._command(
-        _WrappedAmps(), "VIN1", "set_charging_amps", charging_amps=15) is False
+        _WrappedAmps(), _db(), "VIN1",
+        "set_charging_amps", charging_amps=15) is False
 
 
 class _NightImportClient:
@@ -3195,3 +3209,54 @@ async def test_a_real_outage_breaks_the_watch_rather_than_papering_over_it(
     check.close()
     assert st["asleep_confirmed_ts"] is None, (
         "a hole we cannot vouch across must break the chain, not extend it")
+
+
+@pytest.mark.asyncio
+async def test_a_disconnected_refusal_ends_the_watch_it_was_reasoning_from(tmp_path):
+    """2026-09-17, end to end. Reproduces the live state read off the mini:
+    a snapshot 44.5 hours old that says plugged in and Stopped at 39% against
+    an 80% limit, with an unbroken asleep chain holding knowledge_age_s at
+    zero. That combination satisfies sleeping_candidate, so the meter-only
+    watch makes no vehicle call, so the snapshot can never be replaced -- the
+    deadlock that ran for 122 requests without one look at the car.
+
+    The car denied it nineteen times. One refusal now has to be enough.
+    """
+    store_ = Store(tmp_path / "car.db")
+    db = store_._db
+    vin = "VIN1"
+    now = time.time()
+    stale = {"vin": vin, "soc": 39, "usable_soc": 39, "limit": 80,
+             "charging_state": "Stopped", "charging": False, "plugged_in": True,
+             "charge_power_kw": 0, "range_mi": 135.0, "odometer_mi": 57383.6,
+             "inside_c": 30.0, "outside_c": 27.5, "lat": 40.17, "lon": -105.13,
+             "shift": "P", "sampled_at": int(now - 160438)}
+    store_.record(stale)
+
+    def watching():
+        snap = store_.snapshot(vin)
+        confirmed = solar.asleep_confirmed(
+            now=time.time(), snapshot_ts=snap["ts"],
+            confirmed_ts=time.time() - 300, max_gap_s=660)
+        return solar.sleeping_candidate(
+            snap["view"],
+            solar.knowledge_age_s(time.time(), snap["ts"], confirmed),
+            collector.SNAPSHOT_MAX_AGE_S)
+
+    assert watching(), "precondition: the deadlock as it ran live"
+
+    class RefusingClient:
+        async def command(self, vin, name, params):
+            return 200, {"response": {"result": False,
+                                      "reason": "car could not execute "
+                                                "command: disconnected"}}
+
+    assert not await collector._command(RefusingClient(), db, vin, "charge_start")
+
+    assert not watching(), (
+        "a car that has denied the cable must not keep the watch open")
+    snap = store_.snapshot(vin)
+    assert snap["view"]["plugged_in"] is False
+    assert snap["ts"] == int(now - 160438), (
+        "the view is corrected, not freshened -- snapshot_age_s stays honest")
+    store_.close()

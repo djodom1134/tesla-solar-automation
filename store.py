@@ -80,6 +80,35 @@ def _migrate(db: sqlite3.Connection) -> None:
             db.execute(f"ALTER TABLE samples ADD COLUMN {name} {decl}")
 
 
+def correct_snapshot(db: sqlite3.Connection, vin: str,
+                     fields: dict[str, Any]) -> bool:
+    """Write a known-true correction into the stored view. True if anything
+    actually changed.
+
+    `ts` is deliberately left alone. A correction says the view is less
+    WRONG, not that it is newer, and freshening it here would destroy the
+    only signal that stayed honest through the 2026-09-17 outage --
+    snapshot_age_s, which sat at 160438 s in /api/ha/state while every flag
+    beside it reported a healthy controller. See solar.snapshot_correction
+    for what earns a correction and why.
+
+    Takes the raw connection rather than a Store because its callers are the
+    command helpers, which are handed `db` the same way solar.save_state is.
+    """
+    row = db.execute("SELECT json FROM snapshot WHERE vin = ?", (vin,)).fetchone()
+    if row is None:
+        return False
+    view = json.loads(row["json"])
+    changed = {k: v for k, v in fields.items() if view.get(k) != v}
+    if not changed:
+        return False
+    view.update(changed)
+    db.execute("UPDATE snapshot SET json = ? WHERE vin = ?",
+               (json.dumps(view), vin))
+    db.commit()
+    return True
+
+
 class Store:
     def __init__(self, path: Path):
         self.path = Path(path)
