@@ -7,7 +7,7 @@
 
 import { $, api, COLOR, nfmt, initTheme, showGate as gate } from "./shared.js";
 import {
-  PAD, HEIGHT, el, niceTicks, chartFrame, showTip, hideTip, attachCrosshair, barPath,
+  PAD, HEIGHT, el, niceTicks, chartFrame, showTip, hideTip, attachCrosshair,
   estimateLabelWidth, pickNonOverlappingTicks,
 } from "./chart.js";
 
@@ -249,69 +249,106 @@ async function refresh() {
 
 /* --------------------------------------------------------------- solar */
 
-/* Corner radius for the fill bands -- matches the outline's own rx so a
-   full-height fill (soc near 100%) sits flush inside it. */
-const TANK_R = 6;
+/* The battery, horizontal. The full width is 100%: the sun's share of the
+   charge, then the grid's, then the unfilled track. The sun sits at the left
+   so it is always the first thing read. This is a PROPORTION of the pack,
+   not a physical layer -- electrons mix (the "How these numbers work" note
+   says so).
 
-/* Inline SVG battery, no charting library -- reuses chart.js's own
-   hand-rolled idiom (el()/barPath()), the same one app.js's bar charts use.
-   Fill height is soc%, split into two vertically stacked bands: solarPct
-   (from the sun) and the remainder (from the grid). This is a PROPORTION of
-   the pack, not physical stratification -- electrons mix, and the car has
-   no idea which is which; see the hint text set in loadSolar().
+   Limit markers ride on the bar: the owner's own limit and, when the
+   controller has raised it for the sun, the raised one. A raise that has
+   stuck is then visible at a glance rather than discovered next month. */
+function renderBattery(s) {
+  const bar = $("solar-battery");
+  const marks = $("solar-battery-marks");
+  const legend = $("solar-battery-legend");
+  bar.replaceChildren();
+  marks.replaceChildren();
+  legend.replaceChildren();
 
-   barPath rounds only the edge passed as the "tip" (roundTop), leaving the
-   other edge square (see chart.js) -- so the internal seam between the two
-   bands must never be the one told to round. The solar band is always the
-   tip when present (roundTop=true, radius TANK_R; its bottom, the seam or
-   the baseline if grid is empty, comes out square for free). The grid band
-   is only ever rounded at its own top (roundTop=true, radius TANK_R) when
-   there is no solar band above it to hand the tip off to; otherwise it is
-   drawn with radius 0 -- a plain rect, so its top (an internal seam, not
-   the true baseline) is not rounded either. */
-function renderTank(soc, solarPct) {
-  const host = $("solar-tank");
-  if (!host) return;
+  const soc = s.soc;
+  if (soc == null) {
+    legend.textContent = "Charge unknown — the car has not been read yet.";
+    return;
+  }
+  const clamp = (v) => Math.max(0, Math.min(100, v));
+  const sun = clamp(Math.min(soc, s.banked_pct || 0));
+  const grid = clamp(soc - sun);
+
+  const seg = (cls, pct, title) => {
+    if (!(pct > 0)) return;
+    const d = document.createElement("span");
+    d.className = `seg ${cls}`;
+    d.style.width = `${pct}%`;
+    d.title = title;
+    bar.append(d);
+  };
+  seg("seg-sun", sun, `${nfmt(sun, 1)}% of the charge came from the sun`);
+  seg("seg-grid", grid, `${nfmt(grid, 1)}% of the charge came from the grid`);
+
+  // The owner's limit, and the controller's raise when there is one. The
+  // raise is what makes "why is it charging past 80%?" answer itself.
+  const raised = s.raised_to && s.original_limit && s.raised_to !== s.original_limit;
+  const limits = raised
+    ? [[s.original_limit, "your limit"], [s.raised_to, "raised for sun"]]
+    : (s.limit != null ? [[s.limit, "limit"]] : []);
+  for (const [pct, what] of limits) {
+    const tick = document.createElement("span");
+    tick.className = "sc-limit-tick";
+    tick.style.left = `${clamp(pct)}%`;
+    bar.append(tick);
+    const m = document.createElement("span");
+    m.className = "sc-mark" + (what === "raised for sun" ? " sc-mark-raised" : "")
+      + (pct >= 85 ? " edge-right" : pct <= 15 ? " edge-left" : "");
+    m.style.left = `${clamp(pct)}%`;
+    m.textContent = `${pct}% ${what}`;
+    marks.append(m);
+  }
+
+  const total = document.createElement("strong");
+  total.textContent = `${soc}% charged`;
+  legend.append(total, legendItem("key-solar", `Sun ${nfmt(sun, 0)}%`),
+                legendItem("key-grid", `Grid ${nfmt(grid, 0)}%`));
+}
+
+function legendItem(keyClass, text) {
+  const item = document.createElement("span");
+  item.className = "legend-item";
+  const key = document.createElement("span");
+  key.className = `key ${keyClass}`;
+  key.setAttribute("aria-hidden", "true");
+  item.append(key, document.createTextNode(text));
+  return item;
+}
+
+/* A two-part split bar -- sun, then grid -- with both values labelled
+   beneath its ends, so no number depends on hovering. Used for energy,
+   miles and money alike; each bar is its own 0-100% scale, never compared
+   across. `fmt` renders one value. */
+function renderSplit(host, sun, grid, fmt) {
   host.replaceChildren();
+  const total = (sun || 0) + (grid || 0);
+  if (!(total > 0)) { host.hidden = true; return; }
+  host.hidden = false;
+  const pct = (v) => (100 * v) / total;
 
-  const W = 64, H = 132;
-  const bodyTop = 16, bodyBottom = H - 4, bodyLeft = 6, bodyRight = W - 6;
-  const bodyW = bodyRight - bodyLeft, bodyH = bodyBottom - bodyTop;
-
-  const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "presentation" });
-
-  const socPct = Math.max(0, Math.min(100, soc ?? 0));
-  const solar = Math.max(0, Math.min(socPct, solarPct ?? 0));
-  const grid = socPct - solar;
-  const gridH = (grid / 100) * bodyH;
-  const solarH = (solar / 100) * bodyH;
-
-  if (gridH > 0) {
-    const roundTop = solarH <= 0;   // the tip only when no solar band sits above it
-    svg.append(el("path", {
-      d: barPath(bodyLeft, bodyBottom - gridH, bodyW, gridH, roundTop ? TANK_R : 0, roundTop),
-      class: "tank-fill tank-grid",
-    }));
-  }
-  if (solarH > 0) {
-    svg.append(el("path", {
-      d: barPath(bodyLeft, bodyBottom - gridH - solarH, bodyW, solarH, TANK_R, true),
-      class: "tank-fill tank-solar",
-    }));
+  const bar = document.createElement("div");
+  bar.className = "sc-split-bar";
+  for (const [cls, v, name] of [["seg-sun", sun, "Sun"], ["seg-grid", grid, "Grid"]]) {
+    if (!(v > 0)) continue;
+    const d = document.createElement("span");
+    d.className = `seg ${cls}`;
+    d.style.flexGrow = String(v);
+    d.title = `${name}: ${fmt(v)} (${nfmt(pct(v), 1)}%)`;
+    bar.append(d);
   }
 
-  // Outline (and the nub -- the universal battery cue) drawn last, over the
-  // fill, so the edge reads crisply.
-  svg.append(el("rect", {
-    x: bodyLeft, y: bodyTop, width: bodyW, height: bodyH, rx: TANK_R,
-    class: "tank-outline",
-  }));
-  svg.append(el("rect", {
-    x: W / 2 - 9, y: 3, width: 18, height: bodyTop - 5, rx: 3,
-    class: "tank-outline",
-  }));
-
-  host.append(svg);
+  const labels = document.createElement("div");
+  labels.className = "sc-split-labels";
+  labels.append(
+    legendItem("key-solar", `Sun ${fmt(sun)} · ${nfmt(pct(sun), 0)}%`),
+    legendItem("key-grid", `Grid ${fmt(grid)}`));
+  host.append(bar, labels);
 }
 
 /* ------------------------------------------------- live banked-miles ticker
@@ -385,11 +422,14 @@ async function loadReach() {
     const r = await api("/api/car/solar/landmarks");
     reachPlaces = r.places || [];
     $("solar-reach-head").textContent = r.round_trip
-      ? "Round trips you could make on banked sun:"
-      : "Places within banked range:";
+      ? "Round trips it covers" : "Places within reach";
   } catch (_) {
     reachPlaces = null;
   }
+  // loadSolar runs alongside this and may already have painted, against no
+  // places. While the ticker is moving the next frame repaints anyway; when
+  // it is still (no sun coming in) nothing would until the next poll.
+  if (ticker.shown !== null) reachPaint(ticker.shown);
 }
 
 function reachPaint(miles) {
@@ -401,11 +441,12 @@ function reachPaint(miles) {
   }
   box.hidden = false;
   const list = $("solar-reach-list");
-  // Show what is already reachable plus the next three, so there is always
-  // something visibly approaching rather than a list that only ever grows.
+  // The farthest few already in reach plus the next two, so there is always
+  // something visibly approaching, and the list stays short enough to sit
+  // beside the number it belongs to.
   const lit = reachPlaces.filter((p) => miles >= p.needed);
-  const next = reachPlaces.filter((p) => miles < p.needed).slice(0, 3);
-  const rows = lit.slice(-6).concat(next);
+  const next = reachPlaces.filter((p) => miles < p.needed).slice(0, 2);
+  const rows = lit.slice(-4).concat(next);
   list.innerHTML = "";
   for (const p of rows) {
     const reachable = miles >= p.needed;
@@ -424,56 +465,50 @@ function reachPaint(miles) {
   }
 }
 
-// Money saved against a gasoline car. Sun and grid are separate lines because
-// they are separate claims: the sun's miles cost nothing, the grid's cost
-// electricity, and adding the two would hide which one is doing the work.
-function renderSavings(sv) {
-  const box = $("solar-savings");
-  if (!sv) { box.hidden = true; return; }
-  const usd = (v) => `${v < 0 ? "−" : ""}$${nfmt(Math.abs(v), 2)}`;
-  const today = sv.sun_usd_today ? ` (${usd(sv.sun_usd_today)} today)` : "";
-  $("solar-savings-sun").textContent =
-    `Saved by the sun: ${usd(sv.sun_usd)} of gas not bought${today}.`;
-  $("solar-savings-grid").textContent = sv.grid_usd === null
-    ? `Saved on grid electricity: ${usd(sv.grid_gas_usd)} of gas not bought `
-      + "— set an import rate to net off what the electricity cost."
-    : `Saved on grid electricity: ${usd(sv.grid_usd)} `
-      + `(${usd(sv.grid_gas_usd)} of gas, less ${usd(sv.grid_electric_usd)} of power).`;
-  const week = shortDate(new Date(`${sv.gas_week}T12:00:00`).getTime() / 1000);
-  $("solar-savings-basis").textContent =
-    `Against a ${nfmt(sv.mpg, 0)} mpg car. Regular gas ${usd(sv.gas_usd_per_gal)}/gal `
-    + `(${sv.gas_source}, week of ${week}); each charge priced at its own week's gas.`;
-  box.hidden = false;
-}
+/* Money saved against a gasoline car. Four tiles: the two MEASURED figures
+   (sun, grid electricity -- since tracking began) and the two ESTIMATES
+   (the car's whole life, and a year ahead), marked "est." on their labels.
+   Sun and grid are never added into one measured number: the sun's miles
+   cost nothing, the grid's cost electricity, and a single total would hide
+   which one is doing the work. The estimates do carry a total, with the
+   split drawn beneath it. */
+const usd = (v, d = 2) => `${v < 0 ? "−" : ""}$${nfmt(Math.abs(v), d)}`;
 
-// Lifetime and a year ahead. Estimates, and the basis line says exactly which
-// parts are assumed: the car's age when it came from the VIN, and the sun
-// share measured since tracking began applied to the whole life.
-function renderProjection(p) {
-  const box = $("solar-projection");
-  if (!p) { box.hidden = true; return; }
-  const usd = (v) => `${v < 0 ? "−" : ""}$${nfmt(Math.abs(v), 0)}`;
-  $("solar-projection-life").textContent =
-    `Lifetime saved vs. gas (est.): ${usd(p.lifetime_usd)} — `
-    + `${usd(p.lifetime_sun_usd)} sun, ${usd(p.lifetime_grid_usd)} grid, `
-    + `over ${nfmt(p.odometer_mi, 0)} mi.`;
-  $("solar-projection-year").textContent =
-    `Projected per year: ${usd(p.yearly_usd)} — `
-    + `${usd(p.yearly_sun_usd)} sun, ${usd(p.yearly_grid_usd)} grid, `
-    + `at ${nfmt(p.annual_mi, 0)} mi/yr.`;
-  const start = new Date(p.in_service_ts * 1000);
-  const since = `${SHORT_MONTHS[start.getMonth()]} ${start.getFullYear()}`;
-  const age = p.in_service_basis === "configured" ? `since ${since}`
-    : `since ~${since} (estimated from the VIN's model year)`;
-  const share = p.sun_share_basis === "driven"
-    ? "of miles driven on sun since tracking began"
-    : "of home charging from sun";
-  $("solar-projection-basis").textContent =
-    `${nfmt(p.odometer_mi, 0)} mi over ${nfmt(p.years, 1)} yr ${age}. `
-    + `${nfmt(100 * p.sun_share, 1)}% ${share}, applied to the whole life. `
-    + `Grid miles at $${nfmt(p.electric_usd_per_mi, 3)}/mi at the home rate; `
-    + "Supercharging costs more, so the grid figure is an upper bound.";
+function renderMoney(sv, p, since) {
+  const box = $("solar-money");
+  if (!sv && !p) { box.hidden = true; return; }
   box.hidden = false;
+  const mpg = sv ? sv.mpg : 20;       // the projection is always at the same mpg
+  $("solar-money-head").textContent = `Saved vs. a ${nfmt(mpg, 0)} mpg gas car`;
+
+  if (sv) {
+    $("money-sun").textContent = usd(sv.sun_usd);
+    $("money-sun-sub").textContent =
+      (sv.sun_usd_today ? `${usd(sv.sun_usd_today)} today · ` : "") + `since ${since}`;
+    if (sv.grid_usd === null) {
+      $("money-grid").textContent = usd(sv.grid_gas_usd);
+      $("money-grid-sub").textContent = "gas only — set an import rate to net off power";
+    } else {
+      $("money-grid").textContent = usd(sv.grid_usd);
+      $("money-grid-sub").textContent =
+        `${usd(sv.grid_gas_usd)} gas − ${usd(sv.grid_electric_usd)} power`;
+    }
+  }
+
+  const life = $("money-life-tile"), year = $("money-year-tile");
+  life.hidden = year.hidden = !p;
+  if (p) {
+    const whole = (v) => usd(v, 0);
+    $("money-life").textContent = whole(p.lifetime_usd);
+    renderSplit($("money-life-split"), p.lifetime_sun_usd, p.lifetime_grid_usd, whole);
+    const start = new Date(p.in_service_ts * 1000);
+    const month = `${SHORT_MONTHS[start.getMonth()]} ${start.getFullYear()}`;
+    $("money-life-sub").textContent =
+      `${nfmt(p.odometer_mi, 0)} mi since ${p.in_service_basis === "configured" ? "" : "~"}${month}`;
+    $("money-year").textContent = whole(p.yearly_usd);
+    renderSplit($("money-year-split"), p.yearly_sun_usd, p.yearly_grid_usd, whole);
+    $("money-year-sub").textContent = `at ${nfmt(p.annual_mi, 0)} mi a year`;
+  }
 }
 
 async function loadSolar() {
@@ -485,20 +520,6 @@ async function loadSolar() {
   }
   const card = $("solar-card");
   card.hidden = false;
-
-  // The tank -- what the eye lands on first (Task 20). solar_soc (banked_pct)
-  // is always <= soc by the ledger's own invariant (green.ledger_step), so
-  // the grid share is simply the remainder; no new backend field needed.
-  const soc = s.soc;
-  const solarPct = s.banked_pct;
-  renderTank(soc, solarPct);
-  $("solar-tank-label").textContent = soc == null
-    ? "Charge unknown"
-    : `${soc}% charged — ${nfmt(solarPct, 0)}% from sun, `
-      + `${nfmt(Math.max(0, soc - solarPct), 0)}% from grid.`;
-  $("solar-tank-hint").textContent =
-    "The sun/grid split above is a proportion of the pack, not a physical "
-    + "layer — electrons mix, and the car has no idea which is which.";
 
   // WHO is driving, as its own pill. The mode and the machine's state are
   // different questions, and the state alone cannot answer the first: it
@@ -525,6 +546,24 @@ async function loadSolar() {
   $("solar-state").textContent = label;
   $("solar-state").className = "pill state-" + label;
 
+  // --- 1. Now: one sentence, in words, of what the car is doing.
+  const spare = s.surplus_w == null ? null : `${nfmt(s.surplus_w / 1000, 2)} kW`;
+  const amps = s.amps == null ? null : `${s.amps} A`;
+  let now;
+  if (mode === "manual") now = "You set the charge rate — solar control is paused.";
+  else if (mode === "now") now = "Charging at full rate until midnight, sun or not.";
+  else if (mode === "off") now = "Solar charging is switched off.";
+  else if (s.state === "charging") {
+    now = `Charging from the sun${amps ? ` at ${amps}` : ""}`
+        + (spare ? ` — ${spare} of spare sun.` : ".");
+  } else if (s.state === "grace") {
+    now = `Riding out a cloud at the minimum rate${amps ? ` (${amps})` : ""}.`;
+  } else {
+    now = "Waiting for spare sun"
+        + (s.surplus_w > 0 ? ` — ${spare} spare now.` : ".");
+  }
+  $("solar-now").textContent = now;
+
   // The pause says what happened and offers the way out. Both halves matter:
   // "manual" alone leaves the owner to guess what they did and how to undo
   // it, which is how a safety feature turns into a mystery.
@@ -541,113 +580,6 @@ async function loadSolar() {
       `You set ${rate}${when ? " at " + when : ""}. Solar control is paused `
       + "until charging is stopped and started again, or you resume it here.";
   }
-  $("solar-surplus").textContent =
-    s.surplus_w === null ? "—" : (s.surplus_w / 1000).toFixed(2) + " kW surplus";
-  $("solar-amps").textContent = s.amps === null ? "" : s.amps + " A";
-
-  // Show the raised limit NEXT TO the original, so a stuck raise is visible
-  // rather than something you discover next month.
-  const note = $("solar-limit-note");
-  if (s.raised_to && s.original_limit && s.raised_to !== s.original_limit) {
-    note.textContent = `Charge limit raised to ${s.raised_to}% for solar `
-                     + `(your setting: ${s.original_limit}%)`;
-    note.hidden = false;
-  } else {
-    note.hidden = true;
-  }
-
-  $("solar-grace").textContent =
-    `Imported while riding out clouds: ${s.grace_import_wh_today} Wh today, `
-    + `${s.grace_import_wh_total} Wh total`;
-
-  // Honesty is the feature here, not a caveat on it: when either input is
-  // still unproven, say exactly what's missing rather than blanking the
-  // line or showing a confident wrong number (spec 7.4).
-  if (s.free_miles === null) {
-    const missing = [];
-    if (s.miles_sampled < 50) missing.push(`50 miles of driving (have ${s.miles_sampled})`);
-    if (s.pack_sessions < 2) missing.push(`2 charge sessions (have ${s.pack_sessions})`);
-    $("solar-free-miles").textContent = missing.length
-      ? `Free miles: collecting — need ${missing.join(" and ")}.`
-      : "Free miles: collecting more data.";
-  } else {
-    $("solar-free-miles").textContent =
-      `Free miles today: ${s.free_miles} (${s.solar_kwh_today} kWh from the sun `
-      + `at ${s.mi_per_kwh} measured mi/kWh)`;
-  }
-
-  // Banked solar is the STOCK question ("how far on sun already in the
-  // pack"), separate from free_miles above (today's FLOW). Two figures
-  // exist -- the car's own rated range (available immediately) and the
-  // owner's measured consumption (needs Task 16's thresholds) -- shown one
-  // at a time, always labelled which, never averaged (spec 7.4). Promoted to
-  // a headline beside the tank (Task 20); the basis label survives the
-  // promotion unchanged, since it is the difference between a number the
-  // owner can trust and one they cannot.
-  const lower = s.ledger_stale
-    ? " (lower bound -- a sample gap means the pack may have changed unobserved)"
-    : "";
-  if (s.banked_miles === null) {
-    $("solar-banked").textContent = `Banked solar: ${s.banked_pct}% of charge${lower}.`;
-  } else {
-    const basis = s.banked_miles_basis === "measured"
-      ? "measured mi/kWh" : "the car's rated range";
-    // The number lives in its own span so the ticker can rewrite it 60x a
-    // second without touching the sentence around it.
-    $("solar-banked").innerHTML = "";
-    $("solar-banked").append(
-      document.createTextNode(`Banked solar: ${s.banked_pct}% of charge = `));
-    const live = document.createElement("span");
-    live.id = "solar-banked-live";
-    live.className = "live-miles";
-    live.textContent = Number(s.banked_miles).toFixed(3);
-    $("solar-banked").append(live);
-    $("solar-banked").append(
-      document.createTextNode(` free miles (${basis})${lower}.`));
-    tickerSync(Number(s.banked_miles),
-               ENGAGED.has(s.state) ? (s.accrual_mi_per_s || 0) : 0);
-  }
-
-  // Lifetime free miles driven (Task 20) -- the ledger's own running total
-  // (green.free_miles_step), never reset, promoted to its own headline
-  // line rather than a hint. tracked_miles === 0 means the ledger has not
-  // observed a single window yet (fresh install, or the tick right after
-  // deployment recorded its odometer baseline and nothing more) -- say so
-  // rather than showing a misleading "0 of 0 miles (0%)".
-  if (s.tracked_miles === 0 || s.free_miles_since == null) {
-    $("solar-lifetime-free").textContent = "Driven free: no miles tracked yet.";
-  } else {
-    const since = shortDate(s.free_miles_since);
-    $("solar-lifetime-free").textContent =
-      `Driven free: ${nfmt(s.free_miles_driven, 1)} of ${nfmt(s.tracked_miles, 1)} miles `
-      + `(${nfmt(s.free_miles_share, 1)}%) since ${since}.`;
-  }
-
-  // Lifetime energy INTO the car, split by where it actually came from.
-  // Shown as a pair on purpose: the solar figure alone is the flattering
-  // half, and a controller that holds the floor through clouds imports a
-  // little deliberately. Naming that is what makes the solar number
-  // believable.
-  // Reported in kWh, which is measured. Miles are added only once mi/kWh has
-  // been measured too -- NOT from the rated/nominal-pack estimate. Banked
-  // miles above come from the car's own rated range and need no pack size at
-  // all, so a miles figure here resting on an assumed pack disagreed with it
-  // by whatever that assumption was wrong by, and the card contradicted
-  // itself. kWh cannot contradict anything.
-  const split = $("solar-charged-split");
-  if (!s.charged_solar_kwh && !s.charged_grid_kwh) {
-    split.textContent = "Charged so far: nothing recorded yet.";
-  } else {
-    const miles = s.charged_solar_miles === null ? ""
-      : ` — ${nfmt(s.charged_solar_miles, 1)} free miles put in`;
-    split.textContent =
-      `Charged so far: ${nfmt(s.charged_solar_kwh, 2)} kWh from sun, `
-      + `${nfmt(s.charged_grid_kwh, 2)} kWh from grid `
-      + `(${nfmt(s.charged_solar_share, 0)}% solar)${miles}.`;
-  }
-
-  renderSavings(s.savings);
-  renderProjection(s.projection);
 
   const warn = $("solar-warn");
   if (s.capped) {
@@ -669,6 +601,119 @@ async function loadSolar() {
   } else {
     warn.hidden = true;
   }
+
+  renderBattery(s);
+
+  // --- 2. Sun in the battery. The STOCK ("how far on sun already in the
+  // pack"), the one hero number. Two figures exist -- the car's own rated
+  // range and the owner's measured consumption -- shown one at a time,
+  // always labelled which, never averaged (spec 7.4).
+  const lower = s.ledger_stale ? " · lower bound (a sample gap)" : "";
+  if (s.banked_miles === null) {
+    $("solar-banked-live").textContent = "—";
+    $("solar-banked-sub").textContent = `${nfmt(s.banked_pct, 2)}% of the charge${lower}`;
+    tickerStop();
+  } else {
+    const basis = s.banked_miles_basis === "measured"
+      ? "at measured mi/kWh" : "at the car's rated range";
+    $("solar-banked-sub").textContent =
+      `${nfmt(s.banked_pct, 2)}% of the charge, ${basis}${lower}`;
+    tickerSync(Number(s.banked_miles),
+               ENGAGED.has(s.state) ? (s.accrual_mi_per_s || 0) : 0);
+  }
+
+  // --- 3. Money.
+  const since = s.free_miles_since == null ? "tracking began" : shortDate(s.free_miles_since);
+  renderMoney(s.savings, s.projection, since);
+
+  // --- 4. Where the energy came from. Energy charged at home is kWh, which
+  // is measured; miles driven counts every mile, Supercharged ones included.
+  // Two separate bars on their own scales, never read against each other.
+  $("solar-mix-head").textContent = s.free_miles_since == null
+    ? "Where the energy came from"
+    : `Where the energy came from · since ${since}`;
+  const kwh = (v) => `${nfmt(v, 1)} kWh`;
+  renderSplit($("mix-charged"), s.charged_solar_kwh, s.charged_grid_kwh, kwh);
+  $("mix-charged-sub").textContent = !s.charged_solar_kwh && !s.charged_grid_kwh
+    ? "Nothing recorded yet."
+    : (s.charged_solar_miles == null ? ""
+       : `${nfmt(s.charged_solar_miles, 1)} free miles put in`);
+  const mi = (v) => `${nfmt(v, 0)} mi`;
+  if (s.tracked_miles > 0) {
+    renderSplit($("mix-driven"), s.free_miles_driven,
+                Math.max(0, s.tracked_miles - s.free_miles_driven), mi);
+    $("mix-driven-sub").textContent =
+      `${nfmt(s.free_miles_driven, 1)} of ${nfmt(s.tracked_miles, 1)} miles driven on sun`;
+  } else {
+    renderSplit($("mix-driven"), 0, 0, mi);
+    $("mix-driven-sub").textContent = "No miles tracked yet.";
+  }
+
+  // Honesty is the feature here, not a caveat on it: when either input is
+  // still unproven, say exactly what's missing rather than blanking the
+  // line or showing a confident wrong number (spec 7.4).
+  let today;
+  if (s.free_miles === null) {
+    const missing = [];
+    if (s.miles_sampled < 50) missing.push(`50 miles of driving (have ${s.miles_sampled})`);
+    if (s.pack_sessions < 2) missing.push(`2 charge sessions (have ${s.pack_sessions})`);
+    today = missing.length
+      ? `Today: free miles still calibrating — need ${missing.join(" and ")}.`
+      : "Today: free miles still calibrating.";
+  } else {
+    today = `Today: ${s.free_miles} free miles from ${s.solar_kwh_today} kWh of sun`;
+  }
+  $("solar-today").textContent =
+    `${today} · ${nfmt(s.grace_import_wh_today, 0)} Wh bought riding out clouds.`;
+
+  // --- 5. The fine print.
+  renderNotes(s);
+}
+
+/* Everything that qualifies a number, in one place, so none of it has to
+   interrupt the numbers themselves. */
+function renderNotes(s) {
+  const notes = [
+    "The sun/grid split of the battery is a proportion of the charge, not a "
+    + "physical layer — electrons mix, and the car has no idea which is which.",
+  ];
+  if (s.mi_per_kwh) {
+    notes.push(`Miles are converted at ${s.mi_per_kwh} mi/kWh, measured from `
+      + `${nfmt(s.miles_sampled, 0)} miles of this car's own driving.`);
+  }
+  const sv = s.savings;
+  if (sv) {
+    const week = shortDate(new Date(`${sv.gas_week}T12:00:00`).getTime() / 1000);
+    notes.push(`Gas is regular at ${usd(sv.gas_usd_per_gal)}/gal this week `
+      + `(${sv.gas_source}, week of ${week}), refreshed daily. Each charge is `
+      + `priced at its own week's gas, against a ${nfmt(sv.mpg, 0)} mpg car. `
+      + "The sun is counted as free.");
+    if (sv.import_rate != null) {
+      notes.push(`Grid electricity is costed at your import rate, `
+        + `$${nfmt(sv.import_rate, 4)}/kWh.`);
+    }
+  }
+  const p = s.projection;
+  if (p) {
+    const start = new Date(p.in_service_ts * 1000);
+    const month = `${SHORT_MONTHS[start.getMonth()]} ${start.getFullYear()}`;
+    notes.push(`The lifetime and yearly figures are estimates: `
+      + `${nfmt(p.odometer_mi, 0)} mi over ${nfmt(p.years, 1)} years since ${month}`
+      + (p.in_service_basis === "configured" ? "" : " (estimated from the VIN's model year)")
+      + `, with the ${nfmt(100 * p.sun_share, 1)}% of miles driven on sun since tracking `
+      + "began applied to the whole life. Grid miles cost "
+      + `$${nfmt(p.electric_usd_per_mi, 3)}/mi at the home rate; Supercharging `
+      + "costs more, so the grid saving is an upper bound.");
+  }
+  notes.push(`While riding out clouds the controller holds the minimum rate and `
+    + `buys a little power on purpose: ${nfmt(s.grace_import_wh_total / 1000, 1)} kWh `
+    + "in total so far.");
+  const list = $("solar-notes");
+  list.replaceChildren(...notes.map((t) => {
+    const li = document.createElement("li");
+    li.textContent = t;
+    return li;
+  }));
 }
 
 /* --------------------------------------------------------------- garage */

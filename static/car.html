@@ -77,60 +77,102 @@
   </section>
 
   <section class="card" id="solar-card" hidden>
-    <h2>Solar charging</h2>
-
-    <!-- The tank is what the eye lands on first: a vertical fill split into
-         the solar and grid share of the CURRENT charge, with the banked-
-         miles figure and the lifetime free-miles figure promoted beside it
-         as headlines rather than buried as footnote hints (Task 20). -->
-    <div class="tank-row">
-      <div id="solar-tank" class="tank" role="img" aria-label="Charge, split by source"></div>
-      <div class="tank-facts">
-        <p id="solar-tank-label" class="tank-headline">—</p>
-        <p id="solar-banked" class="big"></p>
-        <p id="solar-lifetime-free" class="tank-sub"></p>
+    <!-- Five sections, each answering one question, top to bottom:
+         what is happening now, how much sun is in the battery, what it has
+         saved, where the energy came from, and how the numbers are made.
+         The fine print lives in the last one so it stops interrupting the
+         first four. -->
+    <div class="sc-head">
+      <h2>Solar charging</h2>
+      <!-- Two pills, not one. The mode is WHO is driving the car; the state
+           is where the solar machine itself has got to. -->
+      <div class="sc-pills">
+        <span id="solar-mode" class="pill" title="Which mode charging is in">solar</span>
+        <span id="solar-state" class="pill">idle</span>
       </div>
     </div>
-    <p id="solar-tank-hint" class="hint"></p>
 
-    <!-- Two pills, not one. The mode is WHO is driving the car; the state is
-         where the solar machine itself has got to. One pill showing
-         `enabled ? state : "off"` conflated them, and could not say the one
-         thing that matters after an override: that the controller is
-         standing aside on purpose. -->
-    <div class="solar-head">
-      <span id="solar-mode" class="pill" title="Which mode charging is in">solar</span>
-      <span id="solar-state" class="pill">idle</span>
-      <span id="solar-surplus" class="big">—</span>
-      <span id="solar-amps" class="muted">—</span>
-    </div>
+    <!-- 1. Now -->
+    <p id="solar-now" class="sc-now">—</p>
     <div id="solar-override" class="override" hidden>
       <p id="solar-override-note"></p>
       <button id="solar-resume" class="btn" type="button">Resume solar control</button>
     </div>
-    <p id="solar-limit-note" class="hint" hidden></p>
-    <p id="solar-grace" class="hint"></p>
-    <p id="solar-free-miles" class="hint"></p>
-    <p id="solar-charged-split" class="tank-sub"></p>
-    <!-- Saved against a gasoline car, sun and grid on separate lines: the
-         sun figure alone is the flattering half. -->
-    <div id="solar-savings" hidden>
-      <p id="solar-savings-sun" class="tank-sub"></p>
-      <p id="solar-savings-grid" class="tank-sub"></p>
-      <p id="solar-savings-basis" class="hint"></p>
-    </div>
-    <!-- The whole car's life and the year ahead: an ESTIMATE, labelled one,
-         kept apart from the measured figures above. -->
-    <div id="solar-projection" hidden>
-      <p id="solar-projection-life" class="tank-sub"></p>
-      <p id="solar-projection-year" class="tank-sub"></p>
-      <p id="solar-projection-basis" class="hint"></p>
-    </div>
-    <div id="solar-reach" hidden>
-      <p id="solar-reach-head" class="tank-sub"></p>
-      <ul id="solar-reach-list" class="reach"></ul>
-    </div>
     <p id="solar-warn" class="warn" hidden></p>
+
+    <!-- The battery, horizontal: the charge split by source, the unfilled
+         track, and the two limits that matter -- the owner's and the one the
+         controller raised it to for the sun. -->
+    <figure class="sc-battery">
+      <div id="solar-battery" class="sc-battery-bar" role="img"
+           aria-label="Battery charge, split by source"></div>
+      <div id="solar-battery-marks" class="sc-marks"></div>
+      <figcaption id="solar-battery-legend" class="legend"></figcaption>
+    </figure>
+
+    <!-- 2. Sun in the battery: the one hero number on the card. -->
+    <div class="sc-section sc-bank">
+      <div>
+        <p class="tile-label"><span class="key key-solar" aria-hidden="true"></span>Sun in the battery</p>
+        <p class="hero-figure"><span id="solar-banked-live" class="live-miles">—</span><span class="hero-unit">free miles</span></p>
+        <p id="solar-banked-sub" class="sc-sub"></p>
+      </div>
+      <div id="solar-reach" hidden>
+        <p id="solar-reach-head" class="tile-label"></p>
+        <ul id="solar-reach-list" class="reach"></ul>
+      </div>
+    </div>
+
+    <!-- 3. Money. Measured first, estimates after, never blended. -->
+    <div id="solar-money" class="sc-section" hidden>
+      <h3 id="solar-money-head" class="sc-h3">Saved vs. a gas car</h3>
+      <div class="kpis sc-kpis">
+        <div class="stat">
+          <span class="tile-label"><span class="key key-solar" aria-hidden="true"></span>Sun</span>
+          <span id="money-sun" class="tile-value">—</span>
+          <span id="money-sun-sub" class="sc-sub"></span>
+        </div>
+        <div class="stat">
+          <span class="tile-label"><span class="key key-grid" aria-hidden="true"></span>Grid electricity</span>
+          <span id="money-grid" class="tile-value">—</span>
+          <span id="money-grid-sub" class="sc-sub"></span>
+        </div>
+        <div class="stat" id="money-life-tile" hidden>
+          <span class="tile-label">Whole car, lifetime <em class="sc-est">est.</em></span>
+          <span id="money-life" class="tile-value">—</span>
+          <div id="money-life-split" class="sc-split sc-split-thin"></div>
+          <span id="money-life-sub" class="sc-sub"></span>
+        </div>
+        <div class="stat" id="money-year-tile" hidden>
+          <span class="tile-label">Per year ahead <em class="sc-est">est.</em></span>
+          <span id="money-year" class="tile-value">—</span>
+          <div id="money-year-split" class="sc-split sc-split-thin"></div>
+          <span id="money-year-sub" class="sc-sub"></span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 4. Where the energy came from -->
+    <div class="sc-section">
+      <h3 id="solar-mix-head" class="sc-h3">Where the energy came from</h3>
+      <div class="sc-mix">
+        <p class="tile-label">Charged at home</p>
+        <div id="mix-charged" class="sc-split"></div>
+        <p id="mix-charged-sub" class="sc-sub"></p>
+      </div>
+      <div class="sc-mix">
+        <p class="tile-label">Miles driven</p>
+        <div id="mix-driven" class="sc-split"></div>
+        <p id="mix-driven-sub" class="sc-sub"></p>
+      </div>
+      <p id="solar-today" class="sc-sub sc-today"></p>
+    </div>
+
+    <!-- 5. The fine print, out of the way until asked for. -->
+    <details class="sc-notes">
+      <summary>How these numbers work</summary>
+      <ul id="solar-notes"></ul>
+    </details>
   </section>
 
   <section class="card" id="garage-card" hidden>

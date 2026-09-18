@@ -23,6 +23,13 @@
   --export:       #2a78d6;
   --home:         #4a3aa7;
   --good:         #0ca30c;
+  /* Grid ENERGY beside solar in the car card: the de-emphasis half of an
+     emphasis pair (sun is the point, grid is context). Its own token because
+     no existing gray works in both modes -- --ink-2 outshouts the amber in
+     dark mode and --muted sits too close to it in lightness. Validated
+     against --solar: light ΔE 17.2, dark ΔE 22.1; both under 3:1 on the
+     surface, so every segment carries a visible label. */
+  --grid-energy:  #9a988f;
 
   --radius: 14px;
   --font: system-ui, -apple-system, "Segoe UI", sans-serif;
@@ -45,6 +52,7 @@
     --import:   #e66767;
     --export:   #3987e5;
     --home:     #9085e9;
+    --grid-energy: #63625d;
   }
 }
 
@@ -54,11 +62,13 @@
   --grid: #e1e0d9; --baseline: #c3c2b7; --border: rgba(11,11,11,.10);
   --shadow: 0 1px 2px rgba(11,11,11,.04), 0 4px 16px rgba(11,11,11,.04);
   --solar: #eda100; --battery: #1baf7a; --import: #e34948; --export: #2a78d6; --home: #4a3aa7;
+  --grid-energy: #9a988f;
 }
 :root[data-theme="dark"] {
   --surface: #1a1a19; --plane: #0d0d0d; --ink: #ffffff; --ink-2: #c3c2b7;
   --grid: #2c2c2a; --baseline: #383835; --border: rgba(255,255,255,.10); --shadow: none;
   --solar: #c98500; --battery: #199e70; --import: #e66767; --export: #3987e5; --home: #9085e9;
+  --grid-energy: #63625d;
 }
 
 * { box-sizing: border-box; }
@@ -151,6 +161,7 @@ main { max-width: 1200px; margin: 0 auto; padding: 2rem 1.5rem 4rem; }
 .key-export  { background: var(--export); }
 .key-home    { background: var(--home); }
 .key-idle    { background: var(--muted); }
+.key-grid    { background: var(--grid-energy); }
 
 /* ---------- filters ---------- */
 
@@ -393,28 +404,80 @@ th .key { vertical-align: middle; margin-right: .35rem; }
 #solar-card .warn, #garage-card .warn { color: var(--bad, #ef4444); }
 #solar-card .hint, #garage-card .hint { color: var(--muted, #888); font-size: .85rem; margin: .35rem 0 .6rem; }
 
-/* ---- solar tank (Task 20) --------------------------------------------
-   Vertical battery fill, split into the solar and grid share of the
-   CURRENT charge -- placed first in the card, where the eye lands, with
-   the banked-miles and lifetime-free-miles figures promoted beside it as
-   headlines rather than the grey hint text they shipped as. */
-#solar-card .tank-row { display: flex; align-items: center; gap: 1.25rem; margin-bottom: .4rem; }
-#solar-card .tank { width: 4.25rem; flex: none; }
-#solar-card .tank svg { width: 100%; height: auto; display: block; }
-/* Neutral chrome -- same gray the ring/gridlines use, not either energy hue. */
-#solar-card .tank-outline { fill: none; stroke: var(--grid); stroke-width: 2; }
-#solar-card .tank-fill.tank-solar { fill: var(--solar); }
-/* Grid energy is ordinary, not an error state -- --import is reserved for
-   alarm/danger UI (.toast.bad, .btn.danger) elsewhere in this file. A big
-   red fill with no legend beside it reads as "something is wrong" even
-   when the battery is healthy. --ink-2 stays legible as a solid fill in
-   both themes (--baseline nearly disappears against --surface in dark
-   mode, since --baseline #383835 sits right next to --surface #1a1a19). */
-#solar-card .tank-fill.tank-grid  { fill: var(--ink-2); }
-#solar-card .tank-facts { flex: 1 1 auto; min-width: 0; }
-#solar-card .tank-headline { font-size: 1.05rem; font-weight: 600; margin: 0 0 .2rem; }
-#solar-card .tank-facts .big { margin: 0 0 .15rem; }
-#solar-card .tank-sub { font-size: .95rem; font-weight: 600; color: var(--ink-2); margin: .2rem 0 0; }
+/* ---- solar card ------------------------------------------------------
+   Five sections, one question each: now, sun in the battery, money saved,
+   where the energy came from, how the numbers are made. Sun is the accent
+   (--solar); grid is its de-emphasis partner (--grid-energy), never --import,
+   which is reserved for alarm. Every bar is direct-labelled. */
+#solar-card .sc-head { display: flex; align-items: center; justify-content: space-between; gap: 1rem; flex-wrap: wrap; }
+#solar-card .sc-head h2 { margin: 0; }
+#solar-card .sc-pills { display: flex; gap: .4rem; }
+#solar-card .sc-now { font-size: 1.25rem; font-weight: 600; margin: 1rem 0 .9rem; line-height: 1.3; }
+#solar-card .sc-sub { font-size: .8125rem; color: var(--muted); margin: 0; }
+#solar-card .sc-h3 { font-size: .95rem; font-weight: 600; margin: 0 0 .85rem; }
+#solar-card .sc-section { margin-top: 1.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); }
+
+/* The battery: 100% wide; sun, then grid, then the unfilled track. */
+#solar-card .sc-battery { margin: 0; }
+#solar-card .sc-battery-bar {
+  position: relative; display: flex; height: 20px; border-radius: 6px;
+  background: var(--grid); overflow: hidden;
+}
+#solar-card .sc-battery-bar .seg { height: 100%; flex: none; }
+/* The 2px surface gap between the two fills. */
+#solar-card .sc-battery-bar .seg-sun + .seg-grid { border-left: 2px solid var(--surface); }
+#solar-card .sc-limit-tick {
+  position: absolute; top: 0; bottom: 0; width: 2px; margin-left: -1px;
+  background: var(--ink);
+}
+#solar-card .sc-marks { position: relative; min-height: 1.4rem; font-size: .75rem; color: var(--muted); }
+#solar-card .sc-marks:has(.sc-mark-raised) { min-height: 2.6rem; }
+#solar-card .sc-mark { position: absolute; top: .3rem; transform: translateX(-50%); white-space: nowrap; }
+#solar-card .sc-mark-raised { top: 1.45rem; color: var(--ink-2); }
+/* Near either end a centred label would hang off the card; pin it inward. */
+#solar-card .sc-mark.edge-right { transform: translateX(-100%); }
+#solar-card .sc-mark.edge-left  { transform: none; }
+#solar-card .sc-battery .legend { margin-top: .35rem; align-items: center; font-size: .875rem; }
+#solar-card .sc-battery .legend strong { font-weight: 600; }
+
+/* Sun in the battery: the hero number, with the places it reaches beside it. */
+#solar-card .sc-bank { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 1.5rem 2.5rem; align-items: start; }
+#solar-card .sc-bank .hero-figure { margin: .4rem 0 .35rem; }
+@media (max-width: 640px) {
+  #solar-card .sc-bank { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* Money tiles reuse the KPI row; "est." marks the two estimates. */
+#solar-card .sc-kpis { margin-bottom: 0; }
+#solar-card .sc-est {
+  font-style: normal; font-size: .6875rem; font-weight: 600; letter-spacing: .03em;
+  text-transform: uppercase; color: var(--muted);
+  border: 1px solid var(--border); border-radius: 4px; padding: 0 .3rem;
+}
+
+/* Split bars: sun then grid, a 2px surface gap, rounded outer ends only. */
+#solar-card .sc-split { margin: .35rem 0 .3rem; }
+#solar-card .sc-split-bar { display: flex; gap: 2px; height: 10px; }
+#solar-card .sc-split-thin .sc-split-bar { height: 6px; }
+#solar-card .sc-split-bar .seg { flex: 1 1 0; min-width: 3px; }
+#solar-card .sc-split-bar .seg:first-child { border-radius: 4px 0 0 4px; }
+#solar-card .sc-split-bar .seg:last-child  { border-radius: 0 4px 4px 0; }
+#solar-card .sc-split-bar .seg:only-child  { border-radius: 4px; }
+#solar-card .sc-split-labels {
+  display: flex; justify-content: space-between; flex-wrap: wrap; gap: .25rem .75rem;
+  margin-top: .35rem;
+}
+#solar-card .sc-split-labels .legend-item { font-size: .8125rem; }
+#solar-card .seg-sun  { background: var(--solar); }
+#solar-card .seg-grid { background: var(--grid-energy); }
+#solar-card .sc-mix { max-width: 40rem; margin-bottom: 1.1rem; }
+#solar-card .sc-mix .tile-label { margin: 0; }
+#solar-card .sc-today { margin-top: .25rem; }
+
+#solar-card .sc-notes { margin-top: 1.5rem; }
+#solar-card .sc-notes summary { cursor: pointer; color: var(--muted); font-size: .875rem; }
+#solar-card .sc-notes ul { margin: .6rem 0 0; padding-left: 1.1rem; font-size: .8125rem; color: var(--ink-2); line-height: 1.5; max-width: 48rem; }
+#solar-card .sc-notes li { margin: .3rem 0; }
 #garage-card .row { display: flex; align-items: center; gap: .6rem; margin: .5rem 0; }
 
 /* Live banked-miles ticker and the places it unlocks. The number is
