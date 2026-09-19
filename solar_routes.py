@@ -518,7 +518,7 @@ async def get_solar_status() -> dict[str, Any]:
     snap = store().snapshot(vin) if vin else None
     view = (snap or {}).get("view") or {}
     last = db.execute(
-        "SELECT ts, surplus_w, amps_written, amps_before, car_w, grid_w"
+        "SELECT ts, surplus_w, amps_written, amps_before, car_w, grid_w, solar_w"
         " FROM solar_ticks"
         " WHERE vin = ? ORDER BY ts DESC LIMIT 1", (vin,)).fetchone() if vin else None
 
@@ -583,6 +583,22 @@ async def get_solar_status() -> dict[str, Any]:
         # pack may have changed unobserved.
         "ledger_stale": bool(state["ledger_stale"]),
         **green_status,
+        # WHY it is not charging, in the site's own numbers. "Waiting for
+        # spare sun" alone cannot tell a house eating 11.5 kW (2026-09-19
+        # 14:34, the oven and the car plugged in at the same minute) from a
+        # controller that has stopped working, and the owner had no way to
+        # tell either. house_w is the site's own identity, grid = house + car
+        # - solar, rearranged; it is what the meter says, not a new reading.
+        "solar_w": last["solar_w"] if last else None,
+        "grid_w": last["grid_w"] if last else None,
+        "house_w": (
+            (last["solar_w"] or 0) + (last["grid_w"] or 0) - (last["car_w"] or 0)
+            if last and last["solar_w"] is not None and last["grid_w"] is not None
+            else None),
+        # The surplus a charge needs before it can start, so the card can say
+        # how far off it is rather than just that it is waiting.
+        "start_w": solar.start_watts(solar.tunables_from(
+            conf, view.get("amps_max"), view.get("volts"))),
         "sun_wasted": solar.sun_wasted(
             enabled=bool(conf["enabled"]),
             plugged=view.get("charging_state") not in (None, "Disconnected"),

@@ -558,9 +558,18 @@ async function loadSolar() {
         + (spare ? ` — ${spare} of spare sun.` : ".");
   } else if (s.state === "grace") {
     now = `Riding out a cloud at the minimum rate${amps ? ` (${amps})` : ""}.`;
+  } else if (s.surplus_w > 0 && s.start_w && s.surplus_w < s.start_w) {
+    // Exporting, but not enough to run the car's slowest charge.
+    now = `Waiting for more sun — ${spare} spare, `
+        + `${nfmt(s.start_w / 1000, 2)} kW needed to start.`;
+  } else if (s.surplus_w > 0) {
+    now = `Waiting to start — ${spare} of spare sun.`;
+  } else if (s.house_w != null && s.solar_w != null) {
+    // The 2026-09-19 case: plenty of sun, and the house drinking all of it.
+    now = `Waiting for spare sun — ${nfmt(s.solar_w / 1000, 1)} kW from the `
+        + `roof, the house is using ${nfmt(s.house_w / 1000, 1)} kW.`;
   } else {
-    now = "Waiting for spare sun"
-        + (s.surplus_w > 0 ? ` — ${spare} spare now.` : ".");
+    now = "Waiting for spare sun.";
   }
   $("solar-now").textContent = now;
 
