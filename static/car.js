@@ -582,7 +582,14 @@ async function loadSolar() {
   }
 
   const warn = $("solar-warn");
-  if (s.capped) {
+  if (s.sun_wasted) {
+    // The one the card had no words for on 2026-09-19: a full car, plugged
+    // in, under an exporting sky, with the controller quietly doing nothing.
+    warn.textContent = "Sun is going to the grid with the car plugged in and "
+                     + "not charging. The charge limit should be raised for it "
+                     + "— check the controller is enabled and not rate-limited.";
+    warn.hidden = false;
+  } else if (s.capped) {
     warn.textContent = "Paused: daily API request cap reached. Resumes tomorrow.";
     warn.hidden = false;
   } else if (s.dirty && !ENGAGED.has(s.state)) {

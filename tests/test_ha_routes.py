@@ -309,3 +309,25 @@ async def test_state_does_not_cry_blind_over_a_car_with_no_headroom(
     body = await _blind_body(tmp_path, monkeypatch, tick_age_s=17 * 3600,
                              soc=99, limit=99)
     assert body["controller_blind"] is False
+
+
+@pytest.mark.asyncio
+async def test_state_reports_sun_going_to_waste_on_a_car_it_could_fill(
+        tmp_path, monkeypatch):
+    """2026-09-19: exporting, plugged in at home, a car with headroom under
+    the ceiling, nothing charging -- and every existing flag quiet.
+    controller_blind asks whether ticks happen; this asks whether they are
+    achieving anything. HA owns the notifying."""
+    body = await _blind_body(tmp_path, monkeypatch, tick_age_s=3600)
+    assert body["sun_wasted"] is True
+    assert body["schema"] == 1, "an additive field must not bump the schema"
+
+
+@pytest.mark.asyncio
+async def test_state_does_not_cry_waste_over_a_car_at_the_ceiling(
+        tmp_path, monkeypatch):
+    """At the ceiling the raise is not allowed to help, so there is nothing
+    to report and an alarm would be noise."""
+    body = await _blind_body(tmp_path, monkeypatch, tick_age_s=3600,
+                             soc=95, limit=95)
+    assert body["sun_wasted"] is False

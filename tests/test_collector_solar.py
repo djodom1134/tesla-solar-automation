@@ -580,6 +580,9 @@ class _NearLimitSteadyExportClient:
         self.commands.append((name, dict(params)))
         return 200, {"response": {"result": True}}
 
+    async def vehicle_data(self, vin, *a, **k):
+        raise AssertionError("a car already charging needs no confirm read")
+
     async def wake_up(self, vin):
         raise AssertionError("must never wake an already-charging car")
 
@@ -2249,9 +2252,12 @@ async def test_the_watch_polls_the_meter_without_touching_the_car(monkeypatch, t
         f"a watch tick must not pay for a vehicle state check: {calls}")
     assert "vehicle_data" not in calls
 
-    # And it must do so at the WATCH cadence, not the 1800 s asleep poll.
-    assert slept[-1] == 300, (
-        f"watch ticks must use watch_s, got {slept}")
+    # And it must do so on the watch's own cadence, not the 1800 s asleep
+    # poll. This meter is exporting, so the tightened one applies: every step
+    # left (hold, wake, raise, start) costs a tick, and five minutes each is
+    # how 2026-09-19 spent sixteen minutes getting a full car charging.
+    assert slept[-1] == 120, (
+        f"an exporting watch tick must tighten to period_s, got {slept}")
     store_ = Store(db_path)
     store_.close()
 
@@ -2376,9 +2382,9 @@ async def test_an_awake_idle_car_also_waits_at_the_watch_cadence(monkeypatch, tm
     with pytest.raises(StopTest):
         await collector.run()
 
-    assert slept[-1] == 300, (
-        f"an awake car waiting for surplus must poll at watch_s, not "
-        f"poll_idle: {slept}")
+    assert slept[-1] == 120, (
+        "an awake car waiting for surplus must poll on the watch cadence, "
+        f"tightened by the live export, not poll_idle: {slept}")
 
 
 @pytest.mark.asyncio
@@ -2456,7 +2462,7 @@ async def test_the_watch_stands_down_after_dark_and_resumes_at_dawn(
     with pytest.raises(StopTest):
         await collector.run()
 
-    assert slept[-1] == 300, (
+    assert slept[-1] == 120 and slept[-1] != collector.settings.poll_asleep, (
         f"the watch MUST resume once the sun is back, got {slept}")
 
 
@@ -2824,6 +2830,12 @@ class _CompleteRefusesStartClient:
             self.limit = params["percent"]
         return 200, {"response": {"result": True}}
 
+    async def vehicle_data(self, vin, *a, **k):
+        """The read that confirms a raise landed. Tests using this client
+        patch vehicle.derive to identity, so this is already a view."""
+        return {**_complete_view(self.limit), "soc": self.soc, "vin": "VIN1",
+                "sampled_at": int(time.time())}
+
     async def wake_up(self, vin):
         return None
 
@@ -2838,10 +2850,11 @@ def _complete_view(limit: int = 85) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_a_car_complete_at_its_limit_still_gets_the_limit_raised(tmp_path):
+async def test_a_car_complete_at_its_limit_still_gets_the_limit_raised(tmp_path, monkeypatch):
     """The regression that matters: stopped + Complete + exporting must reach
     set_charge_limit. Before the fix this asserted zero limit commands across
     any number of ticks, because charge_start's rollback returned first."""
+    monkeypatch.setattr(collector.vehicle, "derive", lambda raw: raw)
     store_ = Store(tmp_path / "car.db")
     db = store_._db
     solar.save_config(db, enabled=1, raise_limit=1, raise_hold_s=600,
@@ -2865,11 +2878,12 @@ async def test_a_car_complete_at_its_limit_still_gets_the_limit_raised(tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_the_raise_records_the_owners_limit_before_changing_it(tmp_path):
+async def test_the_raise_records_the_owners_limit_before_changing_it(tmp_path, monkeypatch):
     """original_limit must capture the owner's 85, not the raised 95. The
     raise now runs ahead of the branch that normally records the originals,
     so it has to record them itself -- otherwise _restore puts back the
     controller's own value and the owner's setting is gone."""
+    monkeypatch.setattr(collector.vehicle, "derive", lambda raw: raw)
     store_ = Store(tmp_path / "car.db")
     db = store_._db
     solar.save_config(db, enabled=1, raise_limit=1, raise_hold_s=600,
@@ -3523,12 +3537,13 @@ class _LateLimitClient(_CompleteRefusesStartClient):
 
 
 @pytest.mark.asyncio
-async def test_a_raise_the_car_has_not_applied_yet_keeps_its_record(tmp_path):
+async def test_a_raise_the_car_has_not_applied_yet_keeps_its_record(tmp_path, monkeypatch):
     """2026-09-18 12:52, live. The raise to 95 was accepted, the charge_start
     behind it in the same tick was refused `complete`, and the rollback's
     _restore -- handed a view still saying 80 -- cleared raised_to and
     original_limit. The car then charged toward 95% at 48 A, 7 kW off the
     grid, with nothing on record to put the owner's 80 back."""
+    monkeypatch.setattr(collector.vehicle, "derive", lambda raw: raw)
     store_ = Store(tmp_path / "car.db")
     db = store_._db
     solar.save_config(db, enabled=1, raise_limit=1, raise_hold_s=600,
@@ -3695,3 +3710,37 @@ async def test_one_missed_read_mid_charge_does_not_stand_the_loop_down(
         f"a missed read stood the loop down to the asleep cadence: {sleeps}")
     assert all(s <= 120 for s in sleeps), sleeps
     assert client.state_checks >= 2, "the next pass must check, not assume"
+
+
+@pytest.mark.asyncio
+async def test_the_raise_and_the_start_land_in_the_same_tick_once_confirmed(
+        tmp_path, monkeypatch):
+    """2026-09-19, live: 5 kW exporting, the car asleep and full at 82/80.
+    The watch accrued the hold, the next tick woke the car and raised the
+    limit, and the START waited for the tick after that -- five more minutes
+    of a live export, because a raise the car had not applied yet once cost
+    the controller its record of the raise (2026-09-18 12:52).
+
+    Reading the car back settles that in two seconds instead of five
+    minutes: a car that confirms the new limit is charged in the same tick.
+    """
+    # restart_hold_s=0, as this site runs it: with the wake skipped for a car
+    # already awake, a restart costs one $0.001 command, and making it wait
+    # discards surplus to insure against a cost not incurred.
+    store_, db, cfg = _at_limit_setup(tmp_path, monkeypatch, raise_hold_s=0,
+                                      restart_hold_s=0)
+    client = _AsleepAtLimitClient()
+
+    for _ in range(6):
+        await collector.solar_tick(client, store_, "VIN1", None, cfg, site_id=1)
+        names = [c[0] for c in client.commands]
+        if "set_charge_limit" in names:
+            assert "charge_start" in names, (
+                "the start must follow a CONFIRMED raise in the same tick: "
+                f"{client.commands}")
+            assert names.index("set_charge_limit") < names.index("charge_start")
+            break
+    else:
+        raise AssertionError(f"no raise at all: {client.commands}")
+    assert solar.load_state(db, "VIN1")["state"] == "charging"
+    store_.close()

@@ -583,6 +583,18 @@ async def get_solar_status() -> dict[str, Any]:
         # pack may have changed unobserved.
         "ledger_stale": bool(state["ledger_stale"]),
         **green_status,
+        "sun_wasted": solar.sun_wasted(
+            enabled=bool(conf["enabled"]),
+            plugged=view.get("charging_state") not in (None, "Disconnected"),
+            location=home.classify(view, home.load(db)),
+            soc=view.get("soc"),
+            ceiling=conf["soc_ceiling"],
+            state=state["state"],
+            recent=solar.recent_ticks(db, vin, 40) if vin else [],
+            start_w=solar.start_watts(solar.tunables_from(
+                conf, view.get("amps_max"), view.get("volts"))),
+            min_s=900,
+            now=time.time()),
         "savings": _savings(db, vin, conf, green_status["mi_per_kwh"]),
         "projection": _projection(db, vin, conf, view, green_status),
     }

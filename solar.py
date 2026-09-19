@@ -496,6 +496,89 @@ def knowledge_stale(*, running: bool, snapshot_age_s: float | None,
     return snapshot_age_s > max_age_s
 
 
+def watch_interval(watch_s: int, period_s: int,
+                   recent_grid_w: list[float]) -> int:
+    """How long to wait before the next tick while waiting for surplus.
+
+    The watch cadence is tuned for the question "has the sun come up yet",
+    which is worth asking every five minutes and no oftener. Once the meter
+    is ACTUALLY exporting the question has changed -- everything left to do
+    (accrue the hold, wake the car, raise the limit, start the charge) takes
+    one tick each -- and five minutes a step is how 2026-09-19 spent sixteen
+    minutes of a 5 kW export getting a full car charging.
+
+    So: export on the newest reading tightens to the control period. The
+    cost is a request every two minutes instead of five, and only while the
+    site is genuinely exporting, which is the one time it is worth paying
+    for.
+    """
+    if recent_grid_w and recent_grid_w[0] < 0:
+        return min(watch_s, period_s)
+    return watch_s
+
+
+def sun_wasted(*, enabled: bool, plugged: bool, location: str,
+               soc: int | None, ceiling: int, state: str,
+               recent: list[dict], start_w: float, min_s: float,
+               now: float) -> bool:
+    """Whether the site has been exporting, with a car that could take it
+    plugged in at home and not charging, for long enough that something is
+    wrong. Reported, never acted on -- ha_routes carries it to Home
+    Assistant, exactly as controller_blind and should_plug_in are.
+
+    THE DAY THIS EXISTS FOR, 2026-09-19. The car sat at 82% against an 80%
+    limit while the array exported, and every existing signal stayed quiet:
+    the controller was running and ticking (controller_blind asks about
+    ticks, and excludes a car with no headroom by design), the car was
+    plugged in (should_plug_in's whole subject), and nothing anywhere said
+    "there is sun going into the grid that this car could be drinking". The
+    owner found it by looking out of the window.
+
+    A car with no headroom is EXACTLY the case to alarm on, not the case to
+    excuse: the raise exists to make headroom, so a full car under a bright
+    sky is either about to be raised or stuck. Only a car at the ceiling --
+    where a raise is no longer allowed to help -- is genuinely nothing to
+    report.
+
+    `min_s` is the patience: the ordinary path from first export to charging
+    takes a few ticks (hold, wake, raise, start), and alarming inside that
+    window would fire on every normal engagement. `recent` is the tick log,
+    newest first, each row carrying ts, grid_w and car_w.
+    """
+    if not enabled or not plugged or location != "home":
+        return False
+    if soc is None or soc >= ceiling:
+        return False          # nowhere left to put it; the raise cannot help
+    if state in ("charging", "grace"):
+        return False
+    newest = None
+    oldest = None
+    for row in recent:
+        grid_w, ts = row.get("grid_w"), row.get("ts")
+        if grid_w is None or ts is None:
+            break
+        if grid_w > -start_w or (row.get("car_w") or 0) > 0:
+            break             # not exporting enough, or the car was drawing
+        newest = ts if newest is None else newest
+        oldest = ts
+    if newest is None or oldest is None:
+        return False
+    # Measured to NOW, not to the newest tick: a loop that stopped ticking
+    # mid-export would otherwise freeze this at whatever span it had reached.
+    return (now - oldest) >= min_s
+
+
+def recent_ticks(db: sqlite3.Connection, vin: str, limit: int) -> list[dict]:
+    """The last `limit` logged (ts, state, grid_w, car_w) rows, newest first.
+    Feeds sun_wasted()."""
+    rows = db.execute(
+        """SELECT ts, state, grid_w, car_w FROM solar_ticks
+           WHERE vin = ? ORDER BY ts DESC LIMIT ?""",
+        (vin, limit),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def should_plug_in(*, plugged: bool, location: str, soc: int | None,
                    ceiling: int, surplus_w: float | None,
                    tun: Tunables) -> bool:

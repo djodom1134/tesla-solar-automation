@@ -640,6 +640,7 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
         location=location,
     )
     raised = st["raised_to"]
+    limit_confirmed = False
     if target_limit is not None:
         # Remember BEFORE we change it, exactly as charge_start does below.
         # The raise can now fire from "stopped", which is AHEAD of the branch
@@ -660,6 +661,23 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
             raised = target_limit
             _log(f"raised charge limit {view.get('limit')} -> {target_limit} "
                  f"for solar")
+            # Read the car back before charging against the new limit. The
+            # car takes a limit asynchronously (2026-09-18 12:52: accepted,
+            # and the charge_start two seconds later still refused
+            # `complete`), so the old rule was to wait a whole tick. At the
+            # watch cadence that is five minutes of a live export spent
+            # waiting for a value the car has usually already taken -- half
+            # the sixteen minutes of 2026-09-19. One $0.002 read, once per
+            # engagement, settles it either way: confirmed, and this tick
+            # starts the charge; not confirmed, and the next tick does.
+            #
+            # Only when a start is actually queued. A car already charging
+            # has nothing waiting on the confirmation -- the raise just gave
+            # it somewhere to keep going -- so the read would buy nothing.
+            if "charge_start" in actions:
+                confirmed = await refresh_view(client, store_, vin)
+                if confirmed is not None and confirmed.get("limit") == target_limit:
+                    view, limit_confirmed = confirmed, True
     solar.save_state(db, vin, raised_to=raised, raise_hold_elapsed=raise_hold)
     st = solar.load_state(db, vin)
 
@@ -674,7 +692,7 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
     # car either started itself (a raise above SoC resumes the charge) or
     # takes the charge_start; either way the record is intact.
     raised_now = target_limit is not None and raised == target_limit
-    if raised_now and "charge_start" in actions:
+    if raised_now and not limit_confirmed and "charge_start" in actions:
         machine, actions = solar.machine_from(st), []
 
     # --- act ---------------------------------------------------------------
@@ -1488,9 +1506,15 @@ async def run(once: bool = False) -> int:
 
             if once:
                 return 0
+            # Waiting for surplus runs at the watch cadence -- tightened to
+            # the control period once the meter is actually exporting, since
+            # every step left (hold, wake, raise, start) costs one tick.
+            watch_s = solar.watch_interval(
+                conf["watch_s"], conf["period_s"],
+                solar.recent_grid_w(store._db, vin, 1))
             last_sleep_s = (
                 backoff_s
-                or (conf["watch_s"] if waiting_for_surplus
+                or (watch_s if waiting_for_surplus
                     else next_interval(car_state, view, settings, engaged)))
             await asyncio.sleep(
                 backoff_s
@@ -1502,7 +1526,7 @@ async def run(once: bool = False) -> int:
                 # poll_idle for the waking one, because "idle" is not in
                 # ENGAGED_STATES. Thirty minutes of standing surplus either
                 # way, which is the complaint that started this.
-                or (conf["watch_s"] if waiting_for_surplus
+                or (watch_s if waiting_for_surplus
                     else next_interval(car_state, view, settings, engaged)))
     finally:
         await client.aclose()

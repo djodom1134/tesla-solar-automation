@@ -539,3 +539,72 @@ def test_at_limit_draws_the_same_line_as_sleeping_candidate():
     assert solar.at_limit({"soc": 80, "limit": 80})
     assert not solar.at_limit({"soc": 78, "limit": 80})
     assert not solar.at_limit({"soc": None, "limit": 80})
+
+
+def test_the_watch_tightens_while_the_meter_is_actually_exporting():
+    """Waiting for the sun is a five-minute question; acting on it is not --
+    hold, wake, raise and start cost a tick each. See 2026-09-19."""
+    assert solar.watch_interval(300, 120, [-4000.0]) == 120
+    assert solar.watch_interval(300, 120, [1500.0]) == 300     # importing
+    assert solar.watch_interval(300, 120, []) == 300           # no reading
+    # The control period is the floor, never a ceiling: a watch tuned faster
+    # than the period stays where the owner put it.
+    assert solar.watch_interval(60, 120, [-4000.0]) == 60
+
+
+def _wasted(**over):
+    now = 1_800_000_000
+    recent = [{"ts": now - 60 * i, "grid_w": -4000.0, "car_w": 0.0}
+              for i in range(1, 30)]
+    base = dict(enabled=True, plugged=True, location="home", soc=82,
+                ceiling=95, state="stopped", recent=recent, start_w=1300.0,
+                min_s=900, now=now)
+    return solar.sun_wasted(**{**base, **over})
+
+
+def test_sun_going_to_waste_on_a_full_car_is_exactly_what_to_report():
+    """2026-09-19: 82% against an 80% limit, exporting, nothing charging and
+    every other flag quiet -- controller_blind excludes a car with no
+    headroom by design, because the raise is supposed to make headroom."""
+    assert _wasted()
+    assert _wasted(soc=81)                      # at its limit, raise pending
+
+
+def test_sun_is_not_wasted_when_nothing_could_take_it():
+    assert not _wasted(enabled=False)           # feature off: not news
+    assert not _wasted(plugged=False)           # should_plug_in's job
+    assert not _wasted(location="away")
+    assert not _wasted(soc=95)                  # at the ceiling; raise cannot help
+    assert not _wasted(soc=None)
+    assert not _wasted(state="charging")        # it IS taking it
+    assert not _wasted(state="grace")
+
+
+def test_sun_is_not_wasted_before_the_controller_has_had_its_chance():
+    """The ordinary path -- hold, wake, raise, start -- takes a few ticks.
+    An alarm inside that window would fire on every normal engagement."""
+    now = 1_800_000_000
+    just_started = [{"ts": now - 60 * i, "grid_w": -4000.0, "car_w": 0.0}
+                    for i in range(1, 4)]
+    assert not _wasted(recent=just_started)     # three minutes in
+
+
+def test_a_brief_export_does_not_count_as_a_run_of_them():
+    now = 1_800_000_000
+    recent = [{"ts": now - 60, "grid_w": -4000.0, "car_w": 0.0},
+              {"ts": now - 120, "grid_w": 800.0, "car_w": 0.0}]   # importing
+    assert not _wasted(recent=recent)
+    # A car that was drawing during the run ends it too: that is the
+    # controller working, and the tick log is how we know.
+    drew = [{"ts": now - 60 * i, "grid_w": -4000.0,
+             "car_w": 0.0 if i < 5 else 7000.0} for i in range(1, 30)]
+    assert not _wasted(recent=drew)
+
+
+def test_a_stalled_loop_still_reports_waste_it_can_no_longer_see():
+    """Measured to now, not to the newest tick: a loop that stopped ticking
+    mid-export must not freeze the span at whatever it had reached."""
+    now = 1_800_000_000
+    stale = [{"ts": now - 3600 - 60 * i, "grid_w": -4000.0, "car_w": 0.0}
+             for i in range(1, 4)]
+    assert _wasted(recent=stale)

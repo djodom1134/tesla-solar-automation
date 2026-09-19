@@ -415,6 +415,8 @@ def solar_status() -> dict:
         # alone, because a miles figure resting on an assumed pack size
         # contradicts banked_miles, which needs no pack size at all.
         "charged_miles_basis": "measured",
+        # The demo car is charging on sun, so nothing is going to waste.
+        "sun_wasted": False,
         # Against a 20 mpg car at a demo $4.25/gal: 794.0 sun miles is 39.7
         # gal, 143.9 grid miles is 7.2 gal less 38.9 kWh at $0.12.
         "savings": {

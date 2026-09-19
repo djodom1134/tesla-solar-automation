@@ -215,6 +215,28 @@ async def ha_state() -> dict[str, Any]:
             tun=solar.tunables_from(conf, view.get("amps_max"),
                                     view.get("volts"))),
 
+        # Sun going into the grid while a car that could drink it sits
+        # plugged in at home, not charging -- the 2026-09-19 complaint, and
+        # the gap every other flag here leaves. controller_blind asks whether
+        # ticks are happening (they were) and excludes a car with no headroom
+        # (this one had none, which is the case the raise exists for);
+        # should_plug_in asks about the cable (it was plugged in). See
+        # solar.sun_wasted. The patience is fifteen minutes: hold, wake,
+        # raise and start cost a tick each, and an alarm inside that window
+        # would fire on every ordinary engagement.
+        "sun_wasted": solar.sun_wasted(
+            enabled=bool(conf["enabled"]),
+            plugged=plugged_in,
+            location=location,
+            soc=view.get("soc"),
+            ceiling=conf["soc_ceiling"],
+            state=st["state"],
+            recent=solar.recent_ticks(db, vin, 40) if vin else [],
+            start_w=solar.start_watts(solar.tunables_from(
+                conf, view.get("amps_max"), view.get("volts"))),
+            min_s=900,
+            now=now),
+
         # Tunables HA may display and write.
         "margin_w": conf["margin_w"],
         "min_a": conf["min_a"],
