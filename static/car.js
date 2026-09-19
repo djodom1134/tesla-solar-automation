@@ -654,15 +654,22 @@ async function loadSolar() {
     ? "Nothing recorded yet."
     : (s.charged_solar_miles == null ? ""
        : `${nfmt(s.charged_solar_miles, 1)} free miles put in`);
+  // Lifetime free miles driven, promoted to its own element (2026-09-19):
+  // the number that answers "how much of my driving has the sun actually
+  // paid for", which was a sub-line under a bar before. The split beneath it
+  // is the same lifetime mileage, sun against everything else.
   const mi = (v) => `${nfmt(v, 0)} mi`;
   if (s.tracked_miles > 0) {
-    renderSplit($("mix-driven"), s.free_miles_driven,
+    $("free-miles").textContent = nfmt(s.free_miles_driven, 1);
+    renderSplit($("free-split"), s.free_miles_driven,
                 Math.max(0, s.tracked_miles - s.free_miles_driven), mi);
-    $("mix-driven-sub").textContent =
-      `${nfmt(s.free_miles_driven, 1)} of ${nfmt(s.tracked_miles, 1)} miles driven on sun`;
+    $("free-sub").textContent =
+      `${nfmt(s.free_miles_share, 1)}% of ${nfmt(s.tracked_miles, 0)} mi`
+      + (s.free_miles_since == null ? "" : ` since ${since}`);
   } else {
-    renderSplit($("mix-driven"), 0, 0, mi);
-    $("mix-driven-sub").textContent = "No miles tracked yet.";
+    $("free-miles").textContent = "—";
+    renderSplit($("free-split"), 0, 0, mi);
+    $("free-sub").textContent = "No miles tracked yet.";
   }
 
   // Honesty is the feature here, not a caveat on it: when either input is
@@ -692,6 +699,9 @@ function renderNotes(s) {
   const notes = [
     "The sun/grid split of the battery is a proportion of the charge, not a "
     + "physical layer — electrons mix, and the car has no idea which is which.",
+    "Banked sun is spent first: every mile you drive comes out of it until "
+    + "it is empty, and only then out of the grid share. Drive 10 miles on a "
+    + "25-mile bank and 15 miles of sun are left, all 10 counted as driven free.",
   ];
   if (s.mi_per_kwh) {
     notes.push(`Miles are converted at ${s.mi_per_kwh} mi/kWh, measured from `

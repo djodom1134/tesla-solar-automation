@@ -1017,7 +1017,7 @@ async def test_ledger_first_tick_after_deployment_records_but_banks_nothing(tmp_
 @pytest.mark.asyncio
 async def test_ledger_banks_a_rise_then_drains_a_drop_across_real_ticks(tmp_path):
     """End to end through the real solar_tick: a rise while engaged and
-    exporting banks it, then a drop drains the bank proportionally --
+    exporting banks it, then a drop spends it SUN FIRST --
     green.ledger_step's contract, driven by the collector's own soc/state/
     car_w/grid_w extraction rather than hand-fed pure-function inputs."""
     store_ = Store(tmp_path / "car.db")
@@ -1038,12 +1038,12 @@ async def test_ledger_banks_a_rise_then_drains_a_drop_across_real_ticks(tmp_path
     assert st["solar_soc"] == pytest.approx(5.0)
     assert st["ledger_soc"] == 60
 
-    # Unplugged and drove off 2 of the 60 points -- drains 2/60 of the bank.
+    # Unplugged and drove off 2 of the 60 points -- the bank pays both.
     client.grid_w = 0.0
     view = _ledger_view(58, charging_state="Disconnected", amps_actual=None)
     await collector.solar_tick(client, store_, "VIN1", view, cfg, site_id=1)
     st = solar.load_state(db, "VIN1")
-    assert st["solar_soc"] == pytest.approx(5.0 - 2 * (5.0 / 60))
+    assert st["solar_soc"] == pytest.approx(3.0)
     assert st["ledger_soc"] == 58
     store_.close()
 
@@ -1198,9 +1198,10 @@ async def test_free_miles_uses_the_ledgers_pre_tick_share_not_the_post_tick_one(
 
 
 @pytest.mark.asyncio
-async def test_free_miles_credits_the_share_once_the_ledger_is_no_longer_empty(tmp_path):
-    """A third tick, now WITH a nonzero pre-tick bank, actually credits free
-    miles -- 6 miles driven at a pre-tick share of 5/60 (~8.33%)."""
+async def test_free_miles_credits_the_miles_the_bank_paid_for(tmp_path):
+    """A third tick, now WITH a nonzero pre-tick bank, credits the miles the
+    bank actually paid for: 6 miles on a 3-point drop that the 5 banked
+    points cover in full."""
     store_ = Store(tmp_path / "car.db")
     db = store_._db
     solar.save_config(db, enabled=1)
@@ -1217,13 +1218,18 @@ async def test_free_miles_credits_the_share_once_the_ledger_is_no_longer_empty(t
     st = solar.load_state(db, "VIN1")
     assert (st["solar_soc"], st["ledger_soc"]) == (pytest.approx(5.0), 60), "premise from the prior test"
 
-    # A third tick, still exporting, soc unchanged (no further bank/drain),
-    # 6 more miles on the odometer.
+    # A third tick: driven off, 3 points down, 6 more miles on the odometer.
+    # The 5 banked points cover the whole 3-point drop, so all 6 miles were
+    # sun -- and 2 points of bank are left.
+    client.grid_w = 0.0
     await collector.solar_tick(
-        client, store_, "VIN1", _ledger_view(60, odometer_mi=1016.0), cfg, site_id=1)
+        client, store_, "VIN1",
+        _ledger_view(57, odometer_mi=1016.0, charging_state="Disconnected",
+                     amps_actual=None), cfg, site_id=1)
     st = solar.load_state(db, "VIN1")
     assert st["tracked_miles"] == pytest.approx(16.0)
-    assert st["free_miles_driven"] == pytest.approx(6.0 * (5.0 / 60.0))
+    assert st["free_miles_driven"] == pytest.approx(6.0)
+    assert st["solar_soc"] == pytest.approx(2.0)
     store_.close()
 
 

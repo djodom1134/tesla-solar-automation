@@ -305,13 +305,28 @@ def ledger_step(solar_soc: float, soc_before: int | None, soc_now: int,
     ledger flattering rather than true. A fraction of 0.0 reproduces the old
     grid-charging branch exactly, and 1.0 the old solar branch.
 
-    LEAVING the pack: any drop removes proportionally --
-    ``solar_soc -= drop * (solar_soc / soc_before)``, equivalently
-    ``solar_soc *= soc_now / soc_before``. You cannot drive on "the solar
-    electrons" specifically: a pack that is 40% solar delivers 40% solar to
-    whatever drew the drop -- the motor, vampire drain, Sentry,
-    preconditioning, all alike, with no special case for any of them. A drop
-    all the way to 0% SoC leaves exactly 0 banked, by this same formula.
+    LEAVING the pack: SUN FIRST. A drop comes out of the bank until the bank
+    is empty, and only then out of the grid share --
+    ``solar_soc = max(0, solar_soc - drop)``.
+
+    This is the OWNER'S accounting rule, chosen deliberately on 2026-09-19,
+    and it replaced a proportional drain (``solar_soc *= soc_now /
+    soc_before``). Both are conventions, and neither is physics: electrons
+    mix, and a pack that is 40% solar cannot be made to deliver its sunny
+    ones to the motor first. What the rule decides is which miles the bank
+    is said to have paid for. Sun first says the banked sun is SPENT, and
+    spent on the next miles driven -- 25 miles of banked sun and a 10-mile
+    errand leaves 15, not 22.5 -- so the figure on the card answers "how far
+    can I still go on sun I have already earned", which is the question the
+    owner is actually asking it.
+
+    It applies to every drop, with no special case: the motor, vampire
+    drain, Sentry, preconditioning, all alike. A drop larger than the bank
+    empties it and takes the rest from the grid share; a drop to 0% SoC
+    leaves exactly 0 banked, as before.
+
+    free_miles_step below spends the bank on the SAME rule, or the two
+    ledgers would describe different cars.
 
     soc_before is None on the very first observation after this column
     existed at all -- a fresh install, or the tick right after this feature
@@ -361,7 +376,8 @@ def ledger_step(solar_soc: float, soc_before: int | None, soc_now: int,
         # grid charge always did -- see docstring.
         raw += delta * max(0.0, min(1.0, solar_fraction))
     elif delta < 0 and soc_before > 0:
-        raw -= (soc_before - soc_now) * (raw / soc_before)
+        # Sun first: the bank pays for the drop until it is empty.
+        raw = max(0.0, raw - (soc_before - soc_now))
 
     clamped = max(0.0, min(raw, soc_now))
     if clamped != raw:
@@ -415,6 +431,7 @@ def banked_miles_measured(
 def free_miles_step(
     free_miles_driven: float, tracked_miles: float, ledger_odo: float | None,
     odo_now: float, solar_soc_before: float, soc_before: int | None,
+    soc_now: int | None = None,
 ) -> tuple[float, float, float]:
     """Advance the lifetime free-miles ledger by one observation.
 
@@ -424,19 +441,37 @@ def free_miles_step(
     way to re-derive "the previous sample" inside a pure function) and gets
     back the updated lifetime totals plus the new odometer baseline.
 
-    THE ARITHMETIC (the brief's own formula, unchanged)::
+    THE ARITHMETIC, on ledger_step's own sun-first rule (2026-09-19)::
 
-        solar_share    = solar_soc_before / soc_before
-        free_miles    += miles_in_window * solar_share
+        drop           = soc_before - soc_now          # SoC points spent
+        sun_spent      = min(solar_soc_before, drop)   # the bank pays first
+        free_miles    += miles_in_window * sun_spent / drop
         tracked_miles += miles_in_window
+
+    The bank pays for the miles it can, and the grid share pays for the
+    rest: a 3-point drop against 5 banked points is wholly free, and the
+    next 4-point drop against the 2 points left is half free. This MUST
+    match ledger_step's depletion rule -- it is the same energy leaving the
+    same pack, counted once in points and once in miles -- and it did not
+    when that rule was proportional and this one read the pack's average
+    share.
+
+    A window with no net SoC drop (soc_now >= soc_before -- the car charged
+    as much as it drove, or the window spans a drive and a charge) credits
+    NO free miles while still counting the miles as tracked. The window's
+    own energy cannot be attributed from two SoC readings that come out
+    level, and the conservative direction is the honest one: the counter
+    may understate the sun's share, never overstate it.
 
     solar_soc_before and soc_before are deliberately the SAME "before" values
     ledger_step (above) is called with this same tick -- the banked ledger's
     own state prior to folding in this observation, not the value it
-    produces after. The fraction is only valid for the pack as it stood
-    across the window just driven; reading the post-update fraction here
-    would credit this window with a solar share the pack could not actually
-    have delivered across it.
+    produces after. The bank is only valid for the pack as it stood across
+    the window just driven; reading the post-update value here would spend a
+    bank this window never had.
+
+    soc_now defaults to None for callers that predate the sun-first rule,
+    which then credit nothing rather than guessing a drop.
 
     ledger_odo is None on the very first tick after this column existed --
     a fresh install, or the tick right after this feature was deployed.
@@ -478,8 +513,13 @@ def free_miles_step(
     if not soc_before:
         return free_miles_driven, tracked_miles, odo_now
 
-    solar_share = solar_soc_before / soc_before
-    return (free_miles_driven + miles_in_window * solar_share,
+    drop = soc_before - soc_now if soc_now is not None else 0
+    if drop <= 0:
+        # Nothing came out of the pack across this window that these two
+        # readings can see -- count the miles, credit no sun.
+        return free_miles_driven, tracked_miles + miles_in_window, odo_now
+    sun_spent = min(max(solar_soc_before, 0.0), drop)
+    return (free_miles_driven + miles_in_window * sun_spent / drop,
             tracked_miles + miles_in_window,
             odo_now)
 

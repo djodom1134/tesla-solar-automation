@@ -933,7 +933,8 @@ async def solar_tick(client: TeslaClient, store_: Store, vin: str,
             first_observation = st["ledger_odo"] is None
             new_free_miles, new_tracked_miles, new_ledger_odo = green.free_miles_step(
                 st["free_miles_driven"], st["tracked_miles"], st["ledger_odo"],
-                float(odo_now), st["solar_soc"], st["ledger_soc"])
+                float(odo_now), st["solar_soc"], st["ledger_soc"],
+                int(soc_now))
             ledger_fields["free_miles_driven"] = new_free_miles
             ledger_fields["tracked_miles"] = new_tracked_miles
             ledger_fields["ledger_odo"] = new_ledger_odo

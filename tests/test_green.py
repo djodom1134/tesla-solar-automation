@@ -125,10 +125,19 @@ def test_ledger_rise_while_grid_charging_does_not_bank():
     assert stale is False
 
 
-def test_ledger_drop_drains_proportionally():
-    """32 of 80 (40%) drops to 70: 40% of the 10-point drop leaves with it."""
+def test_ledger_drop_spends_the_sun_first():
+    """The owner's rule (2026-09-19): banked sun is spent on the next miles
+    driven, not drained pro rata. 32 banked, a 10-point drop: the bank pays
+    all ten and 22 is left -- not the 28 a proportional drain would leave."""
     solar_soc, _ = green.ledger_step(32.0, 80, 70, 0.0, 60, THRESH)
-    assert solar_soc == pytest.approx(28.0)
+    assert solar_soc == pytest.approx(22.0)
+
+
+def test_ledger_drop_larger_than_the_bank_empties_it_and_no_further():
+    """5 banked against a 12-point drop: the bank covers five of them and
+    the grid share covers the rest. Never negative."""
+    solar_soc, _ = green.ledger_step(5.0, 80, 68, 0.0, 60, THRESH)
+    assert solar_soc == 0
 
 
 def test_ledger_drop_to_zero_soc_leaves_zero_banked():
@@ -166,13 +175,13 @@ def test_ledger_long_gap_with_soc_risen_and_no_solar_charging_is_stale():
     assert 0 <= solar_soc <= 70
 
 
-def test_ledger_long_gap_with_soc_fallen_is_stale_and_drains_proportionally():
-    """A drop still drains proportionally regardless of staleness -- the
-    proportional-drain rule doesn't get suspended by not having watched it
-    happen continuously -- but the gap is still reported stale."""
+def test_ledger_long_gap_with_soc_fallen_is_stale_and_still_spends_sun_first():
+    """A drop still spends the bank regardless of staleness -- the rule is
+    not suspended by not having watched it happen continuously -- but the
+    gap is still reported stale."""
     solar_soc, stale = green.ledger_step(32.0, 80, 70, 0.0, THRESH + 1, THRESH)
     assert stale is True
-    assert solar_soc == pytest.approx(28.0)
+    assert solar_soc == pytest.approx(22.0)
 
 
 def test_ledger_short_gap_with_soc_movement_is_not_stale():
@@ -227,18 +236,18 @@ def test_ledger_solar_soc_never_exceeds_soc():
         soc_before = soc
 
 
-def test_ledger_full_cycle_bank_drive_off_half_bank_again():
-    """Hand arithmetic: bank 20 (0 -> 20 of 70); halve the pack by driving
-    (70 -> 35), which -- proportional drain preserving the ratio -- halves
-    the bank too (20 -> 10); bank 15 more (10 -> 25 of 50)."""
+def test_ledger_full_cycle_bank_drive_off_bank_again():
+    """Hand arithmetic on the sun-first rule: bank 20 (0 -> 20 of 70); drive
+    35 points off, which the 20 banked cannot cover, so the bank empties and
+    the grid share pays the other 15; then bank 15 more (0 -> 15 of 50)."""
     solar_soc, stale = green.ledger_step(0.0, 50, 70, 1.0, 60, THRESH)
     assert solar_soc == 20 and stale is False
 
     solar_soc, _ = green.ledger_step(solar_soc, 70, 35, 0.0, 60, THRESH)
-    assert solar_soc == pytest.approx(10.0)
+    assert solar_soc == 0
 
     solar_soc, _ = green.ledger_step(solar_soc, 35, 50, 1.0, 60, THRESH)
-    assert solar_soc == pytest.approx(25.0)
+    assert solar_soc == pytest.approx(15.0)
 
 
 def test_banked_miles_rated_uses_the_cars_own_range():
@@ -281,21 +290,41 @@ def test_free_miles_first_tick_after_deployment_records_but_tracks_nothing():
     assert (free, tracked, odo) == (0.0, 0.0, 55_000.0)
 
 
-def test_free_miles_accumulates_the_solar_share_of_the_window():
-    """20 of 80 SoC points (25%) are solar; 20 miles driven since the last
-    observation credits 5 of them as free."""
-    free, tracked, odo = green.free_miles_step(0.0, 0.0, 500.0, 520.0, 20.0, 80)
-    assert free == pytest.approx(5.0)
+def test_free_miles_spends_the_bank_first_on_the_miles_just_driven():
+    """The owner's rule: 20 banked points against a 4-point drop over 20
+    miles -- the bank covers the whole drop, so every one of those miles is
+    free. The old proportional rule called 25% of them free."""
+    free, tracked, odo = green.free_miles_step(0.0, 0.0, 500.0, 520.0, 20.0, 80, 76)
+    assert free == pytest.approx(20.0)
     assert tracked == 20.0
     assert odo == 520.0
+
+
+def test_free_miles_splits_the_window_when_the_bank_runs_out_mid_drive():
+    """2 banked points against a 4-point drop over 16 miles: the bank pays
+    for half the energy, so half the miles are free."""
+    free, tracked, _ = green.free_miles_step(0.0, 0.0, 500.0, 516.0, 2.0, 77, 73)
+    assert free == pytest.approx(8.0)
+    assert tracked == pytest.approx(16.0)
+
+
+def test_free_miles_credits_nothing_when_the_pack_did_not_fall():
+    """Miles driven but the SoC came out level (charged as much as driven,
+    or the window spans both): two readings cannot attribute that energy, so
+    the miles are tracked and no sun is claimed. Understating the sun's
+    share is the honest direction."""
+    free, tracked, odo = green.free_miles_step(0.0, 0.0, 500.0, 510.0, 20.0, 80, 80)
+    assert (free, tracked, odo) == (0.0, 10.0, 510.0)
 
 
 def test_free_miles_is_a_running_lifetime_total_across_many_windows():
     """Lifetime totals, not reset per call -- two windows with different
     solar shares must sum, not overwrite."""
-    free, tracked, odo = green.free_miles_step(0.0, 0.0, 500.0, 520.0, 20.0, 80)  # +5 of 20
-    free, tracked, odo = green.free_miles_step(free, tracked, odo, 540.0, 10.0, 60)  # +10*10/60
-    assert free == pytest.approx(5.0 + 20.0 * (10.0 / 60.0))
+    # 20 miles on a 4-point drop the 20-point bank covers: all free.
+    free, tracked, odo = green.free_miles_step(0.0, 0.0, 500.0, 520.0, 20.0, 80, 76)
+    # 20 more on an 8-point drop the 4 points left cover half of: 10 free.
+    free, tracked, odo = green.free_miles_step(free, tracked, odo, 540.0, 4.0, 76, 68)
+    assert free == pytest.approx(30.0)
     assert tracked == pytest.approx(40.0)
     assert odo == 540.0
 
@@ -315,17 +344,17 @@ def test_free_miles_recovers_after_a_corrupt_sample_without_double_counting():
     """The baseline held back by the corrupt sample above means the NEXT
     good sample's window naturally merges whatever was skipped -- no miles
     invented, none lost."""
-    free, tracked, odo = green.free_miles_step(10.0, 300.0, 500.0, 480.0, 20.0, 80)
-    free, tracked, odo = green.free_miles_step(free, tracked, odo, 510.0, 20.0, 80)
+    free, tracked, odo = green.free_miles_step(10.0, 300.0, 500.0, 480.0, 20.0, 80, 78)
+    free, tracked, odo = green.free_miles_step(free, tracked, odo, 510.0, 20.0, 80, 78)
     assert tracked == pytest.approx(300.0 + 10.0), "500 -> 510 is a 10-mile window"
-    assert free == pytest.approx(10.0 + 10.0 * (20.0 / 80.0))
+    assert free == pytest.approx(10.0 + 10.0), "a 2-point drop the bank covers"
 
 
 def test_free_miles_skips_the_window_when_soc_before_is_zero_but_still_advances_odo():
     """Nothing to take a fraction of -- but the odometer reading itself is
     still trustworthy, so the baseline still advances rather than merging
     this window into the next one (unlike the corrupt-sample case above)."""
-    free, tracked, odo = green.free_miles_step(10.0, 300.0, 500.0, 520.0, 20.0, 0)
+    free, tracked, odo = green.free_miles_step(10.0, 300.0, 500.0, 520.0, 20.0, 0, 0)
     assert (free, tracked, odo) == (10.0, 300.0, 520.0)
 
 
@@ -334,12 +363,12 @@ def test_free_miles_skips_the_window_when_soc_before_is_none_but_still_advances_
     tick yet. Cannot happen via the real collector wiring today (ledger_odo
     and ledger_soc are always set together), but the pure function must not
     divide by an unknown regardless."""
-    free, tracked, odo = green.free_miles_step(10.0, 300.0, 500.0, 520.0, 20.0, None)
+    free, tracked, odo = green.free_miles_step(10.0, 300.0, 500.0, 520.0, 20.0, None, 0)
     assert (free, tracked, odo) == (10.0, 300.0, 520.0)
 
 
 def test_free_miles_zero_delta_window_changes_nothing():
-    free, tracked, odo = green.free_miles_step(10.0, 300.0, 500.0, 500.0, 20.0, 80)
+    free, tracked, odo = green.free_miles_step(10.0, 300.0, 500.0, 500.0, 20.0, 80, 78)
     assert (free, tracked, odo) == (10.0, 300.0, 500.0)
 
 
@@ -599,3 +628,34 @@ def test_interval_fraction_counts_charges_the_controller_did_not_drive():
     of the denominator the way solar_kwh filters it out of a total."""
     ticks = [_t(7000, 7000, state="idle")]
     assert green.interval_solar_fraction(ticks) == 0.0
+
+
+def test_the_errand_the_owner_described():
+    """2026-09-19, in the owner's own terms. A pack holding 25 miles of
+    banked sun goes out, drives 10 miles, and comes home: 15 miles of banked
+    sun are left, and all 10 of those miles are counted as driven free.
+
+    The pack here is 3.5 mi/kWh across 80 kWh, so a SoC point is 2.8 miles:
+    25 banked miles is 8.93 points, and 10 miles is 3.57 of them.
+    """
+    pack_kwh, mi_per_kwh = 80.0, 3.5
+    per_point = pack_kwh * mi_per_kwh / 100          # 2.8 miles per SoC point
+    banked_points = 25.0 / per_point
+    driven_points = 10.0 / per_point
+    soc_before = 70
+    soc_now = round(soc_before - driven_points)
+
+    assert green.banked_miles_measured(
+        banked_points, pack_kwh, mi_per_kwh) == pytest.approx(25.0)
+
+    after, _ = green.ledger_step(banked_points, soc_before, soc_now, 0.0, 60, THRESH)
+    left = green.banked_miles_measured(after, pack_kwh, mi_per_kwh)
+    # SoC is a whole number, so a 3.57-point errand reads as 4 points: the
+    # bank can only ever be as fine as half a point, 1.4 miles on this pack.
+    assert left == pytest.approx(25.0 - 10.0, abs=per_point / 2), (
+        "banked sun must be spent on the miles just driven")
+
+    free, tracked, _ = green.free_miles_step(
+        0.0, 0.0, 1000.0, 1010.0, banked_points, soc_before, soc_now)
+    assert free == pytest.approx(10.0), "and every one of them was sun"
+    assert tracked == pytest.approx(10.0)

@@ -441,7 +441,17 @@ th .key { vertical-align: middle; margin-right: .35rem; }
 #solar-card .sc-battery .legend strong { font-weight: 600; }
 
 /* Sun in the battery: the hero number, with the places it reaches beside it. */
-#solar-card .sc-bank { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 1.5rem 2.5rem; align-items: start; }
+/* Three things, one row: the sun in the pack now, what it has already
+   driven, and where it can still go. They stack on a phone. */
+#solar-card .sc-bank { display: grid; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); gap: 1.5rem 2.5rem; align-items: start; }
+/* Second-size figure: the lifetime number is a headline, but the card has
+   exactly one hero and it is the live bank above. */
+#solar-card .sc-figure-2 {
+  margin: .4rem 0 .35rem; font-size: 2rem; font-weight: 600; line-height: 1;
+  letter-spacing: -0.01em; color: var(--ink);
+  display: flex; align-items: baseline; gap: .4rem;
+}
+#solar-card .sc-free .sc-split { max-width: 20rem; }
 #solar-card .sc-bank .hero-figure { margin: .4rem 0 .35rem; }
 @media (max-width: 640px) {
   #solar-card .sc-bank { grid-template-columns: minmax(0, 1fr); }
