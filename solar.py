@@ -758,6 +758,23 @@ def advance(m: Machine, t: Tick, pol: Policy, tun: Tunables) -> tuple[Machine, l
         return Machine(state="grace", grace_s_elapsed=elapsed, grace_wh=spent), []
 
     # stopped
+    if t.car_charging:
+        # ADOPT from here too, not only from idle. "Stopped" is where this
+        # machine waits for the sun to come back, and a car that starts
+        # charging in the meantime -- plugged in with "start charging on
+        # plug-in", a schedule in the car, the app -- is drawing power the
+        # controller has an opinion about. Ignoring it is what let a 4 kW
+        # grid charge run unopposed after dark on 2026-09-22: the machine sat
+        # in "stopped" reading a meter that could only see the house total,
+        # while the car quietly pulled from the grid.
+        #
+        # Adopting does not mean stopping. It means this machine now governs
+        # the charge, and its ordinary rules decide: with surplus it servos
+        # to the sun; without, the floor breach and grace it always applies
+        # end the charge, the same way they would have if it had started it.
+        # A charge the owner actually wants regardless of the sun is what
+        # "charge now" (force mode) and the deadline are for.
+        return Machine(state="charging"), ["adopt", "set_amps"]
     if t.surplus_w < start_watts(tun):
         return Machine(state="stopped", hold_s=0), []
     if m.hold_s >= pol.restart_hold_s:

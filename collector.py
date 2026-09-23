@@ -1139,6 +1139,20 @@ async def garage_scheduled_close_tick(db, vin: str, cfg: dict, tz: str) -> None:
 # once, and checking more often just spends requests discovering nothing.
 SITE_INGEST_INTERVAL_S = 3600
 
+# After dark, with the car plugged in at home and this controller not driving
+# it, the watch stands down but does not go to sleep entirely: the car can
+# still start charging on its own -- "start charging on plug-in", a schedule
+# in the car, the app -- and every minute before that is noticed is grid
+# power bought on purpose by nobody. Observed 2026-09-22: a 4 kW charge ran
+# unwatched because the only question being asked after dark was "is the sun
+# up", at 1800 s.
+#
+# 900 s is priced against what it protects: a night of these costs ~40 site
+# reads (~$0.08), while half an hour of unnoticed 4 kW charging costs ~2 kWh
+# (~$0.25). Unplugged, or with the controller already driving the charge,
+# nothing can start and the ordinary asleep cadence stands.
+DARK_PLUGGED_S = 900
+
 # A wake is $0.02, 20x a command. A car that refuses to wake must not be
 # asked every tick until midnight.
 FORCE_WAKE_MIN_S = 300
@@ -1500,10 +1514,23 @@ async def run(once: bool = False) -> int:
             # the sun was up at 1 a.m. Falls back to the ordinary asleep/idle
             # cadence, which still notices dawn within half an hour, well
             # before there is 1.2 kW of surplus to act on.
-            if waiting_for_surplus and solar.is_dark_at(
-                    solar.recent_solar(store._db, vin, solar.DARK_TICKS),
-                    time.time()):
+            dark = waiting_for_surplus and solar.is_dark_at(
+                solar.recent_solar(store._db, vin, solar.DARK_TICKS),
+                time.time())
+            if dark:
                 waiting_for_surplus = False
+            # ... but keep half an eye on a plugged-in car (see
+            # DARK_PLUGGED_S): it can start charging without this controller,
+            # and after dark that is always grid power.
+            snap_view = (snap or {}).get("view") or {}
+            dark_plugged_s = (
+                DARK_PLUGGED_S
+                if (dark
+                    and snap_view.get("charging_state") not in (None, "Disconnected")
+                    and home.classify(snap_view, home.load(store._db)) == "home"
+                    and solar.load_state(store._db, vin)["state"]
+                    in ("idle", "stopped"))
+                else 0)
 
             if once:
                 return 0
@@ -1513,22 +1540,20 @@ async def run(once: bool = False) -> int:
             watch_s = solar.watch_interval(
                 conf["watch_s"], conf["period_s"],
                 solar.recent_grid_w(store._db, vin, 1))
+            # Anything WAITING FOR SURPLUS runs at the watch cadence, whether
+            # the car is asleep (unreadable, meter-only ticks) or awake and
+            # idle. Both are the same situation -- nothing to servo, just a
+            # threshold to notice -- and both were falling through to a
+            # 1800 s poll: poll_asleep for the sleeping case, poll_idle for
+            # the waking one, because "idle" is not in ENGAGED_STATES. Thirty
+            # minutes of standing surplus either way, which is the complaint
+            # that started this.
             last_sleep_s = (
                 backoff_s
-                or (watch_s if waiting_for_surplus
-                    else next_interval(car_state, view, settings, engaged)))
-            await asyncio.sleep(
-                backoff_s
-                # Anything WAITING FOR SURPLUS runs at the watch cadence,
-                # whether the car is asleep (unreadable, meter-only ticks) or
-                # awake and idle. Both are the same situation -- nothing to
-                # servo, just a threshold to notice -- and both were falling
-                # through to a 1800 s poll: poll_asleep for the sleeping case,
-                # poll_idle for the waking one, because "idle" is not in
-                # ENGAGED_STATES. Thirty minutes of standing surplus either
-                # way, which is the complaint that started this.
-                or (watch_s if waiting_for_surplus
-                    else next_interval(car_state, view, settings, engaged)))
+                or (watch_s if waiting_for_surplus else 0)
+                or dark_plugged_s
+                or next_interval(car_state, view, settings, engaged))
+            await asyncio.sleep(last_sleep_s)
     finally:
         await client.aclose()
         store.close()

@@ -2451,8 +2451,11 @@ async def test_the_watch_stands_down_after_dark_and_resumes_at_dawn(
     # once DARK_TICKS dark readings are logged it drops off the watch cadence.
     assert slept[-1] != 300, (
         f"after dark the watch must stand down, got {slept}")
-    assert slept[-1] == collector.settings.poll_asleep, (
-        f"and fall back to the ordinary asleep cadence: {slept}")
+    # This car is plugged in at home, so it drops to the night cadence rather
+    # than all the way to the asleep poll: it can still start charging on its
+    # own after dark, and that is always grid power (see DARK_PLUGGED_S).
+    assert slept[-1] == collector.DARK_PLUGGED_S, (
+        f"a plugged-in car keeps a slow night watch: {slept}")
 
     # --- dawn: the same database, now with sun on the array ---------------
     calls.clear()
@@ -3750,3 +3753,63 @@ async def test_the_raise_and_the_start_land_in_the_same_tick_once_confirmed(
         raise AssertionError(f"no raise at all: {client.commands}")
     assert solar.load_state(db, "VIN1")["state"] == "charging"
     store_.close()
+
+
+@pytest.mark.asyncio
+async def test_after_dark_an_unplugged_car_stands_all_the_way_down(
+        monkeypatch, tmp_path):
+    """The night watch exists because a PLUGGED-IN car can start charging on
+    its own. An unplugged one cannot, so nothing can happen and the ordinary
+    asleep cadence stands -- the whole point of standing down at all."""
+    calls: list[str] = []
+    db_path = tmp_path / "car.db"
+    seed = Store(db_path)
+    solar.save_config(seed._db, enabled=1, watch_s=300)
+    home.save(seed._db, 40.0, -105.0, 100)
+    solar.save_state(seed._db, "VIN1", state="stopped", hold_s=0)
+    seed.record({"charging_state": "Disconnected", "amps_actual": 0,
+                 "charging": 0, "charge_amps": 48, "amps_max": 48,
+                 "volts": 240, "soc": 38, "limit": 91, "lat": 40.0,
+                 "lon": -105.0, "fast_charger_present": False,
+                 "fast_charger": None, "vin": "VIN1",
+                 "sampled_at": int(time.time())}, at_home=True)
+    # An unplugged car is never watched, so no ticks get logged and is_dark
+    # would have nothing to read. Seed the dark history the watch would have
+    # written before the cable came out: this test is about the cadence
+    # decision, not about who writes the evidence for it.
+    for i in range(solar.DARK_TICKS):
+        solar.log_tick(seed._db, "VIN1", ts=int(time.time()) - 60 * (i + 1),
+                       state="stopped", grid_w=1800.0, solar_w=0.0, car_w=0.0,
+                       surplus_w=-1800.0, period_s=300)
+    seed.close()
+
+    night = _WatchLoopClient(calls, grid_w=1800.0)
+
+    async def dark_get(path, ttl=0):
+        calls.append("site")
+        return {"grid_power": 1800.0, "solar_power": 0.0}
+    night._get = dark_get
+
+    monkeypatch.setattr(collector.settings, "db_file", db_path)
+    monkeypatch.setattr(collector, "TeslaClient", lambda settings: night)
+
+    slept: list[int] = []
+    clock = [int(time.time())]
+    monkeypatch.setattr(collector.time, "time", lambda: clock[0])
+
+    async def fake_sleep(seconds):
+        slept.append(seconds)
+        clock[0] += max(int(seconds), 1)
+        if len(slept) >= 5:
+            raise StopTest()
+    monkeypatch.setattr(collector.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(StopTest):
+        await collector.run()
+
+    # Only while the dark evidence is fresh: is_dark_at fails OPEN on stale
+    # readings, and this loop's own 1800 s sleeps age it past DARK_MAX_AGE_S
+    # within a few passes, at which point watching resumes -- correctly, since
+    # by then nothing recent says it is still dark.
+    assert slept[:4] == [collector.settings.poll_asleep] * 4, (
+        f"an unplugged car after dark has nothing to watch for: {slept}")

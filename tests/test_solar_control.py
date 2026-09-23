@@ -608,3 +608,56 @@ def test_a_stalled_loop_still_reports_waste_it_can_no_longer_see():
     stale = [{"ts": now - 3600 - 60 * i, "grid_w": -4000.0, "car_w": 0.0}
              for i in range(1, 4)]
     assert _wasted(recent=stale)
+
+
+def test_a_charge_the_car_started_itself_is_adopted_from_stopped_too():
+    """2026-09-22, live: 4 kW into the car at nine in the evening, no sun.
+    The machine was in "stopped" -- where it waits for the sun to come back
+    -- and "stopped" had no answer for a car that starts charging on its own,
+    so the grid charge ran unopposed. Only "idle" adopted.
+
+    Adopting is not stopping: it puts this machine in charge of the charge,
+    and its ordinary rules then decide. With no surplus that means the floor
+    breach and grace it always applies, the same as any charge it started.
+    """
+    tun = solar.Tunables(min_a=5, max_a=48, volts=240, margin_w=100,
+                         deadband_w=250, ramp_a=8)
+    pol = solar.Policy(enabled=True, start_hold_s=60, restart_hold_s=300,
+                       grace_s=900, grace_budget_wh=250.0)
+    # Ramped down to the floor already: the controller only moves ramp_a per
+    # tick, so a car adopted at 16 A takes a tick or two to get here first.
+    night = solar.Tick(
+        surplus_w=-2000.0,                       # importing, no sun
+        decision=solar.control(2000.0, 5, tun),
+        location="home", plugged=True, car_charging=True, period_s=120)
+
+    after, actions = solar.advance(
+        solar.Machine(state="stopped"), night, pol, tun)
+    assert actions == ["adopt", "set_amps"], (
+        "a car charging on the grid in the dark must be taken over, not "
+        f"ignored because this machine did not start it: {actions}")
+    assert after.state == "charging"
+
+    # And from there the ordinary rules end it: no surplus is a floor breach,
+    # two of them reach grace, and grace stops the charge.
+    m, _ = solar.advance(after, night, pol, tun)
+    m, actions = solar.advance(m, night, pol, tun)
+    assert m.state == "grace" and actions == ["set_amps"]
+    m = solar.Machine(state="grace", grace_s_elapsed=pol.grace_s,
+                      grace_wh=pol.grace_budget_wh)
+    m, actions = solar.advance(m, night, pol, tun)
+    assert m.state == "stopped" and actions == ["charge_stop", "restore"]
+
+
+def test_an_idle_car_not_charging_in_the_dark_is_still_left_alone():
+    """The discriminating half: nothing is charging, so there is nothing to
+    adopt and no command to spend."""
+    tun = solar.Tunables(min_a=5, max_a=48, volts=240, margin_w=100,
+                         deadband_w=250, ramp_a=8)
+    pol = solar.Policy(enabled=True, start_hold_s=60, restart_hold_s=300,
+                       grace_s=900, grace_budget_wh=250.0)
+    night = solar.Tick(surplus_w=-2000.0, decision=solar.control(2000.0, 0, tun),
+                       location="home", plugged=True, car_charging=False,
+                       period_s=120)
+    after, actions = solar.advance(solar.Machine(state="stopped"), night, pol, tun)
+    assert (after.state, actions) == ("stopped", [])
