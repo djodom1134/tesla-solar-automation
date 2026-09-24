@@ -1153,6 +1153,23 @@ SITE_INGEST_INTERVAL_S = 3600
 # nothing can start and the ordinary asleep cadence stands.
 DARK_PLUGGED_S = 900
 
+# How old the stored view may get before the loop spends a look at the car to
+# refresh it, and the least time between two such looks.
+#
+# The meter-only watch makes no vehicle call by design, so a car that is
+# plugged in and quiet is never re-read: its view aged 36 hours over
+# 2026-09-22/24 while the loop ticked happily on the meter. Nothing was
+# broken -- but knowledge_stale, the flag that exists to report exactly this,
+# could not clear itself either, because the only thing that refreshes a view
+# is the wake the watch is there to avoid. An alarm with no way back down is
+# one the owner learns to ignore.
+#
+# One wake a day ($0.02) buys a view no older than a day, and buys back the
+# ability to trust the flag. In daylight only: a wake after dark is a noise
+# nobody asked for, and the thing being checked can wait until morning.
+KNOWLEDGE_MAX_AGE_S = 20 * 3600
+KNOWLEDGE_REFRESH_GAP_S = 6 * 3600
+
 # A wake is $0.02, 20x a command. A car that refuses to wake must not be
 # asked every tick until midnight.
 FORCE_WAKE_MIN_S = 300
@@ -1238,6 +1255,7 @@ async def run(once: bool = False) -> int:
     # Runs on first pass, then hourly.
     last_site_ingest = 0.0
     last_gas_attempt = 0.0
+    last_knowledge_look = 0.0
     last_force_wake = 0.0
     try:
         try:
@@ -1267,6 +1285,26 @@ async def run(once: bool = False) -> int:
             st = solar.load_state(store._db, vin)
             solar_wanted = (bool(conf["enabled"]) or bool(st["dirty"])
                             or solar.forcing(conf, time.time()))
+
+            # A DAILY LOOK AT THE CAR, so the stored view cannot age past a
+            # day while the meter-only watch holds. See KNOWLEDGE_MAX_AGE_S.
+            # Daylight only, never while engaged (an engaged loop re-reads on
+            # its own cadence), and never while the daily cap is spent.
+            snap_now = store.snapshot(vin)
+            hc_now = home.load(store._db)
+            if (snap_now is not None
+                    and time.time() - snap_now["ts"] > KNOWLEDGE_MAX_AGE_S
+                    and time.time() - last_knowledge_look >= KNOWLEDGE_REFRESH_GAP_S
+                    and st["state"] in ("idle", "stopped")
+                    and not st["capped"]
+                    and solar.sun_is_up(
+                        hc_now.latitude if hc_now else None,
+                        hc_now.longitude if hc_now else None, time.time())):
+                last_knowledge_look = time.time()
+                age_h = (time.time() - snap_now["ts"]) / 3600
+                _log(f"view is {age_h:.1f} h old; looking at the car")
+                if await _wake_and_look(client, store, vin) is None:
+                    _log("the car did not answer the daily look")
 
             # Daily gas price for the savings card. Not a Tesla request, so
             # it is neither counted nor capped; gas.due throttles it itself.

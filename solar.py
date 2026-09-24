@@ -31,6 +31,7 @@ dead one.
 """
 from __future__ import annotations
 
+import math
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -509,6 +510,50 @@ def knowledge_stale(*, running: bool, snapshot_age_s: float | None,
     if snapshot_age_s is None:
         return True
     return snapshot_age_s > max_age_s
+
+
+def solar_elevation_deg(lat: float, lon: float, now: float) -> float:
+    """The sun's altitude above the horizon, in degrees, at a place and a
+    moment. The standard low-precision solar position (NOAA), good to about
+    a hundredth of a degree -- far finer than "is it up".
+
+    Pure arithmetic on the clock and the site's own coordinates: no
+    dependency, no network, and -- the point -- no reliance on the tick log.
+    is_dark_at() answers a different question, "has the array stopped
+    producing", from evidence the collector itself writes; it fails OPEN when
+    that evidence is thin or stale, which is correct for deciding a polling
+    cadence and exactly wrong for deciding whether to wake the house at
+    2 a.m. A silent loop must not be able to make the sun rise.
+    """
+    d = now / 86400.0 + 2440587.5 - 2451545.0        # days since J2000.0
+    g = math.radians((357.529 + 0.98560028 * d) % 360)          # mean anomaly
+    q = (280.459 + 0.98564736 * d) % 360                        # mean longitude
+    lam = math.radians((q + 1.915 * math.sin(g)
+                        + 0.020 * math.sin(2 * g)) % 360)       # ecliptic lon
+    e = math.radians(23.439 - 0.00000036 * d)                   # obliquity
+    dec = math.asin(math.sin(e) * math.sin(lam))                # declination
+    ra = math.atan2(math.cos(e) * math.sin(lam), math.cos(lam))
+    gmst = (18.697374558 + 24.06570982441908 * d) % 24
+    hour_angle = math.radians(((gmst + lon / 15.0) % 24) * 15.0) - ra
+    lat_r = math.radians(lat)
+    sin_alt = (math.sin(lat_r) * math.sin(dec)
+               + math.cos(lat_r) * math.cos(dec) * math.cos(hour_angle))
+    return math.degrees(math.asin(max(-1.0, min(1.0, sin_alt))))
+
+
+# Sunrise and sunset are defined at -0.833 degrees: the sun's own radius plus
+# the refraction that lifts it over the horizon. Below that it is night, and
+# nothing this system has to say is worth saying out loud.
+HORIZON_DEG = -0.833
+
+
+def sun_is_up(lat: float | None, lon: float | None, now: float) -> bool:
+    """Whether the sun is above the horizon at the site. Unknown coordinates
+    answer True: an alarm that might be needed is better than a system that
+    silences itself because it was never told where it lives."""
+    if lat is None or lon is None:
+        return True
+    return solar_elevation_deg(lat, lon, now) > HORIZON_DEG
 
 
 def watch_interval(watch_s: int, period_s: int,

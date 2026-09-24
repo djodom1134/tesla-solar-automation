@@ -614,9 +614,10 @@ async def get_solar_status() -> dict[str, Any]:
             # Same two guards as ha_routes: stale evidence and a dark sky
             # both mean there is nothing to report right now.
             max_age_s=2000,
-            dark=solar.is_dark_at(
-                solar.recent_solar(db, vin, solar.DARK_TICKS), time.time())
-            if vin else False),
+            dark=not solar.sun_is_up(
+                (home.load(db).latitude if home.load(db) else None),
+                (home.load(db).longitude if home.load(db) else None),
+                time.time())),
         "savings": _savings(db, vin, conf, green_status["mi_per_kwh"]),
         "projection": _projection(db, vin, conf, view, green_status),
     }

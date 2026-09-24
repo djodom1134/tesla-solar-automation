@@ -106,11 +106,23 @@ async def ha_state() -> dict[str, Any]:
 
     st = solar.load_state(db, vin) if vin else dict(solar.STATE_DEFAULTS)
     conf = solar.load_config(db)
-    # Is the sun down? Read once, spent on every flag HA might announce.
-    # is_dark_at fails OPEN on thin or stale history ("we cannot tell"), so
-    # the age guard below is what covers a silent collector.
-    dark = solar.is_dark_at(
-        solar.recent_solar(db, vin, solar.DARK_TICKS), now) if vin else False
+    # QUIET HOURS. The owner's rule, 2026-09-24, after three nights of the
+    # house announcing things at two in the morning: nothing here speaks
+    # after sundown. Every alarm below is gated on this one boolean rather
+    # than each growing its own guard -- the first two that did were the two
+    # that had already gone off, and the third (knowledge_stale) went off the
+    # following night.
+    #
+    # Sundown is computed from the site's own coordinates and the clock (see
+    # solar.sun_is_up), NOT from the tick log. is_dark_at reads evidence the
+    # collector writes and fails open when that evidence is thin -- which is
+    # precisely the state a stalled loop leaves behind, so the one failure
+    # most worth alarming about was also the one that could unsilence itself
+    # at midnight.
+    _home = home.load(db)
+    sun_up = solar.sun_is_up(
+        _home.latitude if _home else None,
+        _home.longitude if _home else None, now)
     snap = store().snapshot(vin) if vin else None
     view = (snap or {}).get("view") or {}
 
@@ -168,7 +180,7 @@ async def ha_state() -> dict[str, Any]:
         # solar.controller_blind; the staleness bar is two of the cadence the
         # collector last recorded for itself plus a minute, floored at an
         # hour so an engaged 120 s loop cannot make it twitchy.
-        "controller_blind": solar.controller_blind(
+        "controller_blind": sun_up and solar.controller_blind(
             enabled=bool(conf["enabled"]),
             running=collector_running(st, now),
             capped=bool(st["capped"]),
@@ -187,7 +199,7 @@ async def ha_state() -> dict[str, Any]:
         # Additive field, SCHEMA deliberately still 1 -- the 34 consumer
         # sensors gate availability on `schema == 1` by equality, so a bump
         # for a new field marks every one of them unavailable.
-        "knowledge_stale": solar.knowledge_stale(
+        "knowledge_stale": sun_up and solar.knowledge_stale(
             running=collector_running(st, now),
             snapshot_age_s=(now - snap["ts"]) if snap else None,
             max_age_s=24 * 3600),
@@ -228,7 +240,7 @@ async def ha_state() -> dict[str, Any]:
             ceiling=conf["soc_ceiling"],
             surplus_w=(last["surplus_w"] if last and
                        (now - last["ts"]) <= FLAG_MAX_AGE_S else None),
-            dark=dark,
+            dark=not sun_up,
             tun=solar.tunables_from(conf, view.get("amps_max"),
                                     view.get("volts"))),
 
@@ -254,7 +266,11 @@ async def ha_state() -> dict[str, Any]:
             min_s=900,
             now=now,
             max_age_s=FLAG_MAX_AGE_S,
-            dark=dark),
+            dark=not sun_up),
+
+        # Whether anything here is allowed to speak right now, so an
+        # automation can say WHY it is quiet rather than looking broken.
+        "sun_up": sun_up,
 
         # Tunables HA may display and write.
         "margin_w": conf["margin_w"],

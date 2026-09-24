@@ -342,3 +342,37 @@ async def test_state_goes_quiet_once_the_evidence_is_last_afternoons(
     body = await _blind_body(tmp_path, monkeypatch, tick_age_s=6 * 3600)
     assert body["sun_wasted"] is False
     assert body["should_plug_in"] is False
+
+
+@pytest.mark.asyncio
+async def test_nothing_announces_after_sundown(tmp_path, monkeypatch):
+    """2026-09-24, the third night running. A stalled loop leaves exactly the
+    conditions every alarm here fires on -- no ticks, an aging view -- and
+    the owner heard about it at 2 a.m. Sundown silences all of them, computed
+    from the site's coordinates so a silent collector cannot unsilence it."""
+    import time as _time
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    two_am = datetime(2026, 9, 24, 2, tzinfo=ZoneInfo("America/Denver")).timestamp()
+    monkeypatch.setattr(_time, "time", lambda: two_am)
+    # A day-old view, no tick for seventeen hours: blind AND stale AND, but
+    # for the hour, worth saying so.
+    body = await _blind_body(tmp_path, monkeypatch, tick_age_s=17 * 3600)
+    assert body["sun_up"] is False
+    for flag in ("controller_blind", "knowledge_stale", "sun_wasted",
+                 "should_plug_in"):
+        assert body[flag] is False, f"{flag} spoke at 2 a.m."
+
+
+@pytest.mark.asyncio
+async def test_the_same_state_does_announce_in_daylight(tmp_path, monkeypatch):
+    """The discriminating half: quiet hours must not become permanent quiet.
+    The same stalled loop at ten in the morning is news."""
+    import time as _time
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    ten_am = datetime(2026, 9, 24, 10, tzinfo=ZoneInfo("America/Denver")).timestamp()
+    monkeypatch.setattr(_time, "time", lambda: ten_am)
+    body = await _blind_body(tmp_path, monkeypatch, tick_age_s=17 * 3600)
+    assert body["sun_up"] is True
+    assert body["controller_blind"] is True

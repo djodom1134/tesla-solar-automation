@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from zoneinfo import ZoneInfo
+
 import pytest
 
 import solar
@@ -712,3 +714,40 @@ def test_the_attendance_chain_re_arms_from_our_own_previous_pass():
     assert solar.asleep_confirmed(
         now=now, snapshot_ts=day_old, confirmed_ts=now - 300,
         max_gap_s=660, beat_ts=None) == now
+
+
+# --------------------------------------------------------------------------
+# Quiet hours. The owner's rule, 2026-09-24: nothing announces after sundown.
+# --------------------------------------------------------------------------
+
+# Rounded to whole hundredths on purpose, the same convention
+# test_landmarks.py uses: sunrise and sunset need the LATITUDE, not anybody's
+# address. A kilometre of longitude moves sunset by four seconds.
+SITE = (40.17, -105.13)
+
+
+def _mdt(day: int, hour: int, minute: int = 0) -> float:
+    from datetime import datetime
+    return datetime(2026, 9, day, hour, minute,
+                    tzinfo=ZoneInfo("America/Denver")).timestamp()
+
+
+def test_sun_is_up_matches_the_almanac_for_this_site():
+    """Sunrise 06:52, sunset 18:55 at Longmont on 2026-09-24. Computed from
+    coordinates and the clock, so a silent collector cannot make the sun
+    rise -- which is exactly what is_dark_at's fail-open did at midnight."""
+    lat, lon = SITE
+    assert not solar.sun_is_up(lat, lon, _mdt(24, 6, 30))
+    assert solar.sun_is_up(lat, lon, _mdt(24, 7, 10))
+    assert solar.sun_is_up(lat, lon, _mdt(24, 18, 30))  # still up at 18:30
+    assert not solar.sun_is_up(lat, lon, _mdt(24, 19, 10))
+    assert not solar.sun_is_up(lat, lon, _mdt(24, 2))        # the 2 a.m. case
+    # Noon is high in September at 40 degrees north, and midnight is not.
+    assert solar.solar_elevation_deg(lat, lon, _mdt(24, 13)) > 45
+    assert solar.solar_elevation_deg(lat, lon, _mdt(24, 1)) < -40
+
+
+def test_a_site_that_never_said_where_it_is_keeps_its_alarms():  # noqa: D401
+    """Silence is the failure mode to avoid: a system that quiets itself
+    because nobody set the coordinates is worse than one that speaks."""
+    assert solar.sun_is_up(None, None, _mdt(24, 2))
