@@ -213,7 +213,7 @@ def raisable_to(conf: dict, st: dict) -> int | None:
 
 def asleep_confirmed(*, now: float, snapshot_ts: float | None,
                      confirmed_ts: float | None, max_gap_s: float,
-                     ) -> float | None:
+                     beat_ts: float | None = None) -> float | None:
     """The moment we last KNEW where a sleeping car was, carried forward by
     one more observation that it is still asleep. None when the chain is
     broken and only the snapshot's own age can answer.
@@ -255,10 +255,25 @@ def asleep_confirmed(*, now: float, snapshot_ts: float | None,
     seen one poll ago is one we are still watching. A car never seen at all
     has nothing to vouch for it.
     """
-    last = confirmed_ts if confirmed_ts is not None else snapshot_ts
-    if last is None or now - last > max_gap_s:
-        return None
-    return now
+    # RE-ARMING, and why the chain must not hang on the snapshot alone.
+    # Broken once, it could never come back: the only thing that refreshes a
+    # snapshot is a wake, the watch is what spends the wake, and the watch is
+    # what the broken chain switched off. One long sleep on 2026-09-22 did
+    # exactly that -- the car then sat plugged in at 65% through the whole of
+    # the 23rd, under a clear sky, while the loop polled every five minutes
+    # and never once looked at the meter.
+    #
+    # `beat_ts` is this loop's own previous pass. If we were here a moment
+    # ago and the car was not online then either -- which is the only reason
+    # this function is called -- attendance is unbroken whatever the
+    # snapshot's age, because a car cannot be driven away while asleep and
+    # the cheap state check every pass is what proves it still is. That is
+    # the same argument the chain was always making; it was merely anchored
+    # to the wrong observation.
+    for last in (confirmed_ts, beat_ts, snapshot_ts):
+        if last is not None and now - last <= max_gap_s:
+            return now
+    return None
 
 
 def knowledge_age_s(now: float, snapshot_ts: float | None,
@@ -520,7 +535,7 @@ def watch_interval(watch_s: int, period_s: int,
 def sun_wasted(*, enabled: bool, plugged: bool, location: str,
                soc: int | None, ceiling: int, state: str,
                recent: list[dict], start_w: float, min_s: float,
-               now: float) -> bool:
+               now: float, max_age_s: float, dark: bool = False) -> bool:
     """Whether the site has been exporting, with a car that could take it
     plugged in at home and not charging, for long enough that something is
     wrong. Reported, never acted on -- ha_routes carries it to Home
@@ -547,6 +562,8 @@ def sun_wasted(*, enabled: bool, plugged: bool, location: str,
     """
     if not enabled or not plugged or location != "home":
         return False
+    if dark:
+        return False          # see AFTER SUNDOWN in the docstring
     if soc is None or soc >= ceiling:
         return False          # nowhere left to put it; the raise cannot help
     if state in ("charging", "grace"):
@@ -563,8 +580,20 @@ def sun_wasted(*, enabled: bool, plugged: bool, location: str,
         oldest = ts
     if newest is None or oldest is None:
         return False
-    # Measured to NOW, not to the newest tick: a loop that stopped ticking
-    # mid-export would otherwise freeze this at whatever span it had reached.
+    # AFTER SUNDOWN, and the reason this function needs two clocks. The span
+    # is measured to NOW, so a loop that stops ticking mid-export still
+    # reports the waste it can no longer see. But the tick log itself stops
+    # at sundown -- the last rows of the day are the last exporting ones, and
+    # they never age out of `recent` -- so measuring only the span kept this
+    # true all night and HA announced into an empty house. 2026-09-24.
+    #
+    # So the EVIDENCE must be fresh as well as long: the newest qualifying
+    # reading has to be within max_age_s, or there is nothing being observed
+    # now and nothing to say. `dark` above is the same guard from the other
+    # direction -- no sun, nothing to waste -- and holds even when a battery
+    # is exporting to the grid after dark, which is not sunshine going begging.
+    if (now - newest) > max_age_s:
+        return False
     return (now - oldest) >= min_s
 
 
@@ -581,7 +610,7 @@ def recent_ticks(db: sqlite3.Connection, vin: str, limit: int) -> list[dict]:
 
 def should_plug_in(*, plugged: bool, location: str, soc: int | None,
                    ceiling: int, surplus_w: float | None,
-                   tun: Tunables) -> bool:
+                   tun: Tunables, dark: bool = False) -> bool:
     """Whether the owner is leaving sunshine on the table for want of a cable.
 
     Every other feature here can act on its own. This one cannot -- nothing
@@ -602,6 +631,13 @@ def should_plug_in(*, plugged: bool, location: str, soc: int | None,
     claims and neither is "home".
     """
     if plugged or location != "home":
+        return False
+    # Never after sundown. `surplus_w` is the last LOGGED tick's, and the tick
+    # log stops at dark, so the final sunny reading of the day would otherwise
+    # sit there all night telling the owner to go out and plug the car in --
+    # 2026-09-24. The caller passes None for a stale reading as well, which
+    # covers a collector that stopped for any other reason.
+    if dark:
         return False
     if soc is None or surplus_w is None:
         return False

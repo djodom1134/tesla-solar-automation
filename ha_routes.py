@@ -49,6 +49,12 @@ DEMO = os.getenv("DEMO", "").strip() in {"1", "true", "yes"}
 # existing field, and update the consumer in the same breath.
 SCHEMA = 1
 
+# How old a tick may be and still be worth ANNOUNCING. The watch's slowest
+# live cadence is the night watch (900 s), so two of those plus slack means a
+# flag goes quiet within about half an hour of the collector going quiet --
+# rather than repeating the last thing it saw at sundown until morning.
+FLAG_MAX_AGE_S = 2000
+
 router = APIRouter(prefix="/api/ha")
 
 _store: Store | None = None
@@ -100,6 +106,11 @@ async def ha_state() -> dict[str, Any]:
 
     st = solar.load_state(db, vin) if vin else dict(solar.STATE_DEFAULTS)
     conf = solar.load_config(db)
+    # Is the sun down? Read once, spent on every flag HA might announce.
+    # is_dark_at fails OPEN on thin or stale history ("we cannot tell"), so
+    # the age guard below is what covers a silent collector.
+    dark = solar.is_dark_at(
+        solar.recent_solar(db, vin, solar.DARK_TICKS), now) if vin else False
     snap = store().snapshot(vin) if vin else None
     view = (snap or {}).get("view") or {}
 
@@ -206,12 +217,18 @@ async def ha_state() -> dict[str, Any]:
         # solar.should_plug_in. The threshold is the controller's own
         # start_watts rather than a number repeated in a template, so it
         # tracks min_a and margin_w instead of drifting from them.
+        #
+        # Gated on darkness and on the reading's own age: the tick log stops
+        # at sundown, so its last sunny row would otherwise stand there all
+        # night telling the owner to plug in. HA announces these out loud.
         "should_plug_in": solar.should_plug_in(
             plugged=plugged_in,
             location=location,
             soc=view.get("soc"),
             ceiling=conf["soc_ceiling"],
-            surplus_w=last["surplus_w"] if last else None,
+            surplus_w=(last["surplus_w"] if last and
+                       (now - last["ts"]) <= FLAG_MAX_AGE_S else None),
+            dark=dark,
             tun=solar.tunables_from(conf, view.get("amps_max"),
                                     view.get("volts"))),
 
@@ -235,7 +252,9 @@ async def ha_state() -> dict[str, Any]:
             start_w=solar.start_watts(solar.tunables_from(
                 conf, view.get("amps_max"), view.get("volts"))),
             min_s=900,
-            now=now),
+            now=now,
+            max_age_s=FLAG_MAX_AGE_S,
+            dark=dark),
 
         # Tunables HA may display and write.
         "margin_w": conf["margin_w"],

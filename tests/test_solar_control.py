@@ -558,7 +558,7 @@ def _wasted(**over):
               for i in range(1, 30)]
     base = dict(enabled=True, plugged=True, location="home", soc=82,
                 ceiling=95, state="stopped", recent=recent, start_w=1300.0,
-                min_s=900, now=now)
+                min_s=900, now=now, max_age_s=2000, dark=False)
     return solar.sun_wasted(**{**base, **over})
 
 
@@ -601,13 +601,34 @@ def test_a_brief_export_does_not_count_as_a_run_of_them():
     assert not _wasted(recent=drew)
 
 
-def test_a_stalled_loop_still_reports_waste_it_can_no_longer_see():
-    """Measured to now, not to the newest tick: a loop that stopped ticking
-    mid-export must not freeze the span at whatever it had reached."""
+def test_a_stalled_loop_reports_waste_it_can_no_longer_see_only_while_fresh():
+    """The span is measured to NOW, so a loop that stopped ticking mid-export
+    still reports the waste it can no longer see -- but only while the
+    evidence is recent. The tick log stops at sundown, and its last exporting
+    rows would otherwise stand there all night: HA announces these out loud,
+    into an empty house (2026-09-24)."""
     now = 1_800_000_000
-    stale = [{"ts": now - 3600 - 60 * i, "grid_w": -4000.0, "car_w": 0.0}
-             for i in range(1, 4)]
-    assert _wasted(recent=stale)
+    recent_enough = [{"ts": now - 1500 - 60 * i, "grid_w": -4000.0, "car_w": 0.0}
+                     for i in range(1, 4)]
+    assert _wasted(recent=recent_enough), "quiet for 25 min, still exporting"
+
+    overnight = [{"ts": now - 6 * 3600 - 60 * i, "grid_w": -4000.0, "car_w": 0.0}
+                 for i in range(1, 4)]
+    assert not _wasted(recent=overnight), (
+        "six hours on, this is last afternoon's sunshine, not tonight's")
+
+
+def test_nothing_is_announced_after_sundown():
+    """The owner's rule, 2026-09-24: no HA announcements after dark. Sun
+    cannot be wasted when there is none -- including a battery exporting to
+    the grid at night, which is not sunshine going begging."""
+    assert not _wasted(dark=True)
+    tun = solar.Tunables(min_a=5, max_a=48, volts=240, margin_w=100,
+                         deadband_w=250, ramp_a=8)
+    plug = dict(plugged=False, location="home", soc=50, ceiling=90,
+                surplus_w=5000.0, tun=tun)
+    assert solar.should_plug_in(**plug), "premise: it would fire in daylight"
+    assert not solar.should_plug_in(**plug, dark=True)
 
 
 def test_a_charge_the_car_started_itself_is_adopted_from_stopped_too():
@@ -661,3 +682,33 @@ def test_an_idle_car_not_charging_in_the_dark_is_still_left_alone():
                        period_s=120)
     after, actions = solar.advance(solar.Machine(state="stopped"), night, pol, tun)
     assert (after.state, actions) == ("stopped", [])
+
+
+def test_the_attendance_chain_re_arms_from_our_own_previous_pass():
+    """2026-09-23, the day nothing happened. One sleep longer than the gap
+    tolerance broke the chain on the 22nd; from then on the only anchor left
+    was a snapshot that could not be refreshed without a wake, and the wake
+    was the thing the broken chain had switched off. The car sat plugged in
+    at 65% under a clear sky for a whole day while the loop polled every five
+    minutes and never looked at the meter.
+
+    A pass we ourselves made a moment ago is proof of attendance whatever the
+    snapshot's age: a car cannot be driven away while asleep, and the cheap
+    state check on every pass is what keeps proving it still is.
+    """
+    now = 1_800_000_000.0
+    day_old = now - 26 * 3600
+    # Chain broken (None), snapshot a day old -- the dead state.
+    assert solar.asleep_confirmed(
+        now=now, snapshot_ts=day_old, confirmed_ts=None, max_gap_s=660,
+        beat_ts=now - 300) == now, "our own last pass must re-arm it"
+
+    # Without that anchor it stays dead, which is right: nobody was watching.
+    assert solar.asleep_confirmed(
+        now=now, snapshot_ts=day_old, confirmed_ts=None, max_gap_s=660,
+        beat_ts=now - 4 * 3600) is None
+
+    # And a live chain still carries forward on its own.
+    assert solar.asleep_confirmed(
+        now=now, snapshot_ts=day_old, confirmed_ts=now - 300,
+        max_gap_s=660, beat_ts=None) == now

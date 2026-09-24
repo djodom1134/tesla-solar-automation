@@ -1323,6 +1323,9 @@ async def run(once: bool = False) -> int:
                     now=now_beat,
                     snapshot_ts=snap["ts"] if snap else None,
                     confirmed_ts=st["asleep_confirmed_ts"],
+                    # Our own previous pass re-arms a chain broken by one
+                    # long sleep; see asleep_confirmed.
+                    beat_ts=st["heartbeat_ts"],
                     max_gap_s=max(300, 2 * max(
                         last_sleep_s, st["heartbeat_sleep_s"] or 0) + 60))
             solar.save_state(store._db, vin, heartbeat_ts=int(now_beat),

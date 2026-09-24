@@ -318,7 +318,7 @@ async def test_state_reports_sun_going_to_waste_on_a_car_it_could_fill(
     the ceiling, nothing charging -- and every existing flag quiet.
     controller_blind asks whether ticks happen; this asks whether they are
     achieving anything. HA owns the notifying."""
-    body = await _blind_body(tmp_path, monkeypatch, tick_age_s=3600)
+    body = await _blind_body(tmp_path, monkeypatch, tick_age_s=1200)
     assert body["sun_wasted"] is True
     assert body["schema"] == 1, "an additive field must not bump the schema"
 
@@ -328,6 +328,17 @@ async def test_state_does_not_cry_waste_over_a_car_at_the_ceiling(
         tmp_path, monkeypatch):
     """At the ceiling the raise is not allowed to help, so there is nothing
     to report and an alarm would be noise."""
-    body = await _blind_body(tmp_path, monkeypatch, tick_age_s=3600,
+    body = await _blind_body(tmp_path, monkeypatch, tick_age_s=1200,
                              soc=95, limit=95)
     assert body["sun_wasted"] is False
+
+
+@pytest.mark.asyncio
+async def test_state_goes_quiet_once_the_evidence_is_last_afternoons(
+        tmp_path, monkeypatch):
+    """The collector stops ticking at sundown, so the last exporting row of
+    the day sits in the log all night. HA announces these out loud; a flag
+    still true at 2 a.m. is an announcement about this afternoon."""
+    body = await _blind_body(tmp_path, monkeypatch, tick_age_s=6 * 3600)
+    assert body["sun_wasted"] is False
+    assert body["should_plug_in"] is False

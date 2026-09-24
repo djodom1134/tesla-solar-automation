@@ -610,7 +610,13 @@ async def get_solar_status() -> dict[str, Any]:
             start_w=solar.start_watts(solar.tunables_from(
                 conf, view.get("amps_max"), view.get("volts"))),
             min_s=900,
-            now=time.time()),
+            now=time.time(),
+            # Same two guards as ha_routes: stale evidence and a dark sky
+            # both mean there is nothing to report right now.
+            max_age_s=2000,
+            dark=solar.is_dark_at(
+                solar.recent_solar(db, vin, solar.DARK_TICKS), time.time())
+            if vin else False),
         "savings": _savings(db, vin, conf, green_status["mi_per_kwh"]),
         "projection": _projection(db, vin, conf, view, green_status),
     }
